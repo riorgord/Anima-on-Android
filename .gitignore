@@ -1,0 +1,9 @@
+output/
+__pycache__/
+*.pyc
+*.pyo
+models/*.pt
+models/*.safetensors
+models/*.bin
+.DS_Store
+Thumbs.db

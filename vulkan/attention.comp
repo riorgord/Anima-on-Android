@@ -1,0 +1,146 @@
+#version 450
+// Vulkan compute shader: batched scaled dot-product attention
+// Q × K^T → scale → softmax → × V
+
+layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
+
+// Push constants
+layout(push_constant) uniform PushConstants {
+    uint B;        // batch size
+    uint H;        // seq length (q)
+    uint S;        // seq length (kv)
+    uint D;        // head dim
+    float scale;   // 1/sqrt(D)
+} pc;
+
+// Input buffers (float16 stored as uint)
+layout(set=0, binding=0) readonly buffer Q { uint q_data[]; };
+layout(set=0, binding=1) readonly buffer K { uint k_data[]; };
+layout(set=0, binding=2) readonly buffer V { uint v_data[]; };
+layout(set=0, binding=3) writeonly buffer O { uint o_data[]; };
+
+// Helper: pack/unpack float16
+// FP16 stored in lower 16 bits of uint32
+float unpack_f16(uint packed) {
+    uint sign = (packed >> 15) & 1u;
+    uint exp  = (packed >> 10) & 0x1Fu;
+    uint mant = packed & 0x3FFu;
+
+    if (exp == 0u) {
+        // Subnormal or zero
+        return float(sign != 0u ? -1 : 1) * float(mant) / 1024.0 * exp2(-14.0);
+    } else if (exp == 0x1Fu) {
+        // Inf or NaN
+        return float(mant == 0u ? (sign != 0u ? -1 : 1) * 1.0/0.0 : 0.0/0.0);
+    } else {
+        // Normal
+        float value = 1.0 + float(mant) / 1024.0;
+        return float(sign != 0u ? -1 : 1) * value * exp2(float(exp) - 15.0);
+    }
+}
+
+uint pack_f16(float value) {
+    if (isnan(value)) return 0x7E00u;
+
+    uint sign = (value < 0.0) ? 0x8000u : 0u;
+    value = abs(value);
+
+    if (value == 0.0) return sign;
+    if (isinf(value)) return sign | 0x7C00u;
+
+    float scaled = value;
+    int exp_val = 0;
+
+    // Normalize
+    while (scaled >= 2.0) { scaled *= 0.5; exp_val++; }
+    while (scaled < 1.0 && exp_val > -14) { scaled *= 2.0; exp_val--; }
+
+    if (exp_val > 15) return sign | 0x7C00u; // Overflow → Inf
+    if (exp_val < -14) return sign;           // Underflow → 0
+
+    uint mant = uint((scaled - 1.0) * 1024.0) & 0x3FFu;
+    uint exp_bits = uint(exp_val + 15) & 0x1Fu;
+
+    return sign | (exp_bits << 10) | mant;
+}
+
+float load_q(uint idx) { return unpack_f16(q_data[idx]); }
+float load_k(uint idx) { return unpack_f16(k_data[idx]); }
+float load_v(uint idx) { return unpack_f16(v_data[idx]); }
+void store_o(uint idx, float val) { o_data[idx] = pack_f16(val); }
+
+// Shared memory for tile-based attention
+// Each workgroup processes one row of Q and one tile of K,V
+shared float k_tile[256]; // Max D * max tile_size / threads
+shared float v_tile[256];
+
+void main() {
+    uint batch_idx = gl_GlobalInvocationID.x % pc.B;
+    uint head_idx = (gl_GlobalInvocationID.x / pc.B) % 16u; // n_heads=16
+    uint q_row = gl_GlobalInvocationID.y;  // which query position
+    uint thread_id = gl_LocalInvocationIndex; // 0..255 in workgroup
+
+    if (q_row >= pc.H) return;
+
+    // Q base offset for this (batch, head, q_row, :)
+    uint q_base = ((batch_idx * 16u + head_idx) * pc.H + q_row) * pc.D;
+
+    // Output accumulator for this Q row
+    float acc[4]; // Up to D=128 values per thread
+    for (uint d = 0u; d < pc.D; d++) acc[d] = 0.0;
+
+    float row_max = -1.0 / 0.0; // -inf
+    float row_sum = 0.0;
+
+    // Tile over K/V along S dimension
+    uint tile_size = 32u;
+    for (uint tile_start = 0u; tile_start < pc.S; tile_start += tile_size) {
+        uint tile_end = min(tile_start + tile_size, pc.S);
+        uint tile_len = tile_end - tile_start;
+
+        // Load K tile into shared memory (cooperatively)
+        for (uint i = thread_id; i < tile_len * pc.D; i += 256u) {
+            uint s_idx = i / pc.D;
+            uint d_idx = i % pc.D;
+            uint global_k_idx = ((batch_idx * 16u + head_idx) * pc.S + tile_start + s_idx) * pc.D + d_idx;
+            k_tile[i] = load_k(global_k_idx);
+            v_tile[i] = load_v(global_k_idx);
+        }
+        barrier();
+
+        // Compute Q×K^T for this tile
+        float scores[32]; // tile_size scores
+        for (uint s = 0u; s < tile_len; s++) {
+            float dot = 0.0;
+            for (uint d = 0u; d < pc.D; d++) {
+                dot += load_q(q_base + d) * k_tile[s * pc.D + d];
+            }
+            scores[s] = dot * pc.scale;
+        }
+
+        // Online softmax: update row_max and recompute
+        float old_max = row_max;
+        for (uint s = 0u; s < tile_len; s++) {
+            row_max = max(row_max, scores[s]);
+        }
+
+        float exp_diff = exp(old_max - row_max);
+        row_sum *= exp_diff;
+        for (uint d = 0u; d < pc.D; d++) acc[d] *= exp_diff;
+
+        for (uint s = 0u; s < tile_len; s++) {
+            float weight = exp(scores[s] - row_max);
+            row_sum += weight;
+            for (uint d = 0u; d < pc.D; d++) {
+                acc[d] += weight * v_tile[s * pc.D + d];
+            }
+        }
+        barrier();
+    }
+
+    // Normalize and store
+    uint o_base = ((batch_idx * 16u + head_idx) * pc.H + q_row) * pc.D;
+    for (uint d = 0u; d < pc.D; d++) {
+        store_o(o_base + d, acc[d] / row_sum);
+    }
+}
