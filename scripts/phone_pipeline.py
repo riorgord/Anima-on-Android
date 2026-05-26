@@ -48,7 +48,7 @@ t_start = time.time()
 for i in range(STEPS):
     sigma = sigmas[i]
     sigma_next = sigmas[i + 1]
-    ts = torch.tensor([sigma * 1000.0], dtype=DTYPE)
+    ts = torch.tensor([sigma], dtype=DTYPE)
     x_b = x.unsqueeze(2).repeat(2, 1, 1, 1, 1)
     ctx_b = torch.cat([ctx_cond, ctx_uncond], dim=0)
     ts_b = ts.repeat(2)
