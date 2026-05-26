@@ -52,13 +52,13 @@ shared float b_tile[16][16];
 
 void main() {
     uint batch_idx = gl_GlobalInvocationID.z;
-    uint row = gl_GlobalInvocationID.y;
-    uint col = gl_GlobalInvocationID.x;
+    uint row = gl_GlobalInvocationID.x;
+    uint col = gl_GlobalInvocationID.y;
 
     if (row >= pc.M || col >= pc.N) return;
 
-    uint local_row = gl_LocalInvocationID.y;
-    uint local_col = gl_LocalInvocationID.x;
+    uint local_row = gl_LocalInvocationID.x;
+    uint local_col = gl_LocalInvocationID.y;
 
     float sum = 0.0;
     uint tiles = (pc.K + 15u) / 16u;

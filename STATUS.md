@@ -21,11 +21,11 @@
 - ✅ 手机 CPU 管线 (DiT 2B + VAE，256×256，123s/步，正确出图)
 - ✅ VAE 格子 bug 根因：wan_vae.py 缺失 latent_mean/std 归一化，已修复
 - ✅ Vulkan GEMM benchmark：Adreno 730 7.8× 加速，max_err=0.0001 (独立测试正确)
+- ✅ **Vulkan GEMM dispatch swap bug 定位并修复** (2026-05-26)：gemm.comp 里 row/col 映射跟 dispatch 的 X/Y 轴对调 — M=N 时隐藏，M≠N 时 columns 被截断输出 0。修法只改 shader 2 行（row/col 与 local_row/col 同时 swap），libvk_gemm.so 不变。修复后 281 GEMM 全部 0 翻车，max_err<0.02 ✅
 
 ## 当前状态
-- ⚠️ Vulkan GEMM 在真实 shape（M=512, N=2048）下出错，输出有"漏算位置 vk=0.0000"。
-  之前 STATUS.md 中关于 ".so 出垃圾" 的所有诊断已被推翻：根因是 binary/dl_test 当时用 `tile=4` 跑触发 shader 退化，参数污染。
-  当前怀疑：shape 较大 + 真实数据触发的 shader 或 driver bug，跟 K 是否 16 倍数无关、跟 .so vs binary 无关。
+- ⚠️ Vulkan GEMM dispatch swap bug **已修复**（gemm.comp + gemm.spv 入仓），但 .so 尚未重编（运行时读 gemm.spv 自动生效）。待定：是否尝试完整 3 步管线出图（Vulkan 加速 vs CPU 参考）、是否入仓。
+- ⚠️ 手机端 `/data/local/tmp/gemm.spv` = 修复版；`/data/local/tmp/gemm_broken.spv` = 旧备份
 
 ## Vulkan 加速调试进展 (2026-05-25 今天)
 
@@ -79,11 +79,42 @@ Type 3 (`HOST_VISIBLE | HOST_CACHED`，无 COHERENT) **不在 memoryTypeBits 里
 - `build_bridge.bat` — 编译 vk_bridge
 - `vulkan/vk_ops_diag.py` (anima_phone 仓库新加) — 强制启用 Vulkan + 每次 CPU 对照 + 异常 raise 的诊断版 HybridOps；常态 `vk_ops.py` 保持 `_VK_AVAILABLE=False` 干净，需要诊断时 phone_pipeline 把 `import vk_ops` 换成 `import vk_ops_diag as vk_ops`
 
+### Dispatch swap 根因定位全记录 (2026-05-26)
+
+**早上的混乱状态**：STATUS.md 声称 .so 路径出 garbage，但所有证据被参数污染（tile=4 退化触发 inf/nan）。重新核实后 binary baseline 干净。
+
+**D2 阶段（GEMM shape 分析）**：推出 phone_pipeline 走 .so 的 shape 列表 → 全是 16 倍数，K-divisible 假说证伪。
+
+**真管线 diagnostic**：phone_pipeline 1 步 + 每次 CPU 对照 → 第一个 GEMM `x_embedder.proj` (M=512,N=2048,K=68) max_err=2.6, vk_out 有 0 位置。
+
+**dl_test_scan 边界扫描**：M=512,N=64 → 88% zeros；M=64,N=2048 → 97% zeros。假说为"N 维度截断"。
+
+**B 阶段（读 shader）**：`gemm.comp:55-56 row=gl_GlobalInvocationID.y, col=gl_GlobalInvocationID.x` ← 跟 `main.cpp:103 vkCmdDispatch(..., (M+15)/16, (N+15)/16, 1)` 配合，M→X groups、N→Y groups。结果是：
+- col (N 维度) 由 X 轴供给 → 只覆盖 `0..M_padded-1` → **M < N 时 N 维度被截断**
+- row (M 维度) 由 Y 轴供给 → 只覆盖 `0..N_padded-1` → M < N 时超出部分被边界检查 prune（浪费但不错）
+
+**修复**：`gemm.comp` 交换全局 + 局部两对 ID：
+```glsl
+// 前    uint row = gl_GlobalInvocationID.y;  uint col = gl_GlobalInvocationID.x;
+// 后    uint row = gl_GlobalInvocationID.x;  uint col = gl_GlobalInvocationID.y;
+// 前    uint local_row = gl_LocalInvocationID.y;  uint local_col = gl_LocalInvocationID.x;
+// 后    uint local_row = gl_LocalInvocationID.x;  uint local_col = gl_LocalInvocationID.y;
+```
+重编 gemm.spv（glslangValidator -V），推 `/data/local/tmp/gemm.spv`，.so 运行时自动读入无需重编。
+
+**修复验证**：
+- dl_test_scan 512×64×64: max_err=0.0077, 0% zero ✅（前：5.11, 88% zero）
+- dl_test_scan 512×2048×68: max_err=0.0082, 0% zero ✅（前：0.56, 75% zero）
+- phone_pipeline 1 步 diagnostic: 281 Vulkan GEMM 全部 max_err<0.02, OK ✅
+
+**教训**：不是 driver bug，不是 .so vs binary 差异，不是 K 不整除 16。是一个 dispatch 轴映射错误在 M=N 的 benchmark 中完美隐藏了**一个多月**。
+
 ### 后续可能方向（2026-05-26 更新）
-1. **B+A 结合定位**（进行中）：读 `vulkan/gemm.comp` shader 找边界处理漏洞 + 用 `dl_test_K68` 扫描 M/N/data 维度找阈值
-2. 如果是 shader 漏边界检查 → 修 shader 重编 .so
-3. 如果是 driver bug → 在 vk_ops 加 shape/数据范围阈值绕过；或者 subprocess 调 binary
-4. INT8 CPU 量化作为保底方案
+1. ~~B+A 结合定位~~ **已完成**，dispatch swap bug 修复
+2. 重新 benchmark：M=512,N=2048（真实 shape）的 7.8× 加速是否还在
+3. 完整 3 步管线 + Vulkan 加速出图 vs CPU 参考图，确认无误
+4. 如果加速无误 → 将 `_VK_AVAILABLE` 开关打开，正式启用
+5. INT8 CPU 量化作为保底方案
 
 ## 关键技术路径
 ```
