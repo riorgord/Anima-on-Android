@@ -7,3 +7,5 @@ models/*.safetensors
 models/*.bin
 .DS_Store
 Thumbs.db
+*.pdf
+*.apk

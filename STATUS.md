@@ -1,4 +1,4 @@
-# Anima 项目状态摘要 (2026-05-26 更新)
+# Anima 项目状态摘要 (2026-05-26 晚间更新)
 
 ## 我们在做什么
 在 Snapdragon 8+ Gen1 手机上运行 Anima 动漫风格图像生成模型 (2B DiT)。
@@ -23,11 +23,69 @@
 - ✅ Vulkan GEMM benchmark：Adreno 730 7.8× 加速，max_err=0.0001 (独立测试正确)
 - ✅ **Vulkan GEMM dispatch swap bug 定位并修复** (2026-05-26)：gemm.comp 里 row/col 映射跟 dispatch 的 X/Y 轴对调 — M=N 时隐藏，M≠N 时 columns 被截断输出 0。修法只改 shader 2 行（row/col 与 local_row/col 同时 swap），libvk_gemm.so 不变。修复后 281 GEMM 全部 0 翻车，max_err<0.02 ✅
 
-## 当前状态
-- ⚠️ Vulkan GEMM dispatch swap bug **已修复**（gemm.comp + gemm.spv 入仓），但 .so 尚未重编（运行时读 gemm.spv 自动生效）。待定：是否尝试完整 3 步管线出图（Vulkan 加速 vs CPU 参考）、是否入仓。
-- ⚠️ 手机端 `/data/local/tmp/gemm.spv` = 修复版；`/data/local/tmp/gemm_broken.spv` = 旧备份
+## 当前状态 (2026-05-26 晚间)
 
-## Vulkan 加速调试进展 (2026-05-25 今天)
+**正确性**：Vulkan GEMM dispatch swap bug **已修复**，3 步管线出图正常 ✅
+
+**速度**：Vulkan 220s/步，比纯 CPU 120s/步 **慢 83%**。所有优化手段（fp16 直通、批量提交、Type 6 HOST_COHERENT 直算）均已尝试，均不改善。clock_gettime 内部分段计时揭示根因：GEMM 618-634ms/次，98% 时间在 GPU 侧的 submit+execute 阶段。
+
+**根因**：我们的 gemm.comp 通用 tiled GEMM shader 在 Adreno 730 上仅跑出 **~14 GFLOPS**，对比理论峰值 1,843 GFLOPS（利用率 **0.75%**）。shader 架构不适配 Adreno TBDR 硬件。
+
+**下步方向**：C++ 推理引擎路线。Phase 1 先优化/替换 GEMM kernel 适配 Adreno；Phase 2 全 DiT forward 从 PyTorch 剥离；Phase 3 VAE 上 NPU。
+
+> 手机端 `/data/local/tmp/gemm.spv` = 修复版（dispatch swap）；`/data/local/tmp/gemm_broken.spv` = 旧备份
+
+## 2026-05-26 晚间：性能剖析 & 路线决策
+
+### 分段计时结果（clock_gettime 四段打点，281 GEMM 平均）
+
+| 阶段 | 每 GEMM | 总计 | 占比 |
+|------|---------|------|------|
+| CPU 打包 (uint16→uint32) | 4.7ms | 1s | 0.6% |
+| cmd buffer 录制 | 0.3ms | 0s | 0.0% |
+| **GPU submit→fence** | **633.6ms** | **178s** | **98.4%** |
+| CPU 读回 (uint32→uint16) | 6.8ms | 2s | 1.1% |
+
+### 尝试过但无效的优化
+
+| 优化 | 预期省时 | 实际效果 | 结论 |
+|------|---------|---------|------|
+| 缓存 Vulkan 资源（不复创建） | ~30s | 2s | alloc 不是瓶颈 |
+| fp16 直达路径（省 f2h/h2f） | ~20s | 3s | CPU 转换不是瓶颈 |
+| 批量提交（281→140 submit） | ~40s | -2s | submit 不是瓶颈 |
+| Type 6 HOST_COHERENT（去 DMA） | ~150s | 0s | DMA 不是瓶颈 |
+
+### GPU 利用率计算
+
+```
+Adreno 730 理论 FP16 峰值: 1,843 GFLOPS (1024 ALU × 900MHz × 2 FMA)
+MLP layer2: M=512,N=2048,K=8192 = 8.6 GFLOP/GEMM
+实际: 8.6G / 0.627s = 13.7 GFLOPS
+利用率: 13.7 / 1,843 = 0.75%
+```
+
+**通用 tiled GEMM shader（gemm.comp）在 Adreno TBDR 架构上几乎完全失速。**
+
+### 路线决策
+
+放弃 Python ctypes per-layer Vulkan 路线。转向：
+
+1. **短期（Phase 1）**：参考 ncnn/llama.cpp 的 Adreno 优化 GEMM kernel，替换 gemm.comp。目标每 GEMM ~20ms（利用 25-50% GPU）。如达成，立即释放 Vulkan 加速（预计 40-50s/步）。
+
+2. **中期（Phase 2）**：全 C++ DiT 推理引擎。把整个 transformer block 从 PyTorch 剥离，数据全程留 GPU。参考 llama.cpp 架构。预计 15-30s/步。
+
+3. **长期（Phase 3）**：VAE decode 上 Qualcomm NPU（项目计划书优先项）。Context 文本编码器考虑手机本地跑 TinyLlama 等级模型。
+
+### 外部参考资料
+
+- [Adreno Developer Guide PDF](https://raw.githubusercontent.com/wiki/samrg123/JniTeapot/Documents/Adreno%20Developer%20Guide.pdf) — 已下载到工作区（.gitignore）
+- [ncnn Vulkan backend](https://github.com/Tencent/ncnn) — 腾讯移动端推理框架，Adreno 优化 GEMM
+- [llama.cpp Vulkan](https://github.com/ggerganov/llama.cpp) — 移动端 LLM 推理，Vulkan backend
+- [Qualcomm 开发者文档](https://docs.qualcomm.com/) — 官方 SDK/Profiler
+
+---
+
+## Vulkan 加速调试进展 (2026-05-25) [历史记录]
 
 ### Adreno 730 内存类型 (vk_mem_probe)
 只有 2 种内存可用于 STORAGE_BUFFER (`memoryTypeBits=0x41`)：
@@ -109,12 +167,13 @@ Type 3 (`HOST_VISIBLE | HOST_CACHED`，无 COHERENT) **不在 memoryTypeBits 里
 
 **教训**：不是 driver bug，不是 .so vs binary 差异，不是 K 不整除 16。是一个 dispatch 轴映射错误在 M=N 的 benchmark 中完美隐藏了**一个多月**。
 
-### 后续可能方向（2026-05-26 更新）
-1. ~~B+A 结合定位~~ **已完成**，dispatch swap bug 修复
-2. 重新 benchmark：M=512,N=2048（真实 shape）的 7.8× 加速是否还在
-3. 完整 3 步管线 + Vulkan 加速出图 vs CPU 参考图，确认无误
-4. 如果加速无误 → 将 `_VK_AVAILABLE` 开关打开，正式启用
-5. INT8 CPU 量化作为保底方案
+### 后续可能方向（2026-05-26 晚间更新）
+1. ~~dispatch swap bug~~ **已修复**
+2. ~~批量提交 / Type 6 / fp16 直达~~ **均已测试，不改善**
+3. **Phase 1**：优化 GEMM kernel — 参考 ncnn/llama.cpp + Adreno Developer Guide
+4. **Phase 2**：全 C++ DiT 推理引擎 — 参考 llama.cpp 架构
+5. **Phase 3**：VAE 上 NPU，context 本地文本编码器
+6. INT8 CPU 量化 — 保底方案
 
 ## 关键技术路径
 ```

@@ -29,6 +29,8 @@ if _VK_AVAILABLE:
     _vk._lib.vk_gemm_run_fp16.argtypes = [_ct.c_void_p, _ct.c_void_p, _ct.c_void_p,
                                           _ct.c_int, _ct.c_int, _ct.c_int]
     _vk._lib.vk_gemm_run_fp16.restype = _ct.c_bool
+    _vk._lib.vk_gemm_get_timings_us.argtypes = [_ct.c_void_p, _ct.c_void_p, _ct.c_void_p, _ct.c_void_p, _ct.c_void_p]
+    _vk._lib.vk_gemm_get_timings_us.restype = None
 
 class HybridLinear(nn.Linear):
     """nn.Linear with Vulkan acceleration for large weight matrices."""

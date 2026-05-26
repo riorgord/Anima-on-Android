@@ -66,6 +66,15 @@ for i in range(STEPS):
 print(f"VkGEMM: {vk_ops._VK_COUNT} Vulkan calls, {vk_ops._CPU_COUNT} CPU calls")
 print(f"  VK wall: {vk_ops._VK_TIME:.0f}s  CPU: {vk_ops._CPU_TIME:.0f}s")
 
+# Internal phase breakdown (from C++ clock_gettime)
+import vk_linear, ctypes
+_pack = ctypes.c_double(); _cmd = ctypes.c_double(); _gpu = ctypes.c_double(); _read = ctypes.c_double(); _nc = ctypes.c_int()
+vk_linear._lib.vk_gemm_get_timings_us(ctypes.byref(_pack), ctypes.byref(_cmd), ctypes.byref(_gpu), ctypes.byref(_read), ctypes.byref(_nc))
+_n = _nc.value or 1
+print(f"  Phases (avg/{_n} calls): pack={_pack.value/_n*1e-3:.1f}ms cmd={_cmd.value/_n*1e-3:.1f}ms gpu={_gpu.value/_n*1e-3:.1f}ms read={_read.value/_n*1e-3:.1f}ms")
+_pack_s = _pack.value * 1e-6; _cmd_s = _cmd.value * 1e-6; _gpu_s = _gpu.value * 1e-6; _read_s = _read.value * 1e-6
+print(f"  Breakdown: pack={_pack_s:.0f}s cmd={_cmd_s:.0f}s submit+wait={_gpu_s:.0f}s read={_read_s:.0f}s")
+
 # VAE — our fixed WanVAE (latent normalization added)
 print("Loading VAE...")
 vae_sd = torch.load("/sdcard/anima_on_android/models/vae_weights_fp16.pt", weights_only=True)

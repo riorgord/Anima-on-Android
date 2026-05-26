@@ -122,13 +122,11 @@ output/       生成图片输出
 
 ## Vulkan GPU 加速状态
 
-独立 GEMM benchmark：Adreno 730 上 7.8× 加速，max_err=0.0001，结果正确。
+**正确性**：dispatch swap bug 已修复（`gemm.comp` 2 行改动），281 GEMM 全部正确，3 步管线出图正常 ✅
 
-管线集成受阻于 Adreno 7xx 驱动 bug：相同 Vulkan 代码在独立 C++ 二进制中完全正确，但在 `.so`（通过 ctypes/dlopen 加载）中输出垃圾（inf/nan）。根因疑似 HOST_COHERENT 缓存一致性 bug。详见 `STATUS.md`。
+**速度**：Vulkan 220s/步 vs CPU 120s/步。根因是通用 tiled GEMM shader 在 Adreno 730 上仅跑出 ~14 GFLOPS（理论峰值 1,843 GFLOPS，利用率 0.75%）。详见 `STATUS.md`。
 
-后续方向：
-1. 改用 subprocess 调用独立 binary 代替 ctypes `.so`
-2. INT8 CPU 量化作为保底方案
+**下一步**：C++ 推理引擎路线。Phase 1 先优化 GEMM kernel 适配 Adreno；Phase 2 全 DiT forward C++ 化；Phase 3 VAE 上 NPU。
 
 ## 致谢
 
