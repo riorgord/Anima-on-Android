@@ -1,5 +1,5 @@
 #version 450
-// Native fp16 GEMM: f16vec4 + dot() + float16_t SSBO
+// Native fp16 GEMM: f16vec4 + dot() — no shared memory (Adreno barriers too expensive)
 // Based on ncnn innerproduct pack4 approach, simplified for pure GEMM.
 #extension GL_EXT_shader_16bit_storage: require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16: require
@@ -11,11 +11,7 @@ layout(binding = 1) readonly  buffer B_buf { f16vec4 B_pack4[]; };
 layout(binding = 2) writeonly buffer C_buf { float16_t C[]; };
 
 layout(push_constant) uniform PC {
-    uint M;        // output rows
-    uint N;        // output cols
-    uint K;        // inner dimension
-    uint batch;
-    float alpha;
+    uint M; uint N; uint K; uint batch; float alpha;
 } pc;
 
 void main() {
@@ -26,7 +22,7 @@ void main() {
     float sum = 0.0;
     uint k4 = pc.K / 4u;
 
-    // f16vec4 load: single 8-byte read per vec4 (vs 4× 2-byte reads)
+    // Sequential f16vec4 global reads: Adreno L2 cache handles this well
     for (uint k = 0u; k < k4; k++) {
         f16vec4 av = A_pack4[row * k4 + k];
         f16vec4 bv = B_pack4[col * k4 + k];
@@ -36,11 +32,10 @@ void main() {
     // Remainder (K % 4) — all our K values (68, 2048, 8192) are divisible by 4
     uint rem = pc.K - k4 * 4u;
     if (rem > 0u) {
-        uint k = k4;
-        f16vec4 av_last = A_pack4[row * k4 + k];
-        f16vec4 bv_last = B_pack4[col * k4 + k];
         for (uint r = 0u; r < rem; r++) {
-            sum += float(av_last[r]) * float(bv_last[r]);
+            uint k = k4 * 4u + r;
+            sum += float(A_pack4[row * k4 + k / 4u][k % 4u])
+                 * float(B_pack4[col * k4 + k / 4u][k % 4u]);
         }
     }
 

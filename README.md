@@ -132,4 +132,5 @@ output/       生成图片输出
 
 - 模型：[circlestone-labs/Anima](https://huggingface.co/circlestone-labs/Anima)
 - 代码改编自：ComfyUI ([GPL-3.0](https://github.com/comfyanonymous/ComfyUI))、[DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio) (Apache 2.0)、NVIDIA Cosmos (Apache 2.0)、Wan-Video VAE (Apache 2.0)
+- Vulkan GEMM shader 参考：[ncnn](https://github.com/Tencent/ncnn) (BSD-3-Clause) by Tencent — innerproduct pack4 + fp16 vectorization 设计思路
 - 开发辅助：DeepSeek V4 Pro + Claude Code
