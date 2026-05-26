@@ -1,4 +1,4 @@
-# Anima 项目状态摘要 (2026-05-25)
+# Anima 项目状态摘要 (2026-05-26 更新)
 
 ## 我们在做什么
 在 Snapdragon 8+ Gen1 手机上运行 Anima 动漫风格图像生成模型 (2B DiT)。
@@ -23,7 +23,9 @@
 - ✅ Vulkan GEMM benchmark：Adreno 730 7.8× 加速，max_err=0.0001 (独立测试正确)
 
 ## 当前状态
-- ⚠️ Vulkan GEMM 在管线内/`.so` 内出错，但独立 C++ 二进制完全正确。根因深于预期。
+- ⚠️ Vulkan GEMM 在真实 shape（M=512, N=2048）下出错，输出有"漏算位置 vk=0.0000"。
+  之前 STATUS.md 中关于 ".so 出垃圾" 的所有诊断已被推翻：根因是 binary/dl_test 当时用 `tile=4` 跑触发 shader 退化，参数污染。
+  当前怀疑：shape 较大 + 真实数据触发的 shader 或 driver bug，跟 K 是否 16 倍数无关、跟 .so vs binary 无关。
 
 ## Vulkan 加速调试进展 (2026-05-25 今天)
 
@@ -38,31 +40,50 @@ Type 3 (`HOST_VISIBLE | HOST_CACHED`，无 COHERENT) **不在 memoryTypeBits 里
 
 | 策略 | 描述 | 结果 |
 |------|------|------|
-| COHERENT | Type 6 直用，无 flush/invalidate | standalone ✅ .so ❌ |
+| COHERENT | Type 6 直用，无 flush/invalidate | standalone ✅ ~~.so ❌~~ |
 | NOCOHERENT | Type 6 + vkFlush/Invalidate (多余) | standalone ✅ |
-| DEVICE_LOCAL | Type 0 计算 + Type 6 staging + vkCmdCopyBuffer | standalone ✅ .so ❌ |
+| DEVICE_LOCAL | Type 0 计算 + Type 6 staging + vkCmdCopyBuffer | standalone ✅ ~~.so ❌~~ |
 
-### 诡异现象
-- **独立 C++ 二进制** (`vk_type_test`, `vk_bridge`)：三种策略全部 max_err=0 ✅
-- **`.so` 形式** (`libvk_gemm.so`)：通过 ctypes / dlopen 加载，输出全是 inf/nan ❌
-- **CPU-only `.so`** (`libvk_gemm_cpu.so`)：通过 ctypes 加载，完全正确 ✅ → 排除 ctypes 传参问题
-- 连 **direct staging**（不经过 device-local copy，只把 staging buffer 绑 descriptor dispatch）在 `.so` 里也出垃圾
-- 即使 **每次 run 创建全新 buffer**（不重用），`.so` 也出垃圾
-- **vk_bridge 独立二进制**（完全相同的 device-local+staging 逻辑）输出也是垃圾！
+~~.so ❌~~ 这两条结论 2026-05-25 时是基于参数污染的测试得出的，已推翻。详见下方"现象（2026-05-26 重新核实后修正）"。
 
-结论：**Vulkan compute 在 Adreno 730 上，只要代码以 `.so` 或特定方式编译就会出 bug**。独立 `main()` 二进制可能因为链接方式（非 PIC）或初始化时机不同而避开 bug。根本原因尚未确认。
+### 现象（2026-05-26 重新核实后修正）
+
+**Binary 路径基线（已重新核实，全部正确）：**
+- `vk_type_test`：三种 memory 策略（COHERENT/NOCOHERENT/DEVICE_LOCAL），64×64×64 → max_err=0 ✅
+- `vk_bridge`：64×64×64 tile=16，identity@ones → max_err=0 ✅
+- `dl_test64`（独立 binary + dlopen libvk_gemm.so）：64×64×64 tile=16 → max_err=0 ✅
+
+**~~vk_bridge 出垃圾~~** ← 错。原因是当时跑 `tile=4`（gemm.spv specialization=16，tile=4 触发 workgroup 配置退化）。改 tile=16 后正常。
+
+**~~`.so` 通过 dlopen 加载出 inf/nan~~** ← 错。原因是 dl_test.cpp 当时用 `M=N=K=4`（即使 init(64,64,64,16)，run 的 4×4 同样触发 shader 退化）。改 64×64 后 dl_test64 完美。
+
+**~~direct staging / fresh buffer / .so 路径 各种"诡异 garbage"~~** ← 全部基于同一参数污染，不可信。
+
+**真实翻车点（2026-05-26 真管线 diagnostic 发现）：**
+- `phone_pipeline` 1 步 DiT 第一个 GEMM = `x_embedder.proj` (M=512, N=2048, K=68)，max_err=2.6，nan=0 inf=0
+- 用 `dl_test_K68` 复现：M=512, N=2048, K∈{64,68,80} randn 数据 → 全部 max_err≈0.55，**worst 位置 vk_out=0.0000**（shader 漏算）
+- 跟 K 是否 16 倍数无关；跟 .so vs binary 无关；跟数据是否非平凡有关（identity+ones 对，randn 错）
+
+**当前怀疑**：大 shape 下 shader 或 driver 漏算了某些 dispatch group。下一步 B+A 结合定位（读 shader + 针对性扫边界）。
+
+### CPU-only `.so` 排除项
+- `libvk_gemm_cpu.so` 通过 ctypes 加载完全正确 → 排除 ctypes 传参问题，问题在 Vulkan 路径本身。
 
 ### 已修改文件
 - `D:\android_vk\build_android.bat\main.cpp` — 多版迭代（Type 3 尝试、device-local+staging、fresh buffers per call），当前版本是 device-local+staging+每次创建新鲜 buffer
 - `D:\android_vk\build_android.bat\bridge.cpp` — 同上逻辑的独立二进制版本
+- `D:\android_vk\build_android.bat\dl_test64.cpp` + `build_dl_test64.bat` — 2026-05-26 新加，binary 内 dlopen .so 跑 64×64×64 验证（已 PASS）
+- `D:\android_vk\build_android.bat\dl_test_K68.cpp` — 2026-05-26 新加，复现真实管线 shape (M=512 N=2048 K=68) 翻车
 - `D:\shoukunshangde_Anima_zancuun\` 下有 `vk_mem_probe`, `vk_type_test`, `dl_test` 等诊断工具
 - `build_so.bat` — 编译 libvk_gemm.so
 - `build_bridge.bat` — 编译 vk_bridge
+- `vulkan/vk_ops_diag.py` (anima_phone 仓库新加) — 强制启用 Vulkan + 每次 CPU 对照 + 异常 raise 的诊断版 HybridOps；常态 `vk_ops.py` 保持 `_VK_AVAILABLE=False` 干净，需要诊断时 phone_pipeline 把 `import vk_ops` 换成 `import vk_ops_diag as vk_ops`
 
-### 后续可能方向
-1. 调查为何 `.so` 里的 Vulkan 与独立 binary 行为不同（PIC vs non-PIC? 链接差异?）
-2. 如果独立 binary 能稳定工作，改用 subprocess 调用 binary（如 vk_bridge）代替 ctypes .so
-3. INT8 CPU 量化作为保底方案
+### 后续可能方向（2026-05-26 更新）
+1. **B+A 结合定位**（进行中）：读 `vulkan/gemm.comp` shader 找边界处理漏洞 + 用 `dl_test_K68` 扫描 M/N/data 维度找阈值
+2. 如果是 shader 漏边界检查 → 修 shader 重编 .so
+3. 如果是 driver bug → 在 vk_ops 加 shape/数据范围阈值绕过；或者 subprocess 调 binary
+4. INT8 CPU 量化作为保底方案
 
 ## 关键技术路径
 ```

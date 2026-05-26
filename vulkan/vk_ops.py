@@ -18,8 +18,6 @@ _VK_N_THRESHOLD = 2048
 
 _VK_COUNT = 0
 _CPU_COUNT = 0
-_VK_COUNT = 0
-_CPU_COUNT = 0
 
 class HybridLinear(nn.Linear):
     """nn.Linear with Vulkan acceleration for large weight matrices."""
