@@ -653,7 +653,7 @@ torch
 
 Do not install large or mobile-specific toolchains yet. Do not start QNN/Android work yet.
 
-## 12. Current status (updated 2026-05-25 evening)
+## 12. Current status (updated 2026-05-26 evening)
 
 ### Completed (2026-05-25)
 
@@ -673,27 +673,42 @@ Do not install large or mobile-specific toolchains yet. Do not start QNN/Android
 | VAE decode (our VAE, fixed) | normal |
 | 3-step pipeline | 382s total |
 
-### Vulkan GEMM: Adreno driver bug identified (2026-05-25 evening)
+### Vulkan GEMM: dispatch swap bug found & fixed, GEMM shader performance profiled (2026-05-26)
 
-**Root cause**: Adreno 7xx GPU driver bug. GLSL compute shader produces inf/NaN when M<16 or N<16 (workgroup dimension too small). Binary search confirmed thresholds: M≥16, N≥16, K any.
+**The "driver bug" was wrong.** All prior "inf/nan/.so garbage" diagnoses were parameter pollution (tile=4 or shape=4×4 triggered shader degeneration). Binary baseline re-verified clean. The real bugs found and fixed:
 
-**Workaround**: Pad small matrices (M<16) with zero rows → compute → slice. Verified correct at M=16+ with max_err<0.01.
+1. **Dispatch swap bug** (gemm.comp): `gl_GlobalInvocationID` row/col mapped opposite to dispatch X/Y axes. M=N时隐藏, M≠N时columns被截断输出0. Fixed by swapping 2 lines in shader. 281 GEMM calls all max_err<0.02 ✅
 
-**Phone DiT status**: N≥2048 threshold gives 368 Vulkan + 86 CPU calls per step. Speed: 81s/step (33% faster than CPU's 123s/step). But image output still contains noise — some Vulkan layers at N≥2048 may have additional subtle driver issues. Pure CPU (0 Vulkan) confirmed clean.
+2. **GEMM shader performance**: clock_gettime internal timing revealed 98% of 178s VK wall time is in GPU submit+fence. Our generic tiled GEMM shader achieves only **14 GFLOPS on Adreno 730** — **0.75% GPU utilization** (1,843 GFLOPS theoretical fp16 peak).
 
-**Next**: Debug which specific Vulkan layers corrupt output. Narrow down from 368 → find problematic layer(s).
+**Optimizations tried and their results:**
+
+| Optimization | Expected | Actual | Conclusion |
+|---|---|---|---|
+| Cached Vulkan resources | ~30s | 2s | alloc not bottleneck |
+| fp16 direct path (no f2h/h2f) | ~20s | 3s | CPU conversion not bottleneck |
+| Batch submission (281→140 submit) | ~40s | -2s | submit/fence not bottleneck |
+| Type 6 HOST_COHERENT (no DMA) | ~150s | 0s | DMA not bottleneck |
+
+**Native fp16 shader (f16vec4 + dot)** based on ncnn approach: 149 GFLOPS (10.6× improvement, 8.1% GPU util). Per-GEMM time dropped from 627ms→100ms (K=8192). Estimated step time: ~54s (2.2× faster than CPU 120s).
+
+**Current speed**: Vulkan 220s/step, CPU 120s/step. Vulkan still slower than CPU. New shader integration in progress.
 
 亮屏 vs 息屏: 120s vs 550s (MIUI throttles CPU by 4.5× when screen off). Fixed with `screen_off_timeout=30min`.
 
-### Vulkan GPU acceleration (2026-05-25)
+### Vulkan GPU acceleration (2026-05-26)
 
-**Benchmark binary (C++)**: ✅ Adreno 730 GEMM 1024³: 7.8× speedup, max_err=0.4352. Proven correct.
-**libvk_gemm.so**: ❌ Same code produces garbage (inf/nan) — root cause unknown. Deferred.
-**vk_bridge (file IPC)**: ❌ Same garbage — `-fPIC -shared` or Vulkan state lifetime issue suspected.
+**Correctness**: Dispatch swap bug fixed. All GEMM calls max_err<0.02. 3-step pipeline output clean ✅
 
-### Current velocity
+**Speed**: 220s/step (Vulkan) vs 120s/step (CPU). Vulkan is slower because generic tiled GEMM shader is 0.75% efficient on Adreno 730.
 
-Phone pipeline: **120s/step** (256×256, 3-step = 382s). Vulkan would bring ~35s/step once .so bug fixed.
+**New fp16 shader** (f16vec4 + dot, based on ncnn): achieves 149 GFLOPS (8.1% GPU util). Integration into libvk_gemm.so in progress. Expected step time ~54s.
+
+**Phone pipeline velocity**:
+- CPU-only: 120s/step (256×256)
+- Vulkan (old shader): 220s/step
+- Vulkan (new fp16 shader, estimated): ~54s/step
+- Vulkan (target after C++ DiT): 15-30s/step
 
 ### WSL workspace
 
@@ -759,15 +774,15 @@ Same VAE root cause. Text encoder + LLMAdapter + DiT + scheduler are all verifie
 
 Anima model card's recommended sampler. Our implementation produces incorrect results. DiffSynth's `FlowMatchScheduler` (Euler + Z-Image) substitutes.
 
-### Phone pipeline status (2026-05-25 evening)
+### Phone pipeline status (2026-05-26 evening)
 
-| Config | Speed | Image |
-|--------|-------|-------|
-| CPU only | 123s/step | ✅ Clean (256×256) |
-| Vulkan (N≥2048, M≥16 guard) | 81s/step | ❌ Noise (Adreno driver bug) |
-| Vulkan standalone GEMM test | 7.8× vs CPU | ✅ max_err=0.0001 |
+| Config | Speed | Image | Notes |
+|--------|-------|-------|-------|
+| CPU only | 120s/step | ✅ Clean (256×256) | Baseline |
+| Vulkan (old generic shader) | 220s/step | ✅ Clean | dispatch swap fixed, but 0.75% GPU util |
+| Vulkan (new fp16 shader) | ~54s/step (est.) | TBD | 8.1% GPU util, integration in progress |
 
-**Decision**: Use CPU-only (123s/step). Acceptable for PoC. Vulkan/OpenCL/INT8 deferred to future.
+**Decision**: Vulkan path is correct now (dispatch swap fixed). Performance bottleneck is GEMM shader efficiency, not driver bugs. New native fp16 shader (f16vec4+dot) achieves 10.6× GPU throughput improvement. Continue optimizing shader and plan C++ DiT engine for next phase.
 
 ### Phone CPU performance note
 
@@ -833,18 +848,25 @@ Anima model card's recommended sampler. Our implementation produces incorrect re
 - Running on phone with CPU affinity locked to big cores (A710×3 + X2)
 - Expected: ~7 minutes for 5 steps
 
-#### 10d: Mobile GPU acceleration ✅ explored, deferred
+#### 10d: Mobile GPU acceleration ✅ explored, active development
 
 - **Vulkan GEMM**: GLSL shaders compiled, SPIR-V→Android NDK cross-compiled, `.so` + Python ctypes integration working
-- **Standalone test**: GEMM 1024³ on Adreno 730 → 7.8× speedup, max_err=0.0001 ✅
-- **Pipeline integration**: Speed 81s/step (33% faster than CPU). But MAX_ERR=85 inside DiT pipeline — **Adreno HOST_COHERENT bug at large buffer sizes**
-- **Root cause**: Standalone .so calls are correct; same calls inside DiT pipeline produce garbage. Suspected Adreno 730 driver cache coherency bug with large Vulkan buffers
-- **Conclusion**: Vulkan acceleration deferred. Adreno 7xx driver has unresolvable issues. OEM won't push driver updates
-- **Future alternatives**: OpenCL (Adreno supports), INT8 CPU quantization
+- **Standalone test**: GEMM 64³ on Adreno 730 → 7.8× speedup, max_err=0.0001 ✅
+- **Pipeline integration**: 281 GEMM calls per step, all correct after dispatch swap fix ✅
+- **Performance**: Original generic tiled shader only 14 GFLOPS (0.75% GPU utilization). New native fp16 shader (f16vec4+dot, based on ncnn approach) achieves 149 GFLOPS (10.6×).
+- **Conclusion**: "Driver bug" theory was wrong — all prior garbage outputs were parameter pollution. Real bottleneck is shader efficiency on Adreno's scalar/TBDR architecture.
+- **Next**: Integrate new shader into .so, then plan C++ DiT engine (keep data on GPU, avoid per-layer Python↔Vulkan boundary).
 
-### Phase 11: Mobile optimization (planned)
+### Phase 11: Mobile optimization (planned → partially in progress)
 
-**11a**: Vulkan attention shader for DiT → 10-50× speedup on attention
-**11b**: VAE decoder → ONNX/QNN for NPU
-**11c**: Text encoder on-device (HF Qwen3Model or pre-computed context caching)
-**11d**: Full 30-step 1024×1024 pipeline on phone
+**11a**: ✅ Vulkan GEMM shader — new fp16 shader achieves 149 GFLOPS (10.6× vs old, 8.1% GPU util). Integration into libvk_gemm.so in progress.
+
+**11b**: **GEMM shader further optimization** — add shared memory tiling to current fp16 shader. Target 300+ GFLOPS (15-20% GPU util). Reference: ncnn innerproduct_pack4 shader, Qualcomm Adreno Developer Guide.
+
+**11c**: **C++ DiT inference engine** — rewrite DiT forward pass in C++/Vulkan compute, keeping all data on GPU. Reference: llama.cpp Vulkan backend architecture. Target step time 15-30s.
+
+**11d**: VAE decoder → Qualcomm QNN for NPU (project plan priority item)
+
+**11e**: Text encoder on-device — investigate TinyLlama-style small encoder or pre-computed context caching
+
+**11f**: Full pipeline at higher resolutions (1024×1024, up to 2048×1024 for wallpapers)
