@@ -43,9 +43,9 @@ class HybridLinear(nn.Linear):
             if not _vk._INITIALIZED:
                 _vk._lib.vk_gemm_init(1024, 8192, 8192, 16)
                 _vk._INITIALIZED = True
-            # fp16 direct: avoid float() round-trip — no f2h/h2f in .so either
-            x_u16 = x.reshape(M, in_f).cpu().numpy().view(np.uint16)
-            w_u16 = self.weight.cpu().numpy().view(np.uint16)
+            # fp16 direct — nn.Linear may store weight as fp32, force fp16
+            x_u16 = x.reshape(M, in_f).cpu().contiguous().to(torch.float16).numpy().view(np.uint16).copy()
+            w_u16 = self.weight.detach().cpu().to(torch.float16).numpy().view(np.uint16).copy()
             out = np.zeros((M, out_f), dtype=np.uint16)
             t0 = time.perf_counter()
             ok = _vk._lib.vk_gemm_run_fp16(
