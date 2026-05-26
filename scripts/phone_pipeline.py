@@ -60,10 +60,13 @@ for i in range(STEPS):
     v_uncond = v_b[1:2].float()
     v_cfg = v_uncond + CFG * (v_cond - v_uncond)
     x = (x.float() + v_cfg.squeeze(2) * (sigma_next - sigma)).to(DTYPE)
-    print(f"  step {i+1}/{STEPS}: {dit_time:.0f}s (total {time.time()-t_start:.0f}s)")
+    print(f"  step {i+1}/{STEPS}: {dit_time:.0f}s VK={vk_ops._VK_TIME:.0f}s GPU={vk_ops._VK_GPU_TIME:.0f}s CPU={vk_ops._CPU_TIME:.0f}s (total {time.time()-t_start:.0f}s)")
 
 # Diagnostic
-print(f"VkGEMM: {vk_ops._VK_COUNT} Vulkan, {vk_ops._CPU_COUNT} CPU calls")
+print(f"VkGEMM: {vk_ops._VK_COUNT} Vulkan calls, {vk_ops._CPU_COUNT} CPU calls")
+print(f"  VK wall: {vk_ops._VK_TIME:.0f}s  GPU pure: {vk_ops._VK_GPU_TIME:.1f}s  CPU: {vk_ops._CPU_TIME:.0f}s")
+if vk_ops._VK_TIME > 0:
+    print(f"  GPU duty cycle: {vk_ops._VK_GPU_TIME/vk_ops._VK_TIME*100:.1f}%")
 
 # VAE — our fixed WanVAE (latent normalization added)
 print("Loading VAE...")
