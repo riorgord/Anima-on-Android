@@ -859,11 +859,13 @@ Anima model card's recommended sampler. Our implementation produces incorrect re
 
 ### Phase 11: Mobile optimization (planned → partially in progress)
 
-**11a**: ✅ Vulkan GEMM shader — new fp16 shader achieves 149 GFLOPS (10.6× vs old, 8.1% GPU util). Integration into libvk_gemm.so in progress.
+**11a**: ✅ Vulkan GEMM shader done — f16vec4+dot achieves 149 GFLOPS (10.6× vs old, 8.1% GPU util). Integrated into libvk_gemm.so + phone pipeline (56s/step).
 
-**11b**: **GEMM shader further optimization** — add shared memory tiling to current fp16 shader. Target 300+ GFLOPS (15-20% GPU util). Reference: ncnn innerproduct_pack4 shader, Qualcomm Adreno Developer Guide.
+**11a+**: ✅ Shared memory tiling tested and rejected — Adreno 730 barriers too expensive, 2× slower than sequential global reads.
 
-**11c**: **C++ DiT inference engine** — rewrite DiT forward pass in C++/Vulkan compute, keeping all data on GPU. Reference: llama.cpp Vulkan backend architecture. Target step time 15-30s.
+**11b**: ✅ **C++ DiT inference engine** — libdit_vk.so compiled (600KB). Full 28-block forward (self-attn+cross-attn+MLP) in one command buffer. **2.1s/step** (26.7× vs Python Vulkan 56s, 57× vs CPU 120s). Missing: x_embedder, AdaLN-LoRA, RoPE, multi-head reshape. Estimated 4-6s/step when complete.
+
+**11c**: **补全 DiT forward** — x_embedder, AdaLN-LoRA modulation, RoPE, proper multi-head attention. Target: end-to-end 3-step pipeline at 256×256.
 
 **11d**: VAE decoder → Qualcomm QNN for NPU (project plan priority item)
 

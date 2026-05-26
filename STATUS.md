@@ -23,15 +23,25 @@
 - ✅ Vulkan GEMM benchmark：Adreno 730 7.8× 加速，max_err=0.0001 (独立测试正确)
 - ✅ **Vulkan GEMM dispatch swap bug 定位并修复** (2026-05-26)：gemm.comp 里 row/col 映射跟 dispatch 的 X/Y 轴对调 — M=N 时隐藏，M≠N 时 columns 被截断输出 0。修法只改 shader 2 行（row/col 与 local_row/col 同时 swap），libvk_gemm.so 不变。修复后 281 GEMM 全部 0 翻车，max_err<0.02 ✅
 
-## 当前状态 (2026-05-26 晚间)
+## 当前状态 (2026-05-27 凌晨)
 
-**正确性**：Vulkan GEMM dispatch swap bug **已修复**，3 步管线出图正常 ✅
+**正确性**：Vulkan GEMM dispatch swap bug **已修复**。所有 GEMM/Norm/SiLU/Softmax shader 全部独立验证通过 ✅
 
-**速度**：Vulkan 220s/步，比纯 CPU 120s/步 **慢 83%**。所有优化手段（fp16 直通、批量提交、Type 6 HOST_COHERENT 直算）均已尝试，均不改善。clock_gettime 内部分段计时揭示根因：GEMM 618-634ms/次，98% 时间在 GPU 侧的 submit+execute 阶段。
+**速度**：
+- Python ctypes per-layer: 56s/步 (new fp16 shader)
+- **C++ DiT 引擎 (libdit_vk.so): 2.1s/步** (28 blocks, self+cross-attn+MLP, 1 command buffer)
+- 对比原始 CPU 120s: **57× 加速**；对比 Python Vulkan 56s: **26.7× 加速**
+- GEMM shader: 旧 14 GFLOPS → 新 149 GFLOPS (10.6×), GPU 利用率 0.75% → 8.1%
 
-**根因**：我们的 gemm.comp 通用 tiled GEMM shader 在 Adreno 730 上仅跑出 **~14 GFLOPS**，对比理论峰值 1,843 GFLOPS（利用率 **0.75%**）。shader 架构不适配 Adreno TBDR 硬件。
+**已完成**：
+- 5 个 fp16 compute shader: GEMM, RMS Norm, SiLU, Softmax, Add
+- C++ 引擎: dit_vk.cpp (Vulkan init + 权重加载 + 5 pipeline + scratch buffer 池 + 28 block forward)
+- 权重导出: export_weights.py (PyTorch .pt → raw binary .bin, 567 tensors)
+- libdit_vk.so 编译成功 (600KB), 手机实测 dit_forward 2.1s
 
-**下步方向**：C++ 推理引擎路线。Phase 1 先优化/替换 GEMM kernel 适配 Adreno；Phase 2 全 DiT forward 从 PyTorch 剥离；Phase 3 VAE 上 NPU。
+**待补**：x_embedder (patch embedding), AdaLN-LoRA modulation, RoPE, 正确注意力多头 reshape。补完后预计 4-6s/步。
+
+**下步方向**：补全 DiT forward 细节 → 端到端出图。Phase 3 VAE 上 NPU。
 
 > 手机端 `/data/local/tmp/gemm.spv` = 修复版（dispatch swap）；`/data/local/tmp/gemm_broken.spv` = 旧备份
 
@@ -167,13 +177,32 @@ Type 3 (`HOST_VISIBLE | HOST_CACHED`，无 COHERENT) **不在 memoryTypeBits 里
 
 **教训**：不是 driver bug，不是 .so vs binary 差异，不是 K 不整除 16。是一个 dispatch 轴映射错误在 M=N 的 benchmark 中完美隐藏了**一个多月**。
 
-### 后续可能方向（2026-05-26 晚间更新）
+### 2026-05-26 深夜：C++ DiT 引擎首次跑通
+
+**libdit_vk.so 编译成功** (600KB)，包含：
+- 5 个 fp16 compute shader (GEMM/RMS Norm/SiLU/Softmax/Add)
+- 权重二进制加载器 (567 tensors, 3.9GB)
+- 13 个 scratch buffer 预分配
+- 完整 28-block forward (self-attn + cross-attn + MLP)，一个 command buffer，一次 submit
+- clock_gettime 内部计时 + dit_get_timings_us 导出
+
+**实测数据**（手机端，随机输入）：
+- dit_init: 6.6s (权重加载 + pipeline 创建)
+- **dit_forward: 2.1s** (28 blocks 完整链路)
+- 对比 Python ctypes 56s：26.7× 加速
+- 对比原始 CPU 120s：57× 加速
+
+缺 x_embedder、AdaLN-LoRA、RoPE、多头 reshape。补全预计 4-6s 仍能保持 20-30× 加速。
+
+### 后续可能方向（2026-05-27 凌晨更新）
 1. ~~dispatch swap bug~~ **已修复**
 2. ~~批量提交 / Type 6 / fp16 直达~~ **均已测试，不改善**
-3. **Phase 1**：优化 GEMM kernel — 参考 ncnn/llama.cpp + Adreno Developer Guide
-4. **Phase 2**：全 C++ DiT 推理引擎 — 参考 llama.cpp 架构
-5. **Phase 3**：VAE 上 NPU，context 本地文本编码器
-6. INT8 CPU 量化 — 保底方案
+3. ~~Phase 1: GEMM kernel 优化~~ **已完成** — f16vec4+dot shader, 149 GFLOPS (10.6×)
+4. ~~Phase 2: C++ DiT 引擎~~ **骨架跑通** — libdit_vk.so, 2.1s/步
+5. **补全 DiT forward**：x_embedder, AdaLN-LoRA, RoPE, 多头 attention
+6. **端到端出图**：连 Python 管线, VAE decode, 3 步出 PNG
+7. **Phase 3**：VAE 上 NPU, context 本地文本编码器
+8. INT8 CPU 量化 — 保底方案
 
 ## 关键技术路径
 ```

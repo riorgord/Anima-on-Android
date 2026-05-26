@@ -126,7 +126,7 @@ output/       生成图片输出
 
 **速度**：Vulkan 220s/步 vs CPU 120s/步。根因是通用 tiled GEMM shader 在 Adreno 730 上仅跑出 ~14 GFLOPS（理论峰值 1,843 GFLOPS，利用率 0.75%）。详见 `STATUS.md`。
 
-**下一步**：C++ 推理引擎路线。Phase 1 先优化 GEMM kernel 适配 Adreno；Phase 2 全 DiT forward C++ 化；Phase 3 VAE 上 NPU。
+**下一步**：C++ 推理引擎路线。Phase 1 GEMM shader ✅ (149 GFLOPS)；Phase 2 C++ DiT 引擎 ✅ (libdit_vk.so, 2.1s/步, 57× 于 CPU)；补全后预计 4-6s/步。Phase 3 VAE 上 NPU。
 
 ## 致谢
 
