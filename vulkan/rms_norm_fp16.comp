@@ -1,0 +1,50 @@
+#version 450
+// RMS Norm fp16: x = x * weight * rsqrt(mean(x^2) + eps)
+// One workgroup per row, 256 threads parallel reduction
+#extension GL_EXT_shader_16bit_storage: require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16: require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer In  { float16_t in_data[];  };
+layout(binding = 1) readonly  buffer W   { float16_t weight[];   };
+layout(binding = 2) writeonly buffer Out { float16_t out_data[]; };
+
+layout(push_constant) uniform PC {
+    uint n_rows;      // total rows = B*T*H*W
+    uint n_elems;     // elements per row (2048 for DiT)
+    float eps;
+} pc;
+
+shared float shm_sq[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.n_rows) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint offset = row * pc.n_elems;
+
+    // 1. Each thread sums squares of its portion
+    float my_sq = 0.0;
+    for (uint i = tid; i < pc.n_elems; i += 256u) {
+        float v = float(in_data[offset + i]);
+        my_sq += v * v;
+    }
+    shm_sq[tid] = my_sq;
+    barrier();
+
+    // 2. Parallel reduction (256 → 1)
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) shm_sq[tid] += shm_sq[tid + s];
+        barrier();
+    }
+
+    // 3. Apply normalization
+    float rms = inversesqrt(shm_sq[0] / float(pc.n_elems) + pc.eps);
+
+    for (uint i = tid; i < pc.n_elems; i += 256u) {
+        float v = float(in_data[offset + i]) * rms;
+        out_data[offset + i] = float16_t(v * float(weight[i]));
+    }
+}

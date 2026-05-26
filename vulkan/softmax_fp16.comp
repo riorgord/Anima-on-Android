@@ -1,0 +1,60 @@
+#version 450
+// Safe softmax per row (3-pass): find max → sum(exp) → normalize
+// fp16 I/O, fp32 internal for numerical stability
+#extension GL_EXT_shader_16bit_storage: require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16: require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer In  { float16_t in_data[];  };
+layout(binding = 1) writeonly buffer Out { float16_t out_data[]; };
+
+layout(push_constant) uniform PC {
+    uint n_rows;
+    uint n_cols;
+} pc;
+
+shared float shm[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.n_rows) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint off = row * pc.n_cols;
+
+    // Pass 1: find row max
+    float mx = -1e30;
+    for (uint i = tid; i < pc.n_cols; i += 256u) {
+        float v = float(in_data[off + i]);
+        if (v > mx) mx = v;
+    }
+    shm[tid] = mx;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s && shm[tid + s] > shm[tid]) shm[tid] = shm[tid + s];
+        barrier();
+    }
+    float row_max = shm[0];
+    barrier();
+
+    // Pass 2: compute sum(exp(x - max))
+    float sm = 0.0;
+    for (uint i = tid; i < pc.n_cols; i += 256u) {
+        sm += exp(float(in_data[off + i]) - row_max);
+    }
+    shm[tid] = sm;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) shm[tid] += shm[tid + s];
+        barrier();
+    }
+    float row_sum = shm[0];
+    float inv_sum = (row_sum > 0.0) ? (1.0 / row_sum) : 1.0;
+    barrier();
+
+    // Pass 3: normalize and write output
+    for (uint i = tid; i < pc.n_cols; i += 256u) {
+        float v = exp(float(in_data[off + i]) - row_max) * inv_sum;
+        out_data[off + i] = float16_t(v);
+    }
+}
