@@ -122,14 +122,9 @@ output/       生成图片输出
 
 ## Vulkan GPU 加速状态
 
-**当前基线**：`phone_pipeline.py` — Python (HybridOps) + Vulkan GEMM per-layer，57s/步，出图 81KB ✅。
+**C++ 引擎 `libdit_vk.so`**：28-block DiT forward **13.06s/步**（vs CPU 120s, 9.2×）。
 
-**实验中**：C++ 全链路引擎（28-block DiT forward），skip-attention ~13s/步，但 GPU AdaLN 需修正。全 attention 集成因 fp16 精度和 Vulkan 同步问题暂缓。
-
-**已验证的 shader**：GEMM、LayerNorm、RMSNorm、SiLU、ScaleShift、RoPE（基础验证）。详见 `STATUS.md`。
-
-## 下一步
-逐模块在 HybridOps 框架上用 Vulkan 替换 PyTorch：AdaLN → norms → attention（online softmax）。
+**已验证**：GEMM、LayerNorm、RMSNorm、SiLU、ScaleShift、GPU AdaLN、self+cross+MLP blocks (skip-attention)。详见 `STATUS.md`。
 
 ## 致谢
 

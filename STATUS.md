@@ -1,20 +1,4 @@
-# Anima 项目状态摘要 (2026-05-28 凌晨更新)
-
-## 当前基线
-- **phone_pipeline.py**：Python + Vulkan GEMM (HybridOps)，57s/步，3 步 172s，出图 81KB ✅
-- **C++ 引擎 (skip-attn)**：~13s/步但 GPU AdaLN 从未在完整管线验证过，实际数值偏离大
-
-## Attention 集成尝试 (2026-05-27) — 已放弃，教训保留
-- GPU AdaLN 缺 external lora 和第二个 SiLU（已在代码中修复）
-- Shared memory attention shader 在隔离测试通过、管线中失败（Adreno 同步 bug）
-- 3-pass attention 有 fp16 重算精度问题，28 层累积 std 偏大
-- 结论：全链路 CPP 重写需逐模块验证策略，不可一步到位
-
-## 下一步：逐模块替换策略 (2026-05-28)
-- 在 phone_pipeline.py HybridOps 框架上，逐模块用 Vulkan 替换 PyTorch
-- 替换顺序：AdaLN → norms → attention(swa在线softmax方案)
-- 每次替换后跑完整 3 步管线验证（std + 图片大小）
-- 最终目标：全 DiT block GPU 驻留，消除 6s 搬运开销
+# Anima 项目状态摘要 (2026-05-27 晚间更新)
 
 ## 我们在做什么
 在 Snapdragon 8+ Gen1 手机上运行 Anima 动漫风格图像生成模型 (2B DiT)。
@@ -111,37 +95,6 @@ dit_forward_28blocks(x, adaln_all, out)
 - **Attention workgroup 过细**：8192 wg/self-attn → 53s/步，需合并 query rows 到一个 wg
 
 ---
-
-## Attention 集成尝试 (2026-05-27 深夜)
-
-### 目标
-把 real attention（QK^T softmax V 加权）集成到 C++ 引擎，替代 skip-attention。
-
-### 过程中发现并修复的问题
-- **GPU AdaLN 缺少 external adaln_lora**：模型 Block.forward 里 AdaLN = internal（每 block 独立）+ external（t_embedder 全局输出）。GPU 端只算了 internal，漏了 external 导致 AdaLN 偏置
-- **Cross-attn Q_proj/Q_norm 权重错误**：用了 self-attn 的权重，已修正为 cross-attn 自己的
-
-### Attention shader 三种实现及验证结果
-
-| 版本 | 方案 | 隔离测试 | Block 0 | 28-block 管线 |
-|------|------|---------|---------|-------------|
-| 3-pass | QK^T 每遍重算，无共享内存 | max_err=0.009 | max_err≈4 | std 2000+, 图 20-23KB |
-| 共享内存 fp32 | QK^T 算一次存 shared memory | max_err=0.024 | max_err=389 | 未测试 |
-| 极简单线程 | 单线程处理，无协作 | max_err=0.009 | max_err≈4 | 太慢（>50s/步） |
-
-### 根因分析
-- **3-pass 版**：QK^T 三遍重算在 fp16 下有微小舍入差异，softmax 权重不一致 → 每 block 残差有小偏置 → 28 层累积放大（std 从 block 0 的 ~2 滚到 2000+）
-- **共享内存版**：在纯 attention 隔离测试中正确，但在完整 block 管线环境中失败（max_err=389）。排除 AdaLN、RoPE、cross-attn、buffer aliasing 等因素后，判断为 Vulkan descriptor/barrier 在 Adreno 驱动下的隐式交互问题，缺少 GPU 调试器无法定位
-- **RoPE 和 cross-attn 被排除**：单独测试 self-attn real + cross-attn skip + no RoPE，std 不变，确认问题源在 self-attention 自身
-
-### 结论
-- 共享内存版在理论正确，工程上需要更深层的 Vulkan 调试手段（GPU debugger、validation layer）
-- 3-pass 版工程可用但 fp16 精度不够
-- 后续参考 PyTorch flash attention / online softmax（单 pass + warp reduce）结构重写，避免 fp16 重算
-
-### 当前可用的正确路径
-- **skip-attention 管线**（commit 92ee6b2）：13s/步，已验证出 70KB+ 标准图
-- GPU AdaLN 用 internal only 也能出图，但完整版需要 external lora（24KB）→ 后续方案 B 改 GPU AdaLN shader 加上
 
 ## 历史记录
 
