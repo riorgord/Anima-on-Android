@@ -127,3 +127,37 @@ dit_forward_28blocks(x, adaln_all, out)
 - `/data/local/tmp/*.spv` — 10 个 SPIR-V shader
 - `/sdcard/anima_on_android/scripts/phone_pipeline.py` — 端到端管线
 - `/sdcard/anima_on_android/models/` — 权重 .pt 文件 + context
+
+## 快速恢复命令
+
+```bash
+# 手机 ADB
+adb connect 192.168.0.104:5555  (WiFi)
+MSYS_NO_PATHCONV=1 adb shell ...  (防止 Git Bash 路径转换)
+
+# 手机跑 Python 管线
+adb shell "su -c 'taskset f0 /data/data/com.termux/files/usr/bin/python -u /sdcard/anima_on_android/scripts/phone_pipeline.py'"
+adb logcat -d -s "DiT_VK:*"  # 看 C++ 引擎日志
+
+# GLSL → SPIR-V 编译
+D:\Vulkan_SDK\Bin\glslangValidator.exe -V shader.comp -o shader.spv
+
+# NDK 编译 libdit_vk.so (一行版)
+set NDK=D:\android-ndk-r27d-windows\android-ndk-r27d
+set TC=%NDK%\toolchains\llvm\prebuilt\windows-x86_64
+"%TC%\bin\clang++.exe" --target=aarch64-none-linux-android28 --sysroot="%TC%\sysroot" -O2 -std=c++17 -fPIC -shared -I"D:\Vulkan_SDK\Include" -o libdit_vk.so dit_engine.cpp -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384 -Wl,--no-rosegment -llog -landroid -lvulkan -L"%TC%\sysroot\usr\lib\aarch64-linux-android\28" -static-libstdc++
+
+# 或者直接跑 build_dit.bat（含 shader 编译 + .so 编译）
+cd D:\AI\anima_phone\vulkan && build_dit.bat
+
+# 推送文件到手机
+MSYS_NO_PATHCONV=1 adb push D:/AI/anima_phone/vulkan/libdit_vk.so /data/local/tmp/
+MSYS_NO_PATHCONV=1 adb push D:/AI/anima_phone/vulkan/*.spv /data/local/tmp/
+MSYS_NO_PATHCONV=1 adb push D:/AI/anima_phone/scripts/test_*.py /sdcard/anima_on_android/scripts/
+
+# 权重导出 (PC 端, PyTorch .pt → raw .bin)
+python D:/AI/anima_phone/scripts/export_weights.py D:/AI/anima_phone/models/diffusion_weights_fp16.pt D:/AI/anima_phone/models/diffusion_weights.bin
+
+# 运行测试 (手机端)
+adb shell "su -c 'taskset f0 /data/data/com.termux/files/usr/bin/python -u /sdcard/anima_on_android/scripts/test_dit_engine.py'"
+```
