@@ -26,6 +26,7 @@
 ## 当前状态 (2026-05-27 晚间): C++ 引擎重写成功
 
 **libdit_vk.so v2**：完全重写，架构改为 per-block cmd buffer（28 个，每个 16 dispatches），回避了旧版 monolithic cmd buffer 的 Adreno submit 失败问题。
+⚠️ **已知缺陷**：GPU AdaLN 缺少第二个 SiLU 和 external lora 加法；attention 是 skip 模式（V→O），非真正的 QK^T+softmax。
 
 ### 已验证通过的链路 (PyTorch reference 对比)
 
