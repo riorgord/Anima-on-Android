@@ -247,10 +247,10 @@ static bool create_all_pipelines(VulkanCtx& ctx, const char* spv_dir) {
 static bool create_descriptor_pool(VulkanCtx& ctx) {
     VkDescriptorPoolSize poolSize = {};
     poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSize.descriptorCount = 6000;
+    poolSize.descriptorCount = 12000;  // 28 blocks × 53 dispatches × ~4 bindings
     VkDescriptorPoolCreateInfo poolInfo = {};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolInfo.maxSets = 1400;
+    poolInfo.maxSets = 3000;
     poolInfo.poolSizeCount = 1;
     poolInfo.pPoolSizes = &poolSize;
     if (vkCreateDescriptorPool(ctx.device, &poolInfo, nullptr, &ctx.descPool) != VK_SUCCESS) return false;
@@ -334,7 +334,7 @@ struct RC {
     VkCommandBuffer cmd;
     std::unordered_map<std::string, WeightInfo>* weights;
     Buffer *xBuf, *tEmbBuf, *ctxBuf, *outBuf;
-    Buffer *t1, *tQ, *tK, *tV, *tO, *rBuf, *aBuf, *nBuf, *gBuf, *bcBuf;
+    Buffer *t1, *tQ, *tK, *tV, *tO, *rBuf, *aBuf, *nBuf, *gBuf, *bcBuf, *onesBuf;
 
     void barrier() {
         VkMemoryBarrier b = {};
@@ -369,14 +369,15 @@ struct RC {
         vkUpdateDescriptorSets(vk->device, 1, &w, 0, nullptr);
     }
 
-    void dispatch_gemm(Buffer& A, const char* wname, uint32_t Mv, uint32_t Nv, uint32_t Kv, Buffer& C) {
+    void dispatch_gemm(Buffer& A, const char* wname, uint32_t Mv, uint32_t Nv, uint32_t Kv, Buffer& C,
+                        size_t wSubOff = 0) {
         auto it = weights->find(wname);
         if (it == weights->end()) { LOGE("Weight not found: %s", wname); return; }
         Buffer& wbuf = it->second.buf;
         auto& sp = vk->gemm;
         auto ds = alloc_set(sp.dsl);
         bind_buf(ds, 0, A, 0, VK_WHOLE_SIZE);
-        bind_buf(ds, 1, wbuf, 0, VK_WHOLE_SIZE);
+        bind_buf(ds, 1, wbuf, wSubOff, VK_WHOLE_SIZE);
         bind_buf(ds, 2, C, 0, VK_WHOLE_SIZE);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.layout, 0, 1, &ds, 0, nullptr);
@@ -451,11 +452,11 @@ struct RC {
         dispatch_scale_shift(x, scl, 0, sft, 0, out, n, sS, fS);
     }
 
-    void dispatch_broadcast(Buffer& in, Buffer& out, uint32_t Mv, uint32_t Dv, uint32_t rpt) {
+    void dispatch_broadcast(Buffer& in, Buffer& out, size_t outOff, uint32_t Mv, uint32_t Dv, uint32_t rpt) {
         auto& sp = vk->broadcast;
         auto ds = alloc_set(sp.dsl);
         bind_buf(ds, 0, in, 0, VK_WHOLE_SIZE);
-        bind_buf(ds, 1, out, 0, VK_WHOLE_SIZE);
+        bind_buf(ds, 1, out, outOff, VK_WHOLE_SIZE);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.layout, 0, 1, &ds, 0, nullptr);
         PC_Broadcast pc = { Mv, Dv, rpt };
@@ -492,6 +493,32 @@ struct RC {
         vkCmdPushConstants(cmd, sp.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         vkCmdDispatch(cmd, tq, 1, 1);
         barrier();
+    }
+
+    // GPU-side AdaLN for one channel (self_attn, cross_attn, or mlp)
+    // Computes: SiLU(t_emb) → LoRA down → 3×LoRA up → scale+1 → 3×broadcast
+    // Writes broadcasted shift/scale/gate to bcBuf at comp slots (base, base+1, base+2)
+    // Uses: aBuf(SiLU temp & scale+1 temp), t1(LoRA down), tQ/tK/tV(shift/scale/gate)
+    void adaln_gpu(const char* w0_name, const char* w2_name, int base_comp) {
+        size_t comp_sz = D * ADALN_LORA_DIM * 2;
+        size_t shiftSlot = (size_t)(base_comp + 1) * MS * D * 2;
+        size_t scaleSlot = (size_t)(base_comp + 0) * MS * D * 2;
+        size_t gateSlot  = (size_t)(base_comp + 2) * MS * D * 2;
+
+        // 1. SiLU(t_emb) → aBuf [M*D]
+        dispatch_silu(*tEmbBuf, *aBuf, M * D);
+        // 2. LoRA down: aBuf @ W0^T → t1 [M, 256]
+        dispatch_gemm(*aBuf, w0_name, M, ADALN_LORA_DIM, D, *t1);
+        // 3-5. LoRA up × 3: t1 @ W2 components → tQ(shift), tK(scale), tV(gate)
+        dispatch_gemm(*t1, w2_name, M, D, ADALN_LORA_DIM, *tQ, 0);
+        dispatch_gemm(*t1, w2_name, M, D, ADALN_LORA_DIM, *tK, comp_sz);
+        dispatch_gemm(*t1, w2_name, M, D, ADALN_LORA_DIM, *tV, comp_sz * 2);
+        // 6. scale+1: tK + 1.0 → aBuf (temporary)
+        dispatch_scale_shift(*tK, *onesBuf, *onesBuf, *aBuf, M * D, 0, 0);
+        // 7-9. Broadcast [M,D] → [MS,D] to bcBuf slots
+        dispatch_broadcast(*tQ, *bcBuf, shiftSlot, M, D, S);
+        dispatch_broadcast(*aBuf, *bcBuf, scaleSlot, M, D, S);  // scale+1
+        dispatch_broadcast(*tV, *bcBuf, gateSlot, M, D, S);
     }
 
     // Weight buffer lookup
@@ -557,10 +584,10 @@ bool dit_init(const char* weight_path, const char* spv_dir) {
     if (!create_buffer(g_vk, bSz, u, g_gBuf)) return false;
     if (!create_buffer(g_vk, bcastSz, u, g_bcBuf)) return false;
 
-    // Ones buffer: two fp16(1.0) values for scale+1 trick
-    if (!create_buffer(g_vk, 4, u, g_onesBuf)) return false;
-    uint16_t ones[2] = { 0x3C00 /*fp16 1.0*/, 0x3C00 };
-    memcpy(g_onesBuf.mapped, ones, 4);
+    // Ones buffer: filled with fp16(1.0)
+    if (!create_buffer(g_vk, 4096, u, g_onesBuf)) return false;
+    uint16_t* ones = (uint16_t*)g_onesBuf.mapped;
+    for (int i = 0; i < 2048; i++) ones[i] = 0x3C00;  // fp16 1.0
 
     LOGI("dit_init OK — %u buffers allocated", 15);
     g_init = true;
@@ -613,7 +640,7 @@ bool dit_record_gemm_test(const char* weight_name, uint32_t Mv, uint32_t Nv, uin
     rc.vk = &g_vk; rc.cmd = g_vk.cmd[0]; rc.weights = &g_weights;
     rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
     rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
-    rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf; rc.bcBuf = &g_bcBuf;
+    rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf; rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
 
     rc.dispatch_gemm(*rc.xBuf, weight_name, Mv, Nv, Kv, *rc.outBuf);
 
@@ -633,7 +660,7 @@ bool dit_record_oneshot(void) {
     rc.vk = &g_vk; rc.cmd = g_vk.cmd[0]; rc.weights = &g_weights;
     rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
     rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
-    rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf; rc.bcBuf = &g_bcBuf;
+    rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf; rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
 
     rc.dispatch_layernorm(*rc.xBuf, *rc.outBuf, MS, D, 1e-6f);
 
@@ -660,7 +687,7 @@ bool dit_record_self_attn(int blockIdx) {
     rc.vk = &g_vk; rc.cmd = g_vk.cmd[0]; rc.weights = &g_weights;
     rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
     rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
-    rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf; rc.bcBuf = &g_bcBuf;
+    rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf; rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
 
     rc.dispatch_layernorm(*rc.xBuf, *rc.nBuf, MS, D, 1e-6f);
     rc.dispatch_gemm(*rc.nBuf, q_w, MS, D, D, *rc.tQ);
@@ -712,7 +739,7 @@ bool dit_record_mlp(int blockIdx) {
     rc.vk = &g_vk; rc.cmd = g_vk.cmd[0]; rc.weights = &g_weights;
     rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
     rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
-    rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf; rc.bcBuf = &g_bcBuf;
+    rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf; rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
 
     rc.dispatch_layernorm(*rc.xBuf, *rc.nBuf, MS, D, 1e-6f);
     rc.dispatch_gemm(*rc.nBuf, l1_w, MS, MLP_HIDDEN, D, *rc.t1);
@@ -744,7 +771,7 @@ bool dit_record_self_attn_full(int blockIdx) {
     rc.vk = &g_vk; rc.cmd = g_vk.cmd[0]; rc.weights = &g_weights;
     rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
     rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
-    rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf; rc.bcBuf = &g_bcBuf;
+    rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf; rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
 
     // 1. LayerNorm(x) → nBuf
     rc.dispatch_layernorm(*rc.xBuf, *rc.nBuf, MS, D, 1e-6f);
@@ -794,7 +821,7 @@ bool dit_record_adaln_only(void) {
     rc.vk = &g_vk; rc.cmd = g_vk.cmd[0]; rc.weights = &g_weights;
     rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
     rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
-    rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf; rc.bcBuf = &g_bcBuf;
+    rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf; rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
 
     rc.dispatch_layernorm(*rc.xBuf, *rc.nBuf, MS, D, 1e-6f);
     rc.dispatch_scale_shift(*rc.nBuf, *rc.bcBuf, scaleOff, *rc.bcBuf, shiftOff,
@@ -820,7 +847,7 @@ bool dit_record_adaln_gemm(int blockIdx) {
     rc.vk = &g_vk; rc.cmd = g_vk.cmd[0]; rc.weights = &g_weights;
     rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
     rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
-    rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf; rc.bcBuf = &g_bcBuf;
+    rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf; rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
 
     rc.dispatch_layernorm(*rc.xBuf, *rc.nBuf, MS, D, 1e-6f);
     rc.dispatch_scale_shift(*rc.nBuf, *rc.bcBuf, scaleOff, *rc.bcBuf, shiftOff,
@@ -859,7 +886,7 @@ bool dit_record_block_full(int blockIdx) {
     rc.vk=&g_vk; rc.cmd=g_vk.cmd[0]; rc.weights=&g_weights;
     rc.xBuf=&g_xBuf; rc.tEmbBuf=&g_tEmbBuf; rc.ctxBuf=&g_ctxBuf; rc.outBuf=&g_outBuf;
     rc.t1=&g_t1; rc.tQ=&g_tQ; rc.tK=&g_tK; rc.tV=&g_tV; rc.tO=&g_tO;
-    rc.rBuf=&g_rBuf; rc.aBuf=&g_aBuf; rc.nBuf=&g_nBuf; rc.gBuf=&g_gBuf; rc.bcBuf=&g_bcBuf;
+    rc.rBuf=&g_rBuf; rc.aBuf=&g_aBuf; rc.nBuf=&g_nBuf; rc.gBuf=&g_gBuf; rc.bcBuf=&g_bcBuf; rc.onesBuf=&g_onesBuf;
 
     uint32_t ph = MS * N_HEADS;
 
@@ -920,6 +947,18 @@ static void record_one_block(RC& rc, int b, Buffer& inBuf, Buffer& outBuf) {
     snprintf(l1w,sizeof(l1w),"blocks.%d.mlp.layer1.weight",b);
     snprintf(l2w,sizeof(l2w),"blocks.%d.mlp.layer2.weight",b);
 
+    // GPU-side AdaLN for all three channels (writes to bcBuf[0..8])
+    // Weight names for block b's AdaLN modules
+    char adaln_s0[128], adaln_s2[128], adaln_c0[128], adaln_c2[128], adaln_m0[128], adaln_m2[128];
+    snprintf(adaln_s0,sizeof(adaln_s0),"blocks.%d.adaln_modulation_self_attn.1.weight",b);
+    snprintf(adaln_s2,sizeof(adaln_s2),"blocks.%d.adaln_modulation_self_attn.2.weight",b);
+    snprintf(adaln_c0,sizeof(adaln_c0),"blocks.%d.adaln_modulation_cross_attn.1.weight",b);
+    snprintf(adaln_c2,sizeof(adaln_c2),"blocks.%d.adaln_modulation_cross_attn.2.weight",b);
+    snprintf(adaln_m0,sizeof(adaln_m0),"blocks.%d.adaln_modulation_mlp.1.weight",b);
+    snprintf(adaln_m2,sizeof(adaln_m2),"blocks.%d.adaln_modulation_mlp.2.weight",b);
+
+    // Self-attn AdaLN → bcBuf[0,1,2]
+    rc.adaln_gpu(adaln_s0, adaln_s2, 0);
     // ===== Self-attn: LN→AdaLN→QKV→norms→V→O→gate+residual → tV =====
     rc.dispatch_layernorm(inBuf, *rc.nBuf, MS, D, 1e-6f);
     rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,off(0),*rc.bcBuf,off(1),*rc.nBuf, MS*D,1,1);
@@ -932,32 +971,30 @@ static void record_one_block(RC& rc, int b, Buffer& inBuf, Buffer& outBuf) {
     rc.dispatch_scale_shift(*rc.tO,*rc.bcBuf,off(2),inBuf,0,
                             *rc.tV, MS*D,1,1);                    // tV = x + gate*self_attn
 
+    // Cross-attn AdaLN → bcBuf[3,4,5]
+    rc.adaln_gpu(adaln_c0, adaln_c2, 3);
     // ===== Cross-attn: LN→AdaLN→Q(from x)→K/V(from ctx)→norms→O→gate+residual =====
     rc.dispatch_layernorm(*rc.tV, *rc.nBuf, MS, D, 1e-6f);
     rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,off(3),*rc.bcBuf,off(4),*rc.nBuf, MS*D,1,1);
-    // Q: from modulated x [MS, D] → tQ [MS, D]
     rc.dispatch_gemm(*rc.nBuf,qw,MS,D,D,*rc.tQ);
-    // K, V: from ctxBuf [MS_kv, CtxD] → t1[0:4MB](K), rBuf(V)
-    rc.dispatch_gemm(*rc.ctxBuf,cx_kw,MS_kv,D,CtxD,*rc.t1);      // K [1024,2048] → t1 (8MB buf)
-    rc.dispatch_gemm(*rc.ctxBuf,cx_vw,MS_kv,D,CtxD,*rc.rBuf);    // V [1024,2048] → rBuf (4MB, exact fit)
-    // Q_norm: same as self [MS*16, 128]
+    rc.dispatch_gemm(*rc.ctxBuf,cx_kw,MS_kv,D,CtxD,*rc.t1);
+    rc.dispatch_gemm(*rc.ctxBuf,cx_vw,MS_kv,D,CtxD,*rc.rBuf);
     rc.dispatch_rmsnorm(*rc.tQ,qnw,*rc.tQ,ph,HEAD_DIM,1e-6f);
-    // K_norm: cross-attn K [MS_kv*16, 128] = [16384, 128]
     rc.dispatch_rmsnorm(*rc.t1,cx_knw,*rc.t1,ph_cross,HEAD_DIM,1e-6f);
-    // Skip attention: feed first MS rows of V to O_proj
-    rc.dispatch_gemm(*rc.rBuf,cx_ow,MS,D,D,*rc.tO);               // tO = V[0:MS]@Wo_cross
-    // Gate+residual: tO * gate_cross + tV → gBuf  (= x after cross-attn)
+    rc.dispatch_gemm(*rc.rBuf,cx_ow,MS,D,D,*rc.tO);
     rc.dispatch_scale_shift(*rc.tO,*rc.bcBuf,off(5),*rc.tV,0,
                             *rc.gBuf, MS*D,1,1);
 
+    // MLP AdaLN → bcBuf[6,7,8]
+    rc.adaln_gpu(adaln_m0, adaln_m2, 6);
     // ===== MLP: LN→AdaLN→fc1→SiLU→fc2→gate+residual =====
     rc.dispatch_layernorm(*rc.gBuf,*rc.nBuf,MS,D,1e-6f);
     rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,off(6),*rc.bcBuf,off(7),*rc.nBuf, MS*D,1,1);
-    rc.dispatch_gemm(*rc.nBuf,l1w,MS,MLP_HIDDEN,D,*rc.t1);       // t1 now free, use for fc1
+    rc.dispatch_gemm(*rc.nBuf,l1w,MS,MLP_HIDDEN,D,*rc.t1);
     rc.dispatch_silu(*rc.t1,*rc.t1,MS*MLP_HIDDEN);
     rc.dispatch_gemm(*rc.t1,l2w,MS,D,MLP_HIDDEN,*rc.nBuf);
     rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,off(8),*rc.gBuf,0,
-                            outBuf, MS*D,1,1);                    // out = x_cross + gate*mlp
+                            outBuf, MS*D,1,1);
 }
 
 bool dit_record_n_blocks(int n) {
@@ -970,7 +1007,7 @@ bool dit_record_n_blocks(int n) {
     rc.vk=&g_vk; rc.cmd=g_vk.cmd[0]; rc.weights=&g_weights;
     rc.xBuf=&g_xBuf; rc.tEmbBuf=&g_tEmbBuf; rc.ctxBuf=&g_ctxBuf; rc.outBuf=&g_outBuf;
     rc.t1=&g_t1; rc.tQ=&g_tQ; rc.tK=&g_tK; rc.tV=&g_tV; rc.tO=&g_tO;
-    rc.rBuf=&g_rBuf; rc.aBuf=&g_aBuf; rc.nBuf=&g_nBuf; rc.gBuf=&g_gBuf; rc.bcBuf=&g_bcBuf;
+    rc.rBuf=&g_rBuf; rc.aBuf=&g_aBuf; rc.nBuf=&g_nBuf; rc.gBuf=&g_gBuf; rc.bcBuf=&g_bcBuf; rc.onesBuf=&g_onesBuf;
 
     for (int i = 0; i < n; i++) {
         Buffer* out, *in;
@@ -1001,7 +1038,7 @@ bool dit_record_block_to(int blockIdx, int cmdIdx) {
     rc.vk=&g_vk; rc.cmd=g_vk.cmd[cmdIdx]; rc.weights=&g_weights;
     rc.xBuf=&g_xBuf; rc.tEmbBuf=&g_tEmbBuf; rc.ctxBuf=&g_ctxBuf; rc.outBuf=&g_outBuf;
     rc.t1=&g_t1; rc.tQ=&g_tQ; rc.tK=&g_tK; rc.tV=&g_tV; rc.tO=&g_tO;
-    rc.rBuf=&g_rBuf; rc.aBuf=&g_aBuf; rc.nBuf=&g_nBuf; rc.gBuf=&g_gBuf; rc.bcBuf=&g_bcBuf;
+    rc.rBuf=&g_rBuf; rc.aBuf=&g_aBuf; rc.nBuf=&g_nBuf; rc.gBuf=&g_gBuf; rc.bcBuf=&g_bcBuf; rc.onesBuf=&g_onesBuf;
 
     // Block reads from xBuf, writes to outBuf (caller copies outBuf→xBuf between blocks)
     record_one_block(rc, blockIdx, *rc.xBuf, *rc.outBuf);
@@ -1019,22 +1056,20 @@ bool dit_init_all_blocks(void) {
     return true;
 }
 
-bool dit_forward_28blocks(void* x_data, void* adaln_all, void* ctx_data, void* out_data,
+bool dit_forward_28blocks(void* x_data, void* t_emb_data, void* ctx_data, void* out_data,
                            int _MS, int _D, int _M, int _Nctx, int _CtxD) {
     if (!g_init) return false;
     MS = (uint32_t)_MS; M = (uint32_t)_M; S = MS / M;
     size_t xBytes = MS * D * 2;
-    size_t adalnPerBlock = 9 * MS * D * 2;
+    size_t tBytes = M * D * 2;
+    size_t ctxBytes = M * (uint32_t)_Nctx * (uint32_t)_CtxD * 2;
 
+    // Upload inputs (t_emb and ctx stay constant across blocks)
     memcpy(g_xBuf.mapped, x_data, xBytes);
-    if (ctx_data) memcpy(g_ctxBuf.mapped, ctx_data, M * (uint32_t)_Nctx * (uint32_t)_CtxD * 2);
+    memcpy(g_tEmbBuf.mapped, t_emb_data, tBytes);
+    if (ctx_data) memcpy(g_ctxBuf.mapped, ctx_data, ctxBytes);
 
-    uint8_t* adaln = (uint8_t*)adaln_all;
     for (int i = 0; i < 28; i++) {
-        // Upload this block's AdaLN data
-        memcpy(g_bcBuf.mapped, adaln + i * adalnPerBlock, adalnPerBlock);
-
-        // Submit
         vkResetFences(g_vk.device, 1, &g_vk.fence);
         VkSubmitInfo submit = {};
         submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -1044,8 +1079,6 @@ bool dit_forward_28blocks(void* x_data, void* adaln_all, void* ctx_data, void* o
             LOGE("Submit failed at block %d", i); return false;
         }
         vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
-
-        // Copy output → xBuf for next block
         memcpy(g_xBuf.mapped, g_outBuf.mapped, xBytes);
     }
 
