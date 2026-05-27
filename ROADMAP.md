@@ -878,7 +878,11 @@ Anima model card's recommended sampler. Our implementation produces incorrect re
 
 **11b**: ✅ **C++ DiT engine v2** — libdit_vk.so (~600KB). 28 per-block cmd buffers, GPU AdaLN, 13.06s/step (9.2× vs CPU). Verified: GEMM, LN, RMSNorm, SiLU, ScaleShift, self+cross+MLP blocks with skip-attention. Pending: RoPE+Attention (shader layout fixed, workgroup too many), x_embedder/t_embedder/final_layer.
 
-**11c**: **补全 DiT forward** — RoPE + Attention（layout 已修复，shader 待优化 workgroup 合并），x_embedder + t_embedder + final_layer C++ 移植。端到端 3-step pipeline 已可用（pipeline_cpp.py + light weights），出图有格子因为 skip-attention。
+**11c**: **补全 DiT forward** — 2026-05-28 改策略：不在独立 C++ 引擎上堆 feature，改为在 phone_pipeline.py HybridOps 框架上逐模块替换。
+- AdaLN 已定位 bug（缺 SiLU + 缺 external lora），待接入 HybridOps 验证
+- Attention 待参考 online softmax + subgroup reduce 重写
+- RoPE shader 已写待验证
+- 目标：最终全 DiT block GPU 驻留，消除包装搬运开销
 
 **11d**: VAE decoder → Qualcomm QNN for NPU (project plan priority item)
 
