@@ -122,13 +122,9 @@ output/       生成图片输出
 
 ## Vulkan GPU 加速状态
 
-**C++ 引擎 `libdit_vk.so`**：重写完成，28-block DiT forward **9.9s/步**（vs Python ctypes 56s, vs CPU 120s）。
+**C++ 引擎 `libdit_vk.so`**：28-block DiT forward **13.06s/步**（vs CPU 120s, 9.2×）。
 
-**已验证**：GEMM (max_err=0.004)、LayerNorm、RMSNorm、SiLU、ScaleShift、LN+4×GEMM barrier chain、Self-attn full (max_err=0.75)、MLP full、28 blocks benchmark。
-
-**架构**：28 per-block cmd buffer (各 16 dispatches)，共享 bcBuf (18MB)。Adrenal 单 cmd buffer 上限 ~64 dispatches。
-
-**未完成**：cross-attention、RoPE+Attention 集成、GPU 端 AdaLN、端到端 phone_pipeline 出图。详见 `STATUS.md`。
+**已验证**：GEMM、LayerNorm、RMSNorm、SiLU、ScaleShift、GPU AdaLN、self+cross+MLP blocks (skip-attention)。详见 `STATUS.md`。
 
 ## 致谢
 

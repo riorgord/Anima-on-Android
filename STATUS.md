@@ -13,12 +13,14 @@
 
 ## 速度演进
 
-| 方案 | 速度 | vs CPU |
-|------|------|--------|
-| CPU only (亮屏) | 120s/步 | 1× |
-| Python ctypes per-layer Vulkan (GEMM only) | 56s/步 | 2.1× |
-| **C++ 引擎 28-block (self-attn+MLP, 无 cross-attn)** | **9.9s/步** | **12×** |
-| C++ 引擎 (估算, 加 cross-attn+RoPE+attention) | ~15-20s/步 | 6-8× |
+| 方案 | 速度 | vs CPU | 状态 |
+|------|------|--------|------|
+| CPU only (亮屏) | 120s/步 | 1× | ✅ |
+| Python ctypes per-layer Vulkan | 56s/步 | 2.1× | ✅ |
+| C++ 引擎 self-attn+MLP only | 9.9s/步 | 12× | ✅ |
+| C++ 引擎 +cross-attn | 13.3s/步 | 9× | ✅ |
+| **C++ 引擎 +GPU AdaLN** | **13.06s/步** | **9.2×** | **✅ 当前** |
+| C++ 引擎 +RoPE+Attention (目标) | ~15s/步 | 8× | ⏳ 开发中 |
 
 ## 当前状态 (2026-05-27 晚间): C++ 引擎重写成功
 
@@ -74,19 +76,23 @@ dit_forward_28blocks(x, adaln_all, out)
 
 ### 未完成
 
-- Cross-attention（K/V 从 ctx 读取，形状 M×Nctx=1024 ≠ MS=512）
-- GPU 端 AdaLN 计算（当前每步 CPU 预计算 504MB → 上传）
-- RoPE + Attention dispatch 集成
-- x_embedder, t_embedder, final_layer（仍在 PyTorch）
-- VAE decode（仍在 PyTorch）
-- 端到端 phone_pipeline 出图
+- **RoPE + Attention** ⚠️ 已尝试（commit b729aca），发现两个问题：
+  1. Attention shader 的 K/V layout 假设错误（原为 batch-head-token，实际 batch-token-head），导致格子 artifact。已定位修复但 SPIR-V 加载了旧文件
+  2. Cross-attn Q_proj/Q_norm 用错权重（用了 self 的），已定位修复
+  3. Workgroup 粒度过细（8192+16384/block），53s/步 → 需优化 attention shader
+  4. 已回退到 92ee6b2，保留 skip-attention
+- x_embedder, t_embedder, final_layer C++ 移植
+- VAE decode（暂留 PyTorch）
+- 端到端 phone_pipeline 出图（pipeline_cpp.py 已可用但出图有格子）
 
 ### 关键技术发现
 
-- **Adreno 单 cmd buffer 上限 ~64 dispatches**：超过后 vkQueueSubmit 失败。旧引擎 784 dispatch 的"全零"实际是 submit 失败（当时没检查返回值）
+- **Adreno 单 cmd buffer 上限 ~64 dispatches**：超过后 vkQueueSubmit 失败
 - **单 buffer 上限 < 3.9GB**：weight buffer 分配失败，改 per-tensor buffer 解决
-- **fp16 溢出于 block 23**：随机输入下残差累积突破 65504，真实 pipeline 输入应在正常范围
-- **验证策略**：PyTorch dump → 卸载 → C++ 对比，避免双持 OOM
+- **fp16 溢出于 block 23**：随机输入下残差累积突破 65504
+- **验证策略**：PyTorch dump → 卸载 → C++ 对比
+- **Attention Q/K/V layout**：(batch, token, head) 而非 (batch, head, token)，shader KV 访问需 stride by n_heads
+- **Attention workgroup 过细**：8192 wg/self-attn → 53s/步，需合并 query rows 到一个 wg
 
 ---
 

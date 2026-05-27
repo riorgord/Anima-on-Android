@@ -876,9 +876,9 @@ Anima model card's recommended sampler. Our implementation produces incorrect re
 
 **11a+**: ✅ Shared memory tiling tested and rejected — Adreno 730 barriers too expensive, 2× slower than sequential global reads.
 
-**11b**: ✅ **C++ DiT engine v2** — libdit_vk.so (~600KB). 28 per-block cmd buffers, 9.9s/step (12× vs CPU). Verified: GEMM, LN, RMSNorm, SiLU, ScaleShift, full block (self-attn+MLP) matching PyTorch. Pending: cross-attention, GPU AdaLN, RoPE+Attention, x_embedder/t_embedder/final_layer C++ port.
+**11b**: ✅ **C++ DiT engine v2** — libdit_vk.so (~600KB). 28 per-block cmd buffers, GPU AdaLN, 13.06s/step (9.2× vs CPU). Verified: GEMM, LN, RMSNorm, SiLU, ScaleShift, self+cross+MLP blocks with skip-attention. Pending: RoPE+Attention (shader layout fixed, workgroup too many), x_embedder/t_embedder/final_layer.
 
-**11c**: **补全 DiT forward** — cross-attention, AdaLN GPU compute, RoPE + attention integration, x_embedder + t_embedder + final_layer. Target: end-to-end 3-step pipeline at 256×256.
+**11c**: **补全 DiT forward** — RoPE + Attention（layout 已修复，shader 待优化 workgroup 合并），x_embedder + t_embedder + final_layer C++ 移植。端到端 3-step pipeline 已可用（pipeline_cpp.py + light weights），出图有格子因为 skip-attention。
 
 **11d**: VAE decoder → Qualcomm QNN for NPU (project plan priority item)
 
