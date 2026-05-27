@@ -19,7 +19,8 @@
 | Python ctypes per-layer Vulkan | 56s/步 | 2.1× | ✅ |
 | C++ 引擎 self-attn+MLP only | 9.9s/步 | 12× | ✅ |
 | C++ 引擎 +cross-attn | 13.3s/步 | 9× | ✅ |
-| **C++ 引擎 +GPU AdaLN** | **13.06s/步** | **9.2×** | **✅ 当前** |
+| **C++ 引擎 +GPU AdaLN** | **13.06s/步** | **9.2×** | benchmark 通过, 管线未验证 |
+| **phone_pipeline.py (HybridOps)** | **57s/步** | **2.1×** | **✅ 管线级正确 (81KB PNG)** |
 | C++ 引擎 +RoPE+Attention (目标) | ~15s/步 | 8× | ⏳ 开发中 |
 
 ## 当前状态 (2026-05-27 晚间): C++ 引擎重写成功
@@ -95,6 +96,14 @@ dit_forward_28blocks(x, adaln_all, out)
 - **Attention workgroup 过细**：8192 wg/self-attn → 53s/步，需合并 query rows 到一个 wg
 
 ---
+
+## 2026-05-27 Attention 集成教训
+
+Adreno 730 上同一 cmd buffer 内多个 compute dispatch 可并行执行（Vulkan 规范允许）。尝试了 VkMemoryBarrier、VkBufferMemoryBarrier、hard sync（submit+wait+新 cmd buffer）均无法修复 dispatch 间 binding 错乱。
+
+Attention shader 三种实现：3-pass（fp16 重算累积误差大）、共享内存（隔离正确管线失败）、极简（太慢）。
+
+后续策略：在 phone_pipeline.py HybridOps 框架上逐模块用 Vulkan 替换 PyTorch，每次替换必须与 PyTorch 做元素级对齐（max_err < 1），不可仅凭端到端结果判断。
 
 ## 历史记录
 

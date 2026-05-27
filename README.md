@@ -124,7 +124,11 @@ output/       生成图片输出
 
 **C++ 引擎 `libdit_vk.so`**：28-block DiT forward **13.06s/步**（vs CPU 120s, 9.2×）。
 
-**已验证**：GEMM、LayerNorm、RMSNorm、SiLU、ScaleShift、GPU AdaLN、self+cross+MLP blocks (skip-attention)。详见 `STATUS.md`。
+**已验证**：GEMM、LayerNorm、RMSNorm、SiLU、ScaleShift、self+cross+MLP blocks (skip-attention)。
+
+**已实现待验证**：GPU AdaLN（benchmark 通过，完整管线验证未完成）。
+
+**已探索暂回退**：Attention / RoPE 集成——遇到 Adreno 多 dispatch 并行执行导致的同步问题（A shader 隔离正确、管线中 binding 错乱）。详见 `STATUS.md`。
 
 ## 致谢
 

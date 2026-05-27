@@ -883,6 +883,7 @@ Anima model card's recommended sampler. Our implementation produces incorrect re
 - Attention 待参考 online softmax + subgroup reduce 重写
 - RoPE shader 已写待验证
 - 目标：最终全 DiT block GPU 驻留，消除包装搬运开销
+- **约束**：每个替换模块必须与 PyTorch 做元素级对齐验证（max_err < 1），不可仅靠 pipeline 端到端结果判断。新写的 C++ 代码需仔细检查与 torch 计算的一致性。
 
 **11d**: VAE decoder → Qualcomm QNN for NPU (project plan priority item)
 
