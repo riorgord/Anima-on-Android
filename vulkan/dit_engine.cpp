@@ -894,21 +894,33 @@ bool dit_record_block_full(int blockIdx) {
 
 static void record_one_block(RC& rc, int b, Buffer& inBuf, Buffer& outBuf) {
     // Shared bcBuf layout: 9 components at comp * MS*D*2 (no per-block offset)
+    //   [0]=scale_self [1]=shift_self [2]=gate_self
+    //   [3]=scale_cross [4]=shift_cross [5]=gate_cross
+    //   [6]=scale_mlp [7]=shift_mlp [8]=gate_mlp
     auto off = [&](int comp) -> size_t {
         return (size_t)comp * MS * D * 2;
     };
-    uint32_t ph = MS * N_HEADS;
-    char qw[128],kw[128],vw[128],ow[128],qnw[128],knw[128],l1w[128],l2w[128];
+    uint32_t ph = MS * N_HEADS;       // per-head rows for self-attn
+    uint32_t ph_cross = M * Nctx * N_HEADS;  // per-head rows for cross-attn (1024*16=16384)
+    uint32_t MS_kv = M * Nctx;        // KV tokens for cross-attn (1024)
+
+    char qw[128],kw[128],vw[128],ow[128],qnw[128],knw[128];
+    char cx_kw[128],cx_vw[128],cx_ow[128],cx_knw[128];
+    char l1w[128],l2w[128];
     snprintf(qw,sizeof(qw),"blocks.%d.self_attn.q_proj.weight",b);
     snprintf(kw,sizeof(kw),"blocks.%d.self_attn.k_proj.weight",b);
     snprintf(vw,sizeof(vw),"blocks.%d.self_attn.v_proj.weight",b);
     snprintf(ow,sizeof(ow),"blocks.%d.self_attn.output_proj.weight",b);
     snprintf(qnw,sizeof(qnw),"blocks.%d.self_attn.q_norm.weight",b);
     snprintf(knw,sizeof(knw),"blocks.%d.self_attn.k_norm.weight",b);
+    snprintf(cx_kw,sizeof(cx_kw),"blocks.%d.cross_attn.k_proj.weight",b);
+    snprintf(cx_vw,sizeof(cx_vw),"blocks.%d.cross_attn.v_proj.weight",b);
+    snprintf(cx_ow,sizeof(cx_ow),"blocks.%d.cross_attn.output_proj.weight",b);
+    snprintf(cx_knw,sizeof(cx_knw),"blocks.%d.cross_attn.k_norm.weight",b);
     snprintf(l1w,sizeof(l1w),"blocks.%d.mlp.layer1.weight",b);
     snprintf(l2w,sizeof(l2w),"blocks.%d.mlp.layer2.weight",b);
 
-    // Self-attn: LN→AdaLN→QKV→norms→V→O→gate+residual → tV (using V as "attn out")
+    // ===== Self-attn: LN→AdaLN→QKV→norms→V→O→gate+residual → tV =====
     rc.dispatch_layernorm(inBuf, *rc.nBuf, MS, D, 1e-6f);
     rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,off(0),*rc.bcBuf,off(1),*rc.nBuf, MS*D,1,1);
     rc.dispatch_gemm(*rc.nBuf,qw,MS,D,D,*rc.tQ);
@@ -916,18 +928,36 @@ static void record_one_block(RC& rc, int b, Buffer& inBuf, Buffer& outBuf) {
     rc.dispatch_gemm(*rc.nBuf,vw,MS,D,D,*rc.tV);
     rc.dispatch_rmsnorm(*rc.tQ,qnw,*rc.tQ,ph,HEAD_DIM,1e-6f);
     rc.dispatch_rmsnorm(*rc.tK,knw,*rc.tK,ph,HEAD_DIM,1e-6f);
-    rc.dispatch_gemm(*rc.tV,ow,MS,D,D,*rc.tO);                   // tO = V@Wo
+    rc.dispatch_gemm(*rc.tV,ow,MS,D,D,*rc.tO);
     rc.dispatch_scale_shift(*rc.tO,*rc.bcBuf,off(2),inBuf,0,
-                            *rc.tV, MS*D,1,1);                    // tV = x + gate*O
+                            *rc.tV, MS*D,1,1);                    // tV = x + gate*self_attn
 
-    // MLP: LN→AdaLN→fc1→SiLU→fc2→gate+residual
-    rc.dispatch_layernorm(*rc.tV,*rc.nBuf,MS,D,1e-6f);
+    // ===== Cross-attn: LN→AdaLN→Q(from x)→K/V(from ctx)→norms→O→gate+residual =====
+    rc.dispatch_layernorm(*rc.tV, *rc.nBuf, MS, D, 1e-6f);
+    rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,off(3),*rc.bcBuf,off(4),*rc.nBuf, MS*D,1,1);
+    // Q: from modulated x [MS, D] → tQ [MS, D]
+    rc.dispatch_gemm(*rc.nBuf,qw,MS,D,D,*rc.tQ);
+    // K, V: from ctxBuf [MS_kv, CtxD] → t1[0:4MB](K), rBuf(V)
+    rc.dispatch_gemm(*rc.ctxBuf,cx_kw,MS_kv,D,CtxD,*rc.t1);      // K [1024,2048] → t1 (8MB buf)
+    rc.dispatch_gemm(*rc.ctxBuf,cx_vw,MS_kv,D,CtxD,*rc.rBuf);    // V [1024,2048] → rBuf (4MB, exact fit)
+    // Q_norm: same as self [MS*16, 128]
+    rc.dispatch_rmsnorm(*rc.tQ,qnw,*rc.tQ,ph,HEAD_DIM,1e-6f);
+    // K_norm: cross-attn K [MS_kv*16, 128] = [16384, 128]
+    rc.dispatch_rmsnorm(*rc.t1,cx_knw,*rc.t1,ph_cross,HEAD_DIM,1e-6f);
+    // Skip attention: feed first MS rows of V to O_proj
+    rc.dispatch_gemm(*rc.rBuf,cx_ow,MS,D,D,*rc.tO);               // tO = V[0:MS]@Wo_cross
+    // Gate+residual: tO * gate_cross + tV → gBuf  (= x after cross-attn)
+    rc.dispatch_scale_shift(*rc.tO,*rc.bcBuf,off(5),*rc.tV,0,
+                            *rc.gBuf, MS*D,1,1);
+
+    // ===== MLP: LN→AdaLN→fc1→SiLU→fc2→gate+residual =====
+    rc.dispatch_layernorm(*rc.gBuf,*rc.nBuf,MS,D,1e-6f);
     rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,off(6),*rc.bcBuf,off(7),*rc.nBuf, MS*D,1,1);
-    rc.dispatch_gemm(*rc.nBuf,l1w,MS,MLP_HIDDEN,D,*rc.t1);
+    rc.dispatch_gemm(*rc.nBuf,l1w,MS,MLP_HIDDEN,D,*rc.t1);       // t1 now free, use for fc1
     rc.dispatch_silu(*rc.t1,*rc.t1,MS*MLP_HIDDEN);
     rc.dispatch_gemm(*rc.t1,l2w,MS,D,MLP_HIDDEN,*rc.nBuf);
-    rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,off(8),*rc.tV,0,
-                            outBuf, MS*D,1,1);                    // out = x + gate*mlp
+    rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,off(8),*rc.gBuf,0,
+                            outBuf, MS*D,1,1);                    // out = x_cross + gate*mlp
 }
 
 bool dit_record_n_blocks(int n) {
@@ -989,16 +1019,15 @@ bool dit_init_all_blocks(void) {
     return true;
 }
 
-bool dit_forward_28blocks(void* x_data, void* adaln_all, void* out_data,
-                           int _MS, int _D, int _M) {
-    // adaln_all: 28 blocks × 9 comps × [MS, D] fp16 = 504MB
-    // For each block: upload its AdaLN to bcBuf, submit cmd[i], copy out→x
+bool dit_forward_28blocks(void* x_data, void* adaln_all, void* ctx_data, void* out_data,
+                           int _MS, int _D, int _M, int _Nctx, int _CtxD) {
     if (!g_init) return false;
     MS = (uint32_t)_MS; M = (uint32_t)_M; S = MS / M;
     size_t xBytes = MS * D * 2;
     size_t adalnPerBlock = 9 * MS * D * 2;
 
     memcpy(g_xBuf.mapped, x_data, xBytes);
+    if (ctx_data) memcpy(g_ctxBuf.mapped, ctx_data, M * (uint32_t)_Nctx * (uint32_t)_CtxD * 2);
 
     uint8_t* adaln = (uint8_t*)adaln_all;
     for (int i = 0; i < 28; i++) {

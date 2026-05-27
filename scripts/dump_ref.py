@@ -44,9 +44,13 @@ with torch.no_grad():
 print(f"x_in range: [{float(x_in.min()):.3f}, {float(x_in.max()):.3f}]")
 print(f"t_emb range: [{float(t_emb.min()):.3f}, {float(t_emb.max()):.3f}]")
 
+# Generate dummy context [M, Nctx, CtxD] = [2, 512, 1024]
+ctx = torch.randn(M, 512, 1024, dtype=torch.float32)
+
 # Save inputs
 np.save(f"{OUT}/x_in.npy", x_in.numpy().astype(np.float16))
 np.save(f"{OUT}/t_emb.npy", t_emb.numpy().astype(np.float16))
+np.save(f"{OUT}/ctx.npy", ctx.numpy().astype(np.float16))
 print("Inputs saved")
 
 # Compute and save AdaLN for all blocks
@@ -69,6 +73,9 @@ for i in range(28):
     sc_s, sh_s, ga_s = adaln(t_emb,
         sd[pfx+"adaln_modulation_self_attn.1.weight"],
         sd[pfx+"adaln_modulation_self_attn.2.weight"])
+    sc_c, sh_c, ga_c = adaln(t_emb,
+        sd[pfx+"adaln_modulation_cross_attn.1.weight"],
+        sd[pfx+"adaln_modulation_cross_attn.2.weight"])
     sc_m, sh_m, ga_m = adaln(t_emb,
         sd[pfx+"adaln_modulation_mlp.1.weight"],
         sd[pfx+"adaln_modulation_mlp.2.weight"])
@@ -77,33 +84,55 @@ for i in range(28):
     adaln_all[base+0*n_elem:base+1*n_elem] = sc_s
     adaln_all[base+1*n_elem:base+2*n_elem] = sh_s
     adaln_all[base+2*n_elem:base+3*n_elem] = ga_s
+    adaln_all[base+3*n_elem:base+4*n_elem] = sc_c
+    adaln_all[base+4*n_elem:base+5*n_elem] = sh_c
+    adaln_all[base+5*n_elem:base+6*n_elem] = ga_c
     adaln_all[base+6*n_elem:base+7*n_elem] = sc_m
     adaln_all[base+7*n_elem:base+8*n_elem] = sh_m
     adaln_all[base+8*n_elem:base+9*n_elem] = ga_m
 
-    # Compute reference (simplified: self-attn + MLP, no cross-attn)
+    # Reference: self-attn + cross-attn + MLP (matching C++ engine)
     w_q = sd[pfx+"self_attn.q_proj.weight"]
-    w_k = sd[pfx+"self_attn.k_proj.weight"]
     w_v = sd[pfx+"self_attn.v_proj.weight"]
     w_o = sd[pfx+"self_attn.output_proj.weight"]
     w_qn = sd[pfx+"self_attn.q_norm.weight"].float()
+    cx_k = sd[pfx+"cross_attn.k_proj.weight"]
+    cx_v = sd[pfx+"cross_attn.v_proj.weight"]
+    cx_o = sd[pfx+"cross_attn.output_proj.weight"]
+    cx_kn = sd[pfx+"cross_attn.k_norm.weight"].float()
     w_l1 = sd[pfx+"mlp.layer1.weight"]
     w_l2 = sd[pfx+"mlp.layer2.weight"]
 
+    def unpack(arr, off):
+        return torch.from_numpy(arr[off*n_elem:(off+1)*n_elem].view(np.float16).reshape(MS,D).astype(np.float32))
+
+    # Self-attn
     ln = F.layer_norm(x_ref, (D,), weight=None, bias=None, eps=1e-6)
-    mod = ln * torch.from_numpy(sc_s.view(np.float16).reshape(MS,D).astype(np.float32)) + \
-                torch.from_numpy(sh_s.view(np.float16).reshape(MS,D).astype(np.float32))
+    mod = ln * unpack(sc_s,0) + unpack(sh_s,0)
     q = F.linear(mod, w_q.float()); v = F.linear(mod, w_v.float())
     q = F.rms_norm(q.reshape(MS*16,128),(128,),weight=w_qn,eps=1e-6).reshape(MS,D)
     o = F.linear(v, w_o.float())
-    x_ref = x_ref + torch.from_numpy(ga_s.view(np.float16).reshape(MS,D).astype(np.float32)) * o
+    x_ref = x_ref + unpack(ga_s,0) * o
 
-    ln2 = F.layer_norm(x_ref, (D,), weight=None, bias=None, eps=1e-6)
-    mod2 = ln2 * torch.from_numpy(sc_m.view(np.float16).reshape(MS,D).astype(np.float32)) + \
-                 torch.from_numpy(sh_m.view(np.float16).reshape(MS,D).astype(np.float32))
-    h = F.linear(mod2, w_l1.float()); h = F.silu(h)
+    # Cross-attn
+    ctx_f = ctx.float()
+    ln_c = F.layer_norm(x_ref, (D,), weight=None, bias=None, eps=1e-6)
+    mod_c = ln_c * unpack(sc_c,0) + unpack(sh_c,0)
+    q_c = F.linear(mod_c, w_q.float())  # Q from x, same weight as self-attn q_proj
+    k_c = F.linear(ctx_f.reshape(M*512,1024), cx_k.float())  # [1024,2048]
+    v_c = F.linear(ctx_f.reshape(M*512,1024), cx_v.float())  # [1024,2048]
+    q_c = F.rms_norm(q_c.reshape(MS*16,128),(128,),weight=w_qn,eps=1e-6).reshape(MS,D)
+    k_c = F.rms_norm(k_c.reshape(1024*16,128),(128,),weight=cx_kn,eps=1e-6).reshape(1024,D)
+    # Skip attention: V[0:MS] → O
+    o_c = F.linear(v_c[:MS], cx_o.float())
+    x_ref = x_ref + unpack(ga_c,0) * o_c
+
+    # MLP
+    ln_m = F.layer_norm(x_ref, (D,), weight=None, bias=None, eps=1e-6)
+    mod_m = ln_m * unpack(sc_m,0) + unpack(sh_m,0)
+    h = F.linear(mod_m, w_l1.float()); h = F.silu(h)
     fc2 = F.linear(h, w_l2.float())
-    x_ref = x_ref + torch.from_numpy(ga_m.view(np.float16).reshape(MS,D).astype(np.float32)) * fc2
+    x_ref = x_ref + unpack(ga_m,0) * fc2
 
 # Save
 adaln_all.tofile(f"{OUT}/adaln_all.bin")
