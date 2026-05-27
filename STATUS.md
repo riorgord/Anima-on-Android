@@ -23,25 +23,15 @@
 - ✅ Vulkan GEMM benchmark：Adreno 730 7.8× 加速，max_err=0.0001 (独立测试正确)
 - ✅ **Vulkan GEMM dispatch swap bug 定位并修复** (2026-05-26)：gemm.comp 里 row/col 映射跟 dispatch 的 X/Y 轴对调 — M=N 时隐藏，M≠N 时 columns 被截断输出 0。修法只改 shader 2 行（row/col 与 local_row/col 同时 swap），libvk_gemm.so 不变。修复后 281 GEMM 全部 0 翻车，max_err<0.02 ✅
 
-## 当前状态 (2026-05-27 凌晨)
+## 当前状态 (2026-05-27 上午)
 
-**正确性**：Vulkan GEMM dispatch swap bug **已修复**。所有 GEMM/Norm/SiLU/Softmax shader 全部独立验证通过 ✅
+**正确性**：Vulkan GEMM dispatch swap bug **已修复**。GEMM/RMS Norm/SiLU/Softmax shader 全部独立验证通过 ✅
 
-**速度**：
-- Python ctypes per-layer: 56s/步 (new fp16 shader)
-- **C++ DiT 引擎 (libdit_vk.so): 2.1s/步** (28 blocks, self+cross-attn+MLP, 1 command buffer)
-- 对比原始 CPU 120s: **57× 加速**；对比 Python Vulkan 56s: **26.7× 加速**
-- GEMM shader: 旧 14 GFLOPS → 新 149 GFLOPS (10.6×), GPU 利用率 0.75% → 8.1%
+**速度**：Python ctypes per-layer Vulkan: **56s/步** (2.4× 于 CPU 120s)。GEMM shader: 旧 14 GFLOPS → 新 149 GFLOPS (10.6×), GPU 利用率 8.1%
 
-**已完成**：
-- 5 个 fp16 compute shader: GEMM, RMS Norm, SiLU, Softmax, Add
-- C++ 引擎: dit_vk.cpp (Vulkan init + 权重加载 + 5 pipeline + scratch buffer 池 + 28 block forward)
-- 权重导出: export_weights.py (PyTorch .pt → raw binary .bin, 567 tensors)
-- libdit_vk.so 编译成功 (600KB), 手机实测 dit_forward 2.1s
+**C++ 引擎 (libdit_vk.so) 结论**：编译成功但从未产出非零输出。根因排查：descriptor pool 在 command 录制时被销毁（vkDestroyDescriptorPool）。修复后仍为全零，怀疑 Adreno Vulkan 驱动对超长 command buffer（784 dispatches）存在未公开限制。**放弃独立引擎路线。**
 
-**待补**：x_embedder (patch embedding), AdaLN-LoRA modulation, RoPE, 正确注意力多头 reshape。补完后预计 4-6s/步。
-
-**下步方向**：补全 DiT forward 细节 → 端到端出图。Phase 3 VAE 上 NPU。
+**下步方向**：把 RMS Norm / SiLU / Softmax / Add 四个已验证 shader 加进 libvk_gemm.so 作为导出函数，Python ctypes 逐层调。GEMM 已有 149 GFLOPS 打底，加上非 GEMM 的 GPU 加速。不动 C++ 独立引擎。
 
 > 手机端 `/data/local/tmp/gemm.spv` = 修复版（dispatch swap）；`/data/local/tmp/gemm_broken.spv` = 旧备份
 
@@ -177,30 +167,19 @@ Type 3 (`HOST_VISIBLE | HOST_CACHED`，无 COHERENT) **不在 memoryTypeBits 里
 
 **教训**：不是 driver bug，不是 .so vs binary 差异，不是 K 不整除 16。是一个 dispatch 轴映射错误在 M=N 的 benchmark 中完美隐藏了**一个多月**。
 
-### 2026-05-26 深夜：C++ DiT 引擎首次跑通
+### 2026-05-27 上午：C++ 引擎回顾 & 路线修正
 
-**libdit_vk.so 编译成功** (600KB)，包含：
-- 5 个 fp16 compute shader (GEMM/RMS Norm/SiLU/Softmax/Add)
-- 权重二进制加载器 (567 tensors, 3.9GB)
-- 13 个 scratch buffer 预分配
-- 完整 28-block forward (self-attn + cross-attn + MLP)，一个 command buffer，一次 submit
-- clock_gettime 内部计时 + dit_get_timings_us 导出
+**libdit_vk.so 尝试**：编译成功 (600KB)，但从未产出非零输出。2.1s 的数字是"假跑通"——upload + record + submit + readback 全走了，但所有 dispatch 都出了零。排查方向包括 descriptor pool 生命周期、command buffer 大小限制（784 dispatches）、Adreno 驱动 bug。**放弃独立引擎路线。**
 
-**实测数据**（手机端，随机输入）：
-- dit_init: 6.6s (权重加载 + pipeline 创建)
-- **dit_forward: 2.1s** (28 blocks 完整链路)
-- 对比 Python ctypes 56s：26.7× 加速
-- 对比原始 CPU 120s：57× 加速
+**修正路线**：把 RMS Norm / SiLU / Softmax / Add 四个已验证 shader 加进 libvk_gemm.so 作为导出函数。GEMM 路径已验证正确（149 GFLOPS, max_err<0.13），四个非 GEMM shader 各自独立验证通过。Python ctypes 逐层调用，保持现有的 HybridLinear 架构但增加 GPU 加速的非 GEMM ops。
 
-缺 x_embedder、AdaLN-LoRA、RoPE、多头 reshape。补全预计 4-6s 仍能保持 20-30× 加速。
-
-### 后续可能方向（2026-05-27 凌晨更新）
+### 后续可能方向（2026-05-27 上午更新）
 1. ~~dispatch swap bug~~ **已修复**
-2. ~~批量提交 / Type 6 / fp16 直达~~ **均已测试，不改善**
-3. ~~Phase 1: GEMM kernel 优化~~ **已完成** — f16vec4+dot shader, 149 GFLOPS (10.6×)
-4. ~~Phase 2: C++ DiT 引擎~~ **骨架跑通** — libdit_vk.so, 2.1s/步
-5. **补全 DiT forward**：x_embedder, AdaLN-LoRA, RoPE, 多头 attention
-6. **端到端出图**：连 Python 管线, VAE decode, 3 步出 PNG
+2. ~~批量提交 / Type 6 / fp16 直达 / shared memory tiling~~ **均已测试**
+3. ~~Phase 1: GEMM 优化~~ **已完成** — 149 GFLOPS (10.6×)
+4. ~~Phase 2: C++ 独立引擎~~ **放弃** — 784 dispatch 超长 cmd buffer 不工作
+5. **加非 GEMM shader 入 libvk_gemm.so** — RMS Norm / SiLU / Softmax / Add
+6. **端到端出图** — Python 管线, VAE decode, 3 步出 PNG
 7. **Phase 3**：VAE 上 NPU, context 本地文本编码器
 8. INT8 CPU 量化 — 保底方案
 
