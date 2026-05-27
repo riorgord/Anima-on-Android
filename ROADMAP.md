@@ -653,27 +653,40 @@ torch
 
 Do not install large or mobile-specific toolchains yet. Do not start QNN/Android work yet.
 
-## 12. Current status (updated 2026-05-26 evening)
+## 12. Current status (updated 2026-05-27 evening)
 
-### Completed (2026-05-25)
+### C++ Vulkan Engine v2 — REWRITTEN & WORKING
 
-- **Phase 9**: DiffSynth baseline verified — base + turbo on 3060 12G ✅
-- **Phase 10a**: DiT export → native PyTorch adopted ✅
-- **Phase 10b**: Phone DiT native inference — H=32, 120s/step (亮屏) ✅
-- **Phase 10c**: Phone e2e pipeline — 3~10 step 256×256 images generated ✅
-- **VAE grid bug**: FIXED — missing latent mean/std normalization in wan_vae.py
-- **Vulkan**: GLSL shaders compiled → SPIR-V; Android NDK binary framework written
+- **libdit_vk.so**: ~1000 lines, 8 shader pipelines, 28 per-block cmd buffers
+- **Speed**: 9.9s/step (28 blocks, self-attn+MLP), 12× vs CPU 120s, 5.7× vs Python ctypes 56s
+- **Correctness**: Block 0 with real pipeline inputs — max_err=0.75 vs PyTorch, mean/std matching
+- **Architecture**: Per-tensor weight buffers (567 tensors, 3.9GB), shared bcBuf (18MB), Type 6 unified memory
 
-### Key metrics (phone, 亮屏)
+### Key technical findings
 
-| Component | CPU time |
-|-----------|----------|
-| DiT load | 14s |
-| DiT forward (H=32) | 120s/step (batched CFG) |
-| VAE decode (our VAE, fixed) | normal |
-| 3-step pipeline | 382s total |
+- Adreno single cmd buffer limit ~64 dispatches (submit fails beyond)
+- Single VkBuffer allocation fails at 3.9GB (per-tensor buffers solve)
+- fp16 overflow risk at block 23+ with out-of-distribution inputs (real pipeline inputs should be fine)
+- Old engine's "all zeros" was vkQueueSubmit failure, not driver bug
+- Validation strategy: PyTorch dump → unload → C++ compare (avoid dual 3.9GB OOM)
 
-### Vulkan GEMM: dispatch swap bug found & fixed, GEMM shader performance profiled (2026-05-26)
+### Completed
+
+- ✅ Phase 10c: Phone e2e pipeline — 3-step 256×256 via Python CPU/ctypes
+- ✅ Vulkan GEMM 149 GFLOPS (f16vec4+dot shader)
+- ✅ C++ engine v2: init, weight loading, 8 pipelines, 28-block recording, forward
+- ✅ Per-shader validation: GEMM, LayerNorm, RMSNorm, SiLU, ScaleShift
+- ✅ Multi-dispatch barrier chain validation: LN+4×GEMM, full self-attn block
+- ✅ Full block (self-attn+MLP) with real pipeline inputs validated
+
+### Pending
+
+- Cross-attention (K/V from ctx, shapes differ)
+- GPU-side AdaLN (currently CPU pre-compute 504MB upload)
+- RoPE + Attention dispatch integration
+- x_embedder, t_embedder, final_layer C++ port
+- VAE decode (stay PyTorch for now)
+- End-to-end phone_pipeline integration
 
 **The "driver bug" was wrong.** All prior "inf/nan/.so garbage" diagnoses were parameter pollution (tile=4 or shape=4×4 triggered shader degeneration). Binary baseline re-verified clean. The real bugs found and fixed:
 
@@ -705,10 +718,10 @@ Do not install large or mobile-specific toolchains yet. Do not start QNN/Android
 **New fp16 shader** (f16vec4 + dot, based on ncnn): achieves 149 GFLOPS (8.1% GPU util). Integration into libvk_gemm.so in progress. Expected step time ~54s.
 
 **Phone pipeline velocity**:
-- CPU-only: 120s/step (256×256)
-- Vulkan (old shader): 220s/step
-- Vulkan (new fp16 shader, estimated): ~54s/step
-- Vulkan (target after C++ DiT): 15-30s/step
+- CPU-only: 120s/step (256×256) ✅
+- Python ctypes per-layer Vulkan: 56s/step ✅
+- **C++ engine v2 (28 blocks): 9.9s/step** ✅ (self-attn+MLP only)
+- C++ engine (est. +cross-attn+attention): ~15-20s/step ⏳
 
 ### WSL workspace
 
@@ -863,9 +876,9 @@ Anima model card's recommended sampler. Our implementation produces incorrect re
 
 **11a+**: ✅ Shared memory tiling tested and rejected — Adreno 730 barriers too expensive, 2× slower than sequential global reads.
 
-**11b**: ✅ **C++ DiT inference engine** — libdit_vk.so compiled (600KB). Full 28-block forward (self-attn+cross-attn+MLP) in one command buffer. **2.1s/step** (26.7× vs Python Vulkan 56s, 57× vs CPU 120s). Missing: x_embedder, AdaLN-LoRA, RoPE, multi-head reshape. Estimated 4-6s/step when complete.
+**11b**: ✅ **C++ DiT engine v2** — libdit_vk.so (~600KB). 28 per-block cmd buffers, 9.9s/step (12× vs CPU). Verified: GEMM, LN, RMSNorm, SiLU, ScaleShift, full block (self-attn+MLP) matching PyTorch. Pending: cross-attention, GPU AdaLN, RoPE+Attention, x_embedder/t_embedder/final_layer C++ port.
 
-**11c**: **补全 DiT forward** — x_embedder, AdaLN-LoRA modulation, RoPE, proper multi-head attention. Target: end-to-end 3-step pipeline at 256×256.
+**11c**: **补全 DiT forward** — cross-attention, AdaLN GPU compute, RoPE + attention integration, x_embedder + t_embedder + final_layer. Target: end-to-end 3-step pipeline at 256×256.
 
 **11d**: VAE decoder → Qualcomm QNN for NPU (project plan priority item)
 

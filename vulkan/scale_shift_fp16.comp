@@ -1,0 +1,28 @@
+#version 450
+// Fused multiply-add: out = x * scale + shift — element-wise, fp16
+// Used for AdaLN modulation and gated residual connections
+#extension GL_EXT_shader_16bit_storage: require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16: require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer X     { float16_t x_data[];     };
+layout(binding = 1) readonly  buffer Scl   { float16_t scale_data[];  };
+layout(binding = 2) readonly  buffer Sft   { float16_t shift_data[];  };
+layout(binding = 3) writeonly buffer Out   { float16_t out_data[];    };
+
+layout(push_constant) uniform PC {
+    uint n_total;       // total elements
+    uint scale_stride;  // 1 if per-element scale, 0 if scalar broadcast
+    uint shift_stride;  // 1 if per-element shift, 0 if scalar broadcast
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n_total) return;
+
+    float x = float(x_data[i]);
+    float s = float(scale_data[i * pc.scale_stride]);
+    float b = float(shift_data[i * pc.shift_stride]);
+    out_data[i] = float16_t(x * s + b);
+}

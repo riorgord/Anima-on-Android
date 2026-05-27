@@ -1,0 +1,122 @@
+#version 450
+// Multi-head scaled dot-product attention: O = softmax(Q @ K^T * scale) @ V
+// One workgroup per (batch, head, query) row. 256 threads cooperative.
+//
+// Q: [total_q, head_dim]  where total_q = B * n_heads * S
+// K: [total_kv, head_dim] where total_kv = B * n_heads * S_kv
+// V: [total_kv, head_dim]
+// O: [total_q, head_dim]
+#extension GL_EXT_shader_16bit_storage: require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16: require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer Q_buf  { float16_t q_data[]; };
+layout(binding = 1) readonly  buffer K_buf  { float16_t k_data[]; };
+layout(binding = 2) readonly  buffer V_buf  { float16_t v_data[]; };
+layout(binding = 3) writeonly buffer O_buf  { float16_t o_data[]; };
+
+layout(push_constant) uniform PC {
+    uint total_q;    // B * n_heads * S
+    uint total_kv;   // B * n_heads * S_kv
+    uint head_dim;   // 128
+    uint S_kv;       // KV sequence length per head
+    float scale;     // 1/sqrt(head_dim)
+} pc;
+
+// Shared memory for score array (max 512 KV length)
+shared float scores[512];
+shared float shm_val[256];  // for parallel reduction
+
+void main() {
+    uint q_idx = gl_WorkGroupID.x;  // which query row
+    if (q_idx >= pc.total_q) return;
+
+    uint tid = gl_LocalInvocationID.x;  // 0..255
+
+    // Offsets for this query row's Q and the KV block it belongs to
+    uint q_base = q_idx * pc.head_dim;
+
+    // Figure out which KV block this query belongs to
+    // total_q = B * n_heads * S, total_kv = B * n_heads * S_kv
+    uint kv_block = q_idx / pc.S_kv;  // same (B*head) for self-attn when S==S_kv
+    // For cross-attn, all queries in same batch share same KV block
+    // Actually: KV is [B, n_heads, S_kv, head_dim], Q is [B, n_heads, S, head_dim]
+    // q_idx = b * n_heads * S + h * S + s
+    // kv_block = b * n_heads + h  (same head, same batch)
+    // But total_q = B * n_heads * S and total_kv = B * n_heads * S_kv
+    // For self-attn: S == S_kv, so kv_block = q_idx / S
+    // For cross-attn: S != S_kv, but kv_block = q_idx / S (same batch*head)
+    // Actually batch*head = q_idx / S, and kv rows for that batch*head start at batch*head * S_kv
+    // Let's just use: kv_block_base = (q_idx / S) * S_kv where S = total_q / (B * n_heads)
+    // Simpler: kv_block_base = (q_idx / pc.S_kv) * pc.S_kv for self-attn only
+    // For cross-attn with different S vs S_kv, we need a different approach.
+
+    // Compute KV base offset: same (batch, head) as this query
+    // total_q = B * n_heads * S_q; total_kv = B * n_heads * S_kv
+    // batch_head_idx = q_idx / S_q (integer division)
+    // kv_base = batch_head_idx * S_kv
+    // But we don't know S_q from push constants... we can derive it:
+    // S_q = total_q / (total_kv / S_kv) = total_q * S_kv / total_kv
+    // For self-attn: total_q == total_kv, so S_q = S_kv = S
+    // For cross-attn: total_q != total_kv
+
+    // Let's add S_q to push constants. But for now, compute it:
+    uint S_q = pc.total_q * pc.S_kv / pc.total_kv;
+    uint batch_head_idx = q_idx / S_q;
+    uint kv_base = batch_head_idx * pc.S_kv;
+
+    // ---- Phase 1: compute QK^T scores for assigned K rows ----
+    float my_max = -1e30;
+    float my_sum = 0.0;
+
+    // Each thread handles a subset of K rows: tid, tid+256, tid+512, ...
+    for (uint kv = tid; kv < pc.S_kv; kv += 256u) {
+        float dot = 0.0;
+        uint k_base = (kv_base + kv) * pc.head_dim;
+        for (uint d = 0u; d < pc.head_dim; d++) {
+            dot += float(q_data[q_base + d]) * float(k_data[k_base + d]);
+        }
+        dot *= pc.scale;
+        scores[kv] = dot;
+        if (dot > my_max) my_max = dot;
+    }
+
+    // ---- Phase 2: parallel reduce to find global max ----
+    shm_val[tid] = my_max;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s && shm_val[tid + s] > shm_val[tid]) shm_val[tid] = shm_val[tid + s];
+        barrier();
+    }
+    float row_max = shm_val[0];
+    barrier();
+
+    // ---- Phase 3: compute exp sum for assigned K rows ----
+    my_sum = 0.0;
+    for (uint kv = tid; kv < pc.S_kv; kv += 256u) {
+        float val = exp(scores[kv] - row_max);
+        scores[kv] = val;
+        my_sum += val;
+    }
+
+    shm_val[tid] = my_sum;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) shm_val[tid] += shm_val[tid + s];
+        barrier();
+    }
+    float inv_sum = 1.0 / (shm_val[0] + 1e-10);
+    barrier();
+
+    // ---- Phase 4: compute weighted V sum and write output ----
+    // Threads 0..head_dim-1 each handle one output dimension
+    if (tid < pc.head_dim) {
+        float acc = 0.0;
+        for (uint kv = 0u; kv < pc.S_kv; kv++) {
+            uint v_idx = (kv_base + kv) * pc.head_dim + tid;
+            acc += scores[kv] * float(v_data[v_idx]);
+        }
+        o_data[q_base + tid] = float16_t(acc * inv_sum);
+    }
+}

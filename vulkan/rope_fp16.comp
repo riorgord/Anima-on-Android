@@ -1,0 +1,43 @@
+#version 450
+// RoPE (Rotary Position Embedding) — apply 2D rotation to Q/K tensors
+// t: [N, head_dim]  freqs: [N, head_dim/2, 2, 2]
+// For each pair (2i, 2i+1): rotate by (cos, sin) from freqs
+#extension GL_EXT_shader_16bit_storage: require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16: require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer T_in    { float16_t t_data[];   };
+layout(binding = 1) readonly  buffer Freqs   { float16_t freq_data[]; };
+layout(binding = 2) writeonly buffer T_out   { float16_t out_data[];  };
+
+layout(push_constant) uniform PC {
+    uint N;          // total number of (token, head) rows
+    uint head_dim;   // 128 for DiT
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.N) return;
+
+    uint half_dim = pc.head_dim / 2u;
+    uint t_base = idx * pc.head_dim;
+
+    for (uint i = 0u; i < half_dim; i++) {
+        float a = float(t_data[t_base + 2u * i]);
+        float b = float(t_data[t_base + 2u * i + 1u]);
+
+        uint f_base = (idx * half_dim + i) * 4u;
+        // freqs layout: [cos, -sin, sin, cos] per pair
+        float c  = float(freq_data[f_base + 0u]);  // cos
+        float ms = float(freq_data[f_base + 1u]);  // -sin
+        float s  = float(freq_data[f_base + 2u]);  // sin
+        float mc = float(freq_data[f_base + 3u]);  // cos (dup for .movedim)
+
+        float out_a = c * a + ms * b;
+        float out_b = s * a + mc * b;
+
+        out_data[t_base + 2u * i]     = float16_t(out_a);
+        out_data[t_base + 2u * i + 1u] = float16_t(out_b);
+    }
+}

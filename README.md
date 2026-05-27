@@ -122,11 +122,13 @@ output/       生成图片输出
 
 ## Vulkan GPU 加速状态
 
-**正确性**：dispatch swap bug 已修复（`gemm.comp` 2 行改动），281 GEMM 全部正确，3 步管线出图正常 ✅
+**C++ 引擎 `libdit_vk.so`**：重写完成，28-block DiT forward **9.9s/步**（vs Python ctypes 56s, vs CPU 120s）。
 
-**速度**：Vulkan 220s/步 vs CPU 120s/步。根因是通用 tiled GEMM shader 在 Adreno 730 上仅跑出 ~14 GFLOPS（理论峰值 1,843 GFLOPS，利用率 0.75%）。详见 `STATUS.md`。
+**已验证**：GEMM (max_err=0.004)、LayerNorm、RMSNorm、SiLU、ScaleShift、LN+4×GEMM barrier chain、Self-attn full (max_err=0.75)、MLP full、28 blocks benchmark。
 
-**下一步**：Phase 1 GEMM shader ✅ (149 GFLOPS)；Phase 2 C++ 引擎放弃（cmd buffer 限制）。回到 Python ctypes 路线，把 RMS Norm/SiLU/Softmax/Add shader 加进 libvk_gemm.so。Phase 3 VAE 上 NPU。
+**架构**：28 per-block cmd buffer (各 16 dispatches)，共享 bcBuf (18MB)。Adrenal 单 cmd buffer 上限 ~64 dispatches。
+
+**未完成**：cross-attention、RoPE+Attention 集成、GPU 端 AdaLN、端到端 phone_pipeline 出图。详见 `STATUS.md`。
 
 ## 致谢
 

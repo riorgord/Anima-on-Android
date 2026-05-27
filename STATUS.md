@@ -1,211 +1,129 @@
-# Anima 项目状态摘要 (2026-05-26 晚间更新)
+# Anima 项目状态摘要 (2026-05-27 晚间更新)
 
 ## 我们在做什么
 在 Snapdragon 8+ Gen1 手机上运行 Anima 动漫风格图像生成模型 (2B DiT)。
 
 ## 工作区
-- **主仓库**: `D:\AI\anima_phone\` (整理后的核心代码)
-  - `src/` — predict2, llm_adapter, wan_vae 等
-  - `scripts/` — phone_pipeline, precompute_context, run_diffsynth_final
-  - `vulkan/` — GLSL 着色器, SPIR-V, vk_ops, vk_linear, main.cpp, 编译脚本
-  - `models/` — 占位 (权重太大，从模型原路径读取)
-- **WSL**: `/home/riorg/anima-work/` (开发、调试)
-- **手机**: `/sdcard/anima_on_android/` (运行时脚本、权重、输出)
+- **主仓库**: `D:\AI\anima_phone\` — vulkan/ (GLSL+SPIR-V+C++引擎), src/ (DiT/VAE), scripts/ (管线+测试)
+- **手机**: `/sdcard/anima_on_android/` — 运行时脚本、权重、输出
 - **编译**: `D:\android_vk\build_android.bat\` (NDK + Vulkan)
 - **NDK**: `D:\android-ndk-r27d-windows\`
 - **Vulkan SDK**: `D:\Vulkan_SDK\`
 - **模型**: `D:\AI\手坤的anima\models\` (diffusion, text_encoder, vae, lora)
 
-## 已完成
-- ✅ PC DiffSynth 推理基线 (3060 12G, base+ turbo)
-- ✅ 手机 CPU 管线 (DiT 2B + VAE，256×256，123s/步，正确出图)
-- ✅ VAE 格子 bug 根因：wan_vae.py 缺失 latent_mean/std 归一化，已修复
-- ✅ Vulkan GEMM benchmark：Adreno 730 7.8× 加速，max_err=0.0001 (独立测试正确)
-- ✅ **Vulkan GEMM dispatch swap bug 定位并修复** (2026-05-26)：gemm.comp 里 row/col 映射跟 dispatch 的 X/Y 轴对调 — M=N 时隐藏，M≠N 时 columns 被截断输出 0。修法只改 shader 2 行（row/col 与 local_row/col 同时 swap），libvk_gemm.so 不变。修复后 281 GEMM 全部 0 翻车，max_err<0.02 ✅
+## 速度演进
 
-## 当前状态 (2026-05-27 上午)
+| 方案 | 速度 | vs CPU |
+|------|------|--------|
+| CPU only (亮屏) | 120s/步 | 1× |
+| Python ctypes per-layer Vulkan (GEMM only) | 56s/步 | 2.1× |
+| **C++ 引擎 28-block (self-attn+MLP, 无 cross-attn)** | **9.9s/步** | **12×** |
+| C++ 引擎 (估算, 加 cross-attn+RoPE+attention) | ~15-20s/步 | 6-8× |
 
-**正确性**：Vulkan GEMM dispatch swap bug **已修复**。GEMM/RMS Norm/SiLU/Softmax shader 全部独立验证通过 ✅
+## 当前状态 (2026-05-27 晚间): C++ 引擎重写成功
 
-**速度**：Python ctypes per-layer Vulkan: **56s/步** (2.4× 于 CPU 120s)。GEMM shader: 旧 14 GFLOPS → 新 149 GFLOPS (10.6×), GPU 利用率 8.1%
+**libdit_vk.so v2**：完全重写，架构改为 per-block cmd buffer（28 个，每个 16 dispatches），回避了旧版 monolithic cmd buffer 的 Adreno submit 失败问题。
 
-**C++ 引擎 (libdit_vk.so) 结论**：编译成功但从未产出非零输出。根因排查：descriptor pool 在 command 录制时被销毁（vkDestroyDescriptorPool）。修复后仍为全零，怀疑 Adreno Vulkan 驱动对超长 command buffer（784 dispatches）存在未公开限制。**放弃独立引擎路线。**
+### 已验证通过的链路 (PyTorch reference 对比)
 
-**下步方向**：把 RMS Norm / SiLU / Softmax / Add 四个已验证 shader 加进 libvk_gemm.so 作为导出函数，Python ctypes 逐层调。GEMM 已有 149 GFLOPS 打底，加上非 GEMM 的 GPU 加速。不动 C++ 独立引擎。
+| 测试项 | max_err | 说明 |
+|--------|---------|------|
+| GEMM (单次) | 0.004 | fp16 精度极限 |
+| LayerNorm | 0.004 | |
+| SiLU (MLP 路径) | 0.031 | 8192-dim fp16 累积 |
+| ScaleShift (AdaLN apply) | 0.008 | |
+| LN+4×GEMM barrier chain | 0.004 | 内存屏障正确 |
+| Self-attn full (LN+AdaLN+QKV+norms+O+gate) | 2.5 | 值 ~294, 2.6 ULP |
+| MLP (LN+fc1+SiLU+fc2+gate) | 0.031 | |
+| **Block 0 真实 pipeline 输入** | **0.75** | mean/std 完全匹配 |
+| 28 blocks benchmark | — | 9.9s/步, 448 dispatches |
 
-> 手机端 `/data/local/tmp/gemm.spv` = 修复版（dispatch swap）；`/data/local/tmp/gemm_broken.spv` = 旧备份
-
-## 2026-05-26 晚间：性能剖析 & 路线决策
-
-### 分段计时结果（clock_gettime 四段打点，281 GEMM 平均）
-
-| 阶段 | 每 GEMM | 总计 | 占比 |
-|------|---------|------|------|
-| CPU 打包 (uint16→uint32) | 4.7ms | 1s | 0.6% |
-| cmd buffer 录制 | 0.3ms | 0s | 0.0% |
-| **GPU submit→fence** | **633.6ms** | **178s** | **98.4%** |
-| CPU 读回 (uint32→uint16) | 6.8ms | 2s | 1.1% |
-
-### 尝试过但无效的优化
-
-| 优化 | 预期省时 | 实际效果 | 结论 |
-|------|---------|---------|------|
-| 缓存 Vulkan 资源（不复创建） | ~30s | 2s | alloc 不是瓶颈 |
-| fp16 直达路径（省 f2h/h2f） | ~20s | 3s | CPU 转换不是瓶颈 |
-| 批量提交（281→140 submit） | ~40s | -2s | submit 不是瓶颈 |
-| Type 6 HOST_COHERENT（去 DMA） | ~150s | 0s | DMA 不是瓶颈 |
-
-### GPU 利用率计算
+### 引擎架构
 
 ```
-Adreno 730 理论 FP16 峰值: 1,843 GFLOPS (1024 ALU × 900MHz × 2 FMA)
-MLP layer2: M=512,N=2048,K=8192 = 8.6 GFLOP/GEMM
-实际: 8.6G / 0.627s = 13.7 GFLOPS
-利用率: 13.7 / 1,843 = 0.75%
+dit_init(weight_bin, spv_dir)
+  → 加载 567 个 per-tensor Vulkan buffer (3.9GB)
+  → 创建 8 个 shader pipeline
+  → 分配 28 个 cmd buffer + I/O buffer
+
+dit_init_all_blocks()
+  → 每个 cmd buffer 录制 1 个 block (16 dispatches)
+  → bcBuf 共享 (18MB, 9 个 AdaLN 分量)
+
+dit_forward_28blocks(x, adaln_all, out)
+  → for i in 0..27:
+      上传 block i 的 AdaLN → bcBuf
+      上传 x → xBuf
+      submit cmd[i] → wait fence
+      复制 outBuf → xBuf (下一 block 输入)
+    → 9.9s total
 ```
 
-**通用 tiled GEMM shader（gemm.comp）在 Adreno TBDR 架构上几乎完全失速。**
+### Shader 验证状态
 
-### 路线决策
+| Shader | 独立验证 | Block 内集成 |
+|--------|---------|-------------|
+| GEMM (gemm_fp16) | ✅ | ✅ |
+| LayerNorm | ✅ | ✅ |
+| RMSNorm | ✅ | ✅ |
+| SiLU | ✅ | ✅ |
+| ScaleShift | ✅ | ✅ |
+| Broadcast | ❌ 未测 | — |
+| Attention | ❌ 未测 | — |
+| RoPE | ❌ 未测 | — |
 
-放弃 Python ctypes per-layer Vulkan 路线。转向：
+### 未完成
 
-1. **短期（Phase 1）**：参考 ncnn/llama.cpp 的 Adreno 优化 GEMM kernel，替换 gemm.comp。目标每 GEMM ~20ms（利用 25-50% GPU）。如达成，立即释放 Vulkan 加速（预计 40-50s/步）。
+- Cross-attention（K/V 从 ctx 读取，形状 M×Nctx=1024 ≠ MS=512）
+- GPU 端 AdaLN 计算（当前每步 CPU 预计算 504MB → 上传）
+- RoPE + Attention dispatch 集成
+- x_embedder, t_embedder, final_layer（仍在 PyTorch）
+- VAE decode（仍在 PyTorch）
+- 端到端 phone_pipeline 出图
 
-2. **中期（Phase 2）**：全 C++ DiT 推理引擎。把整个 transformer block 从 PyTorch 剥离，数据全程留 GPU。参考 llama.cpp 架构。预计 15-30s/步。
+### 关键技术发现
 
-3. **长期（Phase 3）**：VAE decode 上 Qualcomm NPU（项目计划书优先项）。Context 文本编码器考虑手机本地跑 TinyLlama 等级模型。
-
-### 外部参考资料
-
-- [Adreno Developer Guide PDF](https://raw.githubusercontent.com/wiki/samrg123/JniTeapot/Documents/Adreno%20Developer%20Guide.pdf) — 已下载到工作区（.gitignore）
-- [ncnn Vulkan backend](https://github.com/Tencent/ncnn) — 腾讯移动端推理框架，Adreno 优化 GEMM
-- [llama.cpp Vulkan](https://github.com/ggerganov/llama.cpp) — 移动端 LLM 推理，Vulkan backend
-- [Qualcomm 开发者文档](https://docs.qualcomm.com/) — 官方 SDK/Profiler
+- **Adreno 单 cmd buffer 上限 ~64 dispatches**：超过后 vkQueueSubmit 失败。旧引擎 784 dispatch 的"全零"实际是 submit 失败（当时没检查返回值）
+- **单 buffer 上限 < 3.9GB**：weight buffer 分配失败，改 per-tensor buffer 解决
+- **fp16 溢出于 block 23**：随机输入下残差累积突破 65504，真实 pipeline 输入应在正常范围
+- **验证策略**：PyTorch dump → 卸载 → C++ 对比，避免双持 OOM
 
 ---
 
-## Vulkan 加速调试进展 (2026-05-25) [历史记录]
+## 历史记录
 
-### Adreno 730 内存类型 (vk_mem_probe)
-只有 2 种内存可用于 STORAGE_BUFFER (`memoryTypeBits=0x41`)：
-- **Type 0** (`DEVICE_LOCAL`) — 纯 GPU 内存，CPU 不可访问
-- **Type 6** (`DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT | HOST_CACHED`) — CPU/GPU 共享
+<details>
+<summary>2026-05-27 上午：C++ 引擎回顾 & 路线修正 (已推翻)</summary>
 
-Type 3 (`HOST_VISIBLE | HOST_CACHED`，无 COHERENT) **不在 memoryTypeBits 里**，无法用于 storage buffer。
+旧 libdit_vk.so 编译成功但从未产出非零输出。排查方向包括 descriptor pool 生命周期、command buffer 大小限制（784 dispatches）、Adreno 驱动 bug。当时结论是"放弃独立引擎路线"，改为 Python ctypes + 扩展 libvk_gemm.so。
 
-### 已验证的策略（独立 C++ 二进制 vk_type_test，全部 max_err=0）
+**事后分析**：根因不是驱动 bug，而是 784 dispatches 超过了 Adreno 单 cmd buffer 限制。改为 28×16 的 per-block cmd buffer 架构后解决。
+</details>
 
-| 策略 | 描述 | 结果 |
-|------|------|------|
-| COHERENT | Type 6 直用，无 flush/invalidate | standalone ✅ ~~.so ❌~~ |
-| NOCOHERENT | Type 6 + vkFlush/Invalidate (多余) | standalone ✅ |
-| DEVICE_LOCAL | Type 0 计算 + Type 6 staging + vkCmdCopyBuffer | standalone ✅ ~~.so ❌~~ |
+<details>
+<summary>2026-05-26 晚间：性能剖析 & 路线决策</summary>
 
-~~.so ❌~~ 这两条结论 2026-05-25 时是基于参数污染的测试得出的，已推翻。详见下方"现象（2026-05-26 重新核实后修正）"。
+- GEMM shader 只有 14 GFLOPS (0.75% GPU 利用率)
+- 优化无效项：批量提交、Type 6 HOST_COHERENT、shared memory tiling
+- ncnn pack4 + f16vec4+dot → 149 GFLOPS (10.6×)
+- Dispatch swap bug 定位：gemm.comp row/col 映射跟 dispatch X/Y 对调
+</details>
 
-### 现象（2026-05-26 重新核实后修正）
+<details>
+<summary>2026-05-25：早期里程碑</summary>
 
-**Binary 路径基线（已重新核实，全部正确）：**
-- `vk_type_test`：三种 memory 策略（COHERENT/NOCOHERENT/DEVICE_LOCAL），64×64×64 → max_err=0 ✅
-- `vk_bridge`：64×64×64 tile=16，identity@ones → max_err=0 ✅
-- `dl_test64`（独立 binary + dlopen libvk_gemm.so）：64×64×64 tile=16 → max_err=0 ✅
+- PC DiffSynth baseline ✅
+- 手机 CPU 管线: 120s/步 ✅
+- VAE grid bug 修复 (latent mean/std 归一化) ✅
+- Vulkan GEMM standalone 验证 ✅
+- C++ 引擎 skeleton (旧版, 后来重写) ✅
+</details>
 
-**~~vk_bridge 出垃圾~~** ← 错。原因是当时跑 `tile=4`（gemm.spv specialization=16，tile=4 触发 workgroup 配置退化）。改 tile=16 后正常。
+## 手机端关键文件
 
-**~~`.so` 通过 dlopen 加载出 inf/nan~~** ← 错。原因是 dl_test.cpp 当时用 `M=N=K=4`（即使 init(64,64,64,16)，run 的 4×4 同样触发 shader 退化）。改 64×64 后 dl_test64 完美。
-
-**~~direct staging / fresh buffer / .so 路径 各种"诡异 garbage"~~** ← 全部基于同一参数污染，不可信。
-
-**真实翻车点（2026-05-26 真管线 diagnostic 发现）：**
-- `phone_pipeline` 1 步 DiT 第一个 GEMM = `x_embedder.proj` (M=512, N=2048, K=68)，max_err=2.6，nan=0 inf=0
-- 用 `dl_test_K68` 复现：M=512, N=2048, K∈{64,68,80} randn 数据 → 全部 max_err≈0.55，**worst 位置 vk_out=0.0000**（shader 漏算）
-- 跟 K 是否 16 倍数无关；跟 .so vs binary 无关；跟数据是否非平凡有关（identity+ones 对，randn 错）
-
-**当前怀疑**：大 shape 下 shader 或 driver 漏算了某些 dispatch group。下一步 B+A 结合定位（读 shader + 针对性扫边界）。
-
-### CPU-only `.so` 排除项
-- `libvk_gemm_cpu.so` 通过 ctypes 加载完全正确 → 排除 ctypes 传参问题，问题在 Vulkan 路径本身。
-
-### 已修改文件
-- `D:\android_vk\build_android.bat\main.cpp` — 多版迭代（Type 3 尝试、device-local+staging、fresh buffers per call），当前版本是 device-local+staging+每次创建新鲜 buffer
-- `D:\android_vk\build_android.bat\bridge.cpp` — 同上逻辑的独立二进制版本
-- `D:\android_vk\build_android.bat\dl_test64.cpp` + `build_dl_test64.bat` — 2026-05-26 新加，binary 内 dlopen .so 跑 64×64×64 验证（已 PASS）
-- `D:\android_vk\build_android.bat\dl_test_K68.cpp` — 2026-05-26 新加，复现真实管线 shape (M=512 N=2048 K=68) 翻车
-- `D:\shoukunshangde_Anima_zancuun\` 下有 `vk_mem_probe`, `vk_type_test`, `dl_test` 等诊断工具
-- `build_so.bat` — 编译 libvk_gemm.so
-- `build_bridge.bat` — 编译 vk_bridge
-- `vulkan/vk_ops_diag.py` (anima_phone 仓库新加) — 强制启用 Vulkan + 每次 CPU 对照 + 异常 raise 的诊断版 HybridOps；常态 `vk_ops.py` 保持 `_VK_AVAILABLE=False` 干净，需要诊断时 phone_pipeline 把 `import vk_ops` 换成 `import vk_ops_diag as vk_ops`
-
-### Dispatch swap 根因定位全记录 (2026-05-26)
-
-**早上的混乱状态**：STATUS.md 声称 .so 路径出 garbage，但所有证据被参数污染（tile=4 退化触发 inf/nan）。重新核实后 binary baseline 干净。
-
-**D2 阶段（GEMM shape 分析）**：推出 phone_pipeline 走 .so 的 shape 列表 → 全是 16 倍数，K-divisible 假说证伪。
-
-**真管线 diagnostic**：phone_pipeline 1 步 + 每次 CPU 对照 → 第一个 GEMM `x_embedder.proj` (M=512,N=2048,K=68) max_err=2.6, vk_out 有 0 位置。
-
-**dl_test_scan 边界扫描**：M=512,N=64 → 88% zeros；M=64,N=2048 → 97% zeros。假说为"N 维度截断"。
-
-**B 阶段（读 shader）**：`gemm.comp:55-56 row=gl_GlobalInvocationID.y, col=gl_GlobalInvocationID.x` ← 跟 `main.cpp:103 vkCmdDispatch(..., (M+15)/16, (N+15)/16, 1)` 配合，M→X groups、N→Y groups。结果是：
-- col (N 维度) 由 X 轴供给 → 只覆盖 `0..M_padded-1` → **M < N 时 N 维度被截断**
-- row (M 维度) 由 Y 轴供给 → 只覆盖 `0..N_padded-1` → M < N 时超出部分被边界检查 prune（浪费但不错）
-
-**修复**：`gemm.comp` 交换全局 + 局部两对 ID：
-```glsl
-// 前    uint row = gl_GlobalInvocationID.y;  uint col = gl_GlobalInvocationID.x;
-// 后    uint row = gl_GlobalInvocationID.x;  uint col = gl_GlobalInvocationID.y;
-// 前    uint local_row = gl_LocalInvocationID.y;  uint local_col = gl_LocalInvocationID.x;
-// 后    uint local_row = gl_LocalInvocationID.x;  uint local_col = gl_LocalInvocationID.y;
-```
-重编 gemm.spv（glslangValidator -V），推 `/data/local/tmp/gemm.spv`，.so 运行时自动读入无需重编。
-
-**修复验证**：
-- dl_test_scan 512×64×64: max_err=0.0077, 0% zero ✅（前：5.11, 88% zero）
-- dl_test_scan 512×2048×68: max_err=0.0082, 0% zero ✅（前：0.56, 75% zero）
-- phone_pipeline 1 步 diagnostic: 281 Vulkan GEMM 全部 max_err<0.02, OK ✅
-
-**教训**：不是 driver bug，不是 .so vs binary 差异，不是 K 不整除 16。是一个 dispatch 轴映射错误在 M=N 的 benchmark 中完美隐藏了**一个多月**。
-
-### 2026-05-27 上午：C++ 引擎回顾 & 路线修正
-
-**libdit_vk.so 尝试**：编译成功 (600KB)，但从未产出非零输出。2.1s 的数字是"假跑通"——upload + record + submit + readback 全走了，但所有 dispatch 都出了零。排查方向包括 descriptor pool 生命周期、command buffer 大小限制（784 dispatches）、Adreno 驱动 bug。**放弃独立引擎路线。**
-
-**修正路线**：把 RMS Norm / SiLU / Softmax / Add 四个已验证 shader 加进 libvk_gemm.so 作为导出函数。GEMM 路径已验证正确（149 GFLOPS, max_err<0.13），四个非 GEMM shader 各自独立验证通过。Python ctypes 逐层调用，保持现有的 HybridLinear 架构但增加 GPU 加速的非 GEMM ops。
-
-### 后续可能方向（2026-05-27 上午更新）
-1. ~~dispatch swap bug~~ **已修复**
-2. ~~批量提交 / Type 6 / fp16 直达 / shared memory tiling~~ **均已测试**
-3. ~~Phase 1: GEMM 优化~~ **已完成** — 149 GFLOPS (10.6×)
-4. ~~Phase 2: C++ 独立引擎~~ **放弃** — 784 dispatch 超长 cmd buffer 不工作
-5. **加非 GEMM shader 入 libvk_gemm.so** — RMS Norm / SiLU / Softmax / Add
-6. **端到端出图** — Python 管线, VAE decode, 3 步出 PNG
-7. **Phase 3**：VAE 上 NPU, context 本地文本编码器
-8. INT8 CPU 量化 — 保底方案
-
-## 关键技术路径
-```
-prompt → PC预计算context → 手机 DiT (FP16 CPU) denoising → WanVAE decode → PNG
-```
-
-## 快速恢复命令
-```bash
-# WSL 环境
-conda activate /home/riorg/anima-work/.conda
-
-# 手机 ADB
-adb connect 192.168.0.104:5555  (WiFi)
-MSYS_NO_PATHCONV=1 adb shell ...  (防止路径转换)
-
-# 手机跑管线
-adb shell "su -c 'taskset f0 /data/data/com.termux/files/usr/bin/python -u /sdcard/anima_on_android/scripts/phone_pipeline.py'"
-adb logcat -d -s "VkGEMM:*"  # 看 Vulkan 日志
-
-# Android NDK 编译
-set NDK=D:\android-ndk-r27d-windows\android-ndk-r27d
-set TC=%NDK%\toolchains\llvm\prebuilt\windows-x86_64
-"%TC%\bin\clang++.exe" --target=aarch64-none-linux-android28 --sysroot="%TC%\sysroot" -O2 -std=c++17 -ID:\Vulkan_SDK\Include -o output source.cpp -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384 -Wl,--no-rosegment -llog -landroid -lvulkan -L"%TC%\sysroot\usr\lib\aarch64-linux-android\28" -static-libstdc++
-
-# 手机 ADB 推文件 (必须用 MSYS_NO_PATHCONV)
-MSYS_NO_PATHCONV=1 adb push D:/file /sdcard/anima_on_android/
-```
+- `/data/local/tmp/libdit_vk.so` — C++ 引擎
+- `/data/local/tmp/libvk_gemm.so` — 旧 GEMM .so (Python ctypes 用)
+- `/data/local/tmp/diffusion_weights.bin` — 3.9GB 权重 (567 tensors)
+- `/data/local/tmp/*.spv` — 10 个 SPIR-V shader
+- `/sdcard/anima_on_android/scripts/phone_pipeline.py` — 端到端管线
+- `/sdcard/anima_on_android/models/` — 权重 .pt 文件 + context
