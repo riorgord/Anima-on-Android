@@ -329,6 +329,10 @@ static bool load_weights(VulkanCtx& ctx, const char* path,
 // ============================================================
 // Command buffer recording context
 // ============================================================
+// Forward declaration for adaln_gpu access
+static Buffer g_loraBuf;
+static Buffer g_onesBuf;
+
 struct RC {
     VulkanCtx* vk;
     VkCommandBuffer cmd;
@@ -513,6 +517,13 @@ struct RC {
         dispatch_gemm(*t1, w2_name, M, D, ADALN_LORA_DIM, *tQ, 0);
         dispatch_gemm(*t1, w2_name, M, D, ADALN_LORA_DIM, *tK, comp_sz);
         dispatch_gemm(*t1, w2_name, M, D, ADALN_LORA_DIM, *tV, comp_sz * 2);
+        // 5b. Add external lora: tQ += lora_shift, tK += lora_scale, tV += lora_gate
+        // lora layout: [3, M, D] — 3 components, each [M,D] contiguous
+        size_t loraComp = M * D * 2;  // bytes per component
+        dispatch_scale_shift(*tQ, *onesBuf, 0, g_loraBuf, 0,          *tQ, M*D, 0, 1);
+        dispatch_scale_shift(*tK, *onesBuf, 0, g_loraBuf, loraComp,   *tK, M*D, 0, 1);
+        dispatch_scale_shift(*tV, *onesBuf, 0, g_loraBuf, loraComp*2, *tV, M*D, 0, 1);
+
         // 6. scale+1: tK + 1.0 → aBuf (temporary)
         dispatch_scale_shift(*tK, *onesBuf, *onesBuf, *aBuf, M * D, 0, 0);
         // 7-9. Broadcast [M,D] → [MS,D] to bcBuf slots
@@ -535,7 +546,6 @@ struct RC {
 static VulkanCtx g_vk;
 static Buffer g_xBuf, g_tEmbBuf, g_ctxBuf, g_outBuf;
 static Buffer g_t1, g_tQ, g_tK, g_tV, g_tO, g_rBuf, g_aBuf, g_nBuf, g_gBuf, g_bcBuf;
-static Buffer g_onesBuf;  // small buffer: [1.0f, 1.0f] for scale+1 trick
 static std::unordered_map<std::string, WeightInfo> g_weights;
 static bool g_init = false;
 
@@ -584,6 +594,9 @@ bool dit_init(const char* weight_path, const char* spv_dir) {
     if (!create_buffer(g_vk, bSz, u, g_gBuf)) return false;
     if (!create_buffer(g_vk, bcastSz, u, g_bcBuf)) return false;
 
+    // Lora buffer: [3, M, D] fp16 (pre-computed per sigma, CPU→GPU upload)
+    if (!create_buffer(g_vk, 3 * M * D * 2, u, g_loraBuf)) return false;
+
     // Ones buffer: filled with fp16(1.0)
     if (!create_buffer(g_vk, 4096, u, g_onesBuf)) return false;
     uint16_t* ones = (uint16_t*)g_onesBuf.mapped;
@@ -592,6 +605,149 @@ bool dit_init(const char* weight_path, const char* spv_dir) {
     LOGI("dit_init OK — %u buffers allocated", 15);
     g_init = true;
     return true;
+}
+
+// Compute t_emb and lora on CPU from sigma, replace PC pre-compute entirely.
+// Reads t_embedder weights from loaded weight buffers, writes results to
+// g_tEmbBuf (t_emb) and g_loraBuf (lora [3,M,D]). ~0.5ms on Adreno A710.
+bool dit_compute_timestep(float sigma) {
+    if (!g_init) return false;
+
+    // ---- 1. sinusoidal embedding: [M, D] ----
+    auto ws = g_weights.find("t_embedder.1.linear_2.weight");
+    if (ws == g_weights.end()) { LOGE("t_embedder weights not found"); return false; }
+    auto w_ln_it = g_weights.find("t_embedding_norm.weight");
+    if (w_ln_it == g_weights.end()) { LOGE("t_embedding_norm not found"); return false; }
+
+    uint32_t halfD = D / 2u;  // 1024
+    uint32_t D3 = 3u * D;     // 6144
+
+    // Read t_embedder weights from GPU mapped buffers (fp16 → fp32)
+    auto load_f32 = [](const Buffer& buf, size_t n) {
+        std::vector<float> out(n);
+        const uint16_t* src = (const uint16_t*)buf.mapped;
+        for (size_t i = 0; i < n; i++) {
+            // fp16 to fp32 manually
+            uint32_t h = src[i];
+            uint32_t sign = (h >> 15) & 1;
+            uint32_t exp  = (h >> 10) & 0x1f;
+            uint32_t mant = h & 0x3ff;
+            uint32_t f32;
+            if (exp == 0) {
+                if (mant == 0) f32 = sign << 31;
+                else { /* subnormal — approximate to zero */ f32 = sign << 31; }
+            } else if (exp == 31) {
+                f32 = (sign << 31) | 0x7f800000 | (mant << 13);  // NaN/Inf
+            } else {
+                f32 = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+            }
+            out[i] = *(float*)&f32;
+        }
+        return out;
+    };
+
+    // Weight shapes: w1 = [D, D] = [2048, 2048], w2 = [3*D, D] = [6144, 2048]
+    size_t w1_n = (size_t)D * D;
+    size_t w2_n = (size_t)D3 * D;
+    size_t w_ln_n = D;
+
+    // Get weights — need linear_1 too
+    auto w1_it = g_weights.find("t_embedder.1.linear_1.weight");
+    auto w2_it = g_weights.find("t_embedder.1.linear_2.weight");
+    if (w1_it == g_weights.end() || w2_it == g_weights.end()) {
+        LOGE("t_embedder weights missing"); return false;
+    }
+
+    std::vector<float> w1 = load_f32(w1_it->second.buf, w1_n);
+    std::vector<float> w2 = load_f32(w2_it->second.buf, w2_n);
+    std::vector<float> w_ln = load_f32(w_ln_it->second.buf, w_ln_n);
+
+    // ---- 2. sinusoidal embedding [M, D] ----
+    std::vector<float> sin_emb(M * D);
+    double log10000 = log(10000.0);
+    for (uint32_t b = 0; b < M; b++) {
+        float* row = &sin_emb[b * D];
+        for (uint32_t j = 0; j < halfD; j++) {
+            double freq = sigma * exp(-log10000 * (double)j / (double)halfD);
+            row[j] = (float)cos(freq);
+            row[halfD + j] = (float)sin(freq);
+        }
+    }
+
+    // ---- 3. t_emb = RMSNorm(sinusoidal, w_ln, eps=1e-6) ----
+    for (uint32_t b = 0; b < M; b++) {
+        float* row = &sin_emb[b * D];
+        double sq_sum = 0.0;
+        for (uint32_t i = 0; i < D; i++) sq_sum += (double)row[i] * row[i];
+        double rms = sqrt(sq_sum / (double)D + 1e-6);
+        uint16_t* out = (uint16_t*)g_tEmbBuf.mapped + b * D;
+        for (uint32_t i = 0; i < D; i++) {
+            float val = (float)((double)row[i] * (double)w_ln[i] / rms);
+            // fp32 → fp16 (simple rounding)
+            uint32_t bits = *(uint32_t*)&val;
+            uint32_t sign16 = (bits >> 16) & 0x8000;
+            uint32_t exp32 = (bits >> 23) & 0xff;
+            uint32_t mant32 = bits & 0x7fffff;
+            uint32_t half;
+            if (exp32 == 0) { half = sign16; }
+            else if (exp32 >= 143) { half = sign16 | 0x7c00; }  // overflow → inf
+            else if (exp32 <= 112) { half = sign16; }
+            else {
+                uint32_t exp16 = exp32 - 112;
+                half = sign16 | (exp16 << 10) | ((mant32 + 0x1000) >> 13);
+            }
+            out[i] = (uint16_t)half;
+        }
+    }
+
+    // ---- 4. h = SiLU(sin_emb @ w1^T) ----
+    std::vector<float> h1(M * D);
+    for (uint32_t b = 0; b < M; b++) {
+        for (uint32_t o = 0; o < D; o++) {
+            double sum = 0.0;
+            const float* w1_row = &w1[o * D];
+            const float* in_row = &sin_emb[b * D];
+            for (uint32_t k = 0; k < D; k++) sum += (double)in_row[k] * w1_row[k];
+            float x = (float)sum;
+            h1[b * D + o] = x / (1.0f + expf(-x));  // SiLU
+        }
+    }
+
+    // ---- 5. lora = h1 @ w2^T → [M, 3D] → chunk → [3, M, D] ----
+    uint16_t* lora_out = (uint16_t*)g_loraBuf.mapped;
+    for (uint32_t b = 0; b < M; b++) {
+        for (uint32_t o = 0; o < D3; o++) {
+            double sum = 0.0;
+            const float* w2_row = &w2[o * D];
+            const float* in_row = &h1[b * D];
+            for (uint32_t k = 0; k < D; k++) sum += (double)in_row[k] * w2_row[k];
+            float val = (float)sum;
+            // fp32 → fp16
+            uint32_t bits = *(uint32_t*)&val;
+            uint32_t sign16 = (bits >> 16) & 0x8000;
+            uint32_t exp32 = (bits >> 23) & 0xff;
+            uint32_t mant32 = bits & 0x7fffff;
+            uint32_t half;
+            if (exp32 == 0) { half = sign16; }
+            else if (exp32 >= 143) { half = sign16 | 0x7c00; }
+            else if (exp32 <= 112) { half = sign16; }
+            else {
+                uint32_t exp16 = exp32 - 112;
+                half = sign16 | (exp16 << 10) | ((mant32 + 0x1000) >> 13);
+            }
+            // Chunk into [3, M, D]: shift=0, scale=D, gate=2D
+            uint32_t comp = o / D;  // 0=shift, 1=scale, 2=gate
+            uint32_t col  = o % D;
+            lora_out[comp * M * D + b * D + col] = (uint16_t)half;
+        }
+    }
+
+    return true;
+}
+
+void dit_write_lora(void* data) {
+    if (!g_init) return;
+    memcpy(g_loraBuf.mapped, data, 3 * M * D * 2);
 }
 
 bool dit_forward(void* x_data, void* t_emb_data, void* ctx_data, void* out_data,
@@ -721,6 +877,42 @@ bool dit_write_buf(int buf_id, void* data, size_t size) {
     Buffer* b = bufs[buf_id];
     if (size > b->size) size = b->size;
     memcpy(b->mapped, data, size);
+    return true;
+}
+
+bool dit_read_buf(int buf_id, void* out, size_t size) {
+    if (!g_init) return false;
+    Buffer* bufs[] = { &g_xBuf, &g_tEmbBuf, &g_ctxBuf, &g_outBuf,
+                       &g_bcBuf, &g_aBuf, &g_gBuf, &g_nBuf, &g_loraBuf };
+    if (buf_id < 0 || buf_id >= 9) return false;
+    Buffer* b = bufs[buf_id];
+    if (size > b->size) size = b->size;
+    memcpy(out, b->mapped, size);
+    return true;
+}
+
+// GPU adaln test: record just self-attn adaln into cmd[0], writes to bcBuf[0..2]
+bool dit_record_adaln_gpu_test(int blockIdx) {
+    if (!g_init) { LOGE("Not initialized"); return false; }
+    char w0[128], w2[128];
+    snprintf(w0, sizeof(w0), "blocks.%d.adaln_modulation_self_attn.1.weight", blockIdx);
+    snprintf(w2, sizeof(w2), "blocks.%d.adaln_modulation_self_attn.2.weight", blockIdx);
+
+    VkCommandBufferBeginInfo begin = {};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(g_vk.cmd[0], &begin) != VK_SUCCESS) return false;
+
+    RC rc; memset(&rc, 0, sizeof(rc));
+    rc.vk = &g_vk; rc.cmd = g_vk.cmd[0]; rc.weights = &g_weights;
+    rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
+    rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
+    rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf;
+    rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
+
+    rc.adaln_gpu(w0, w2, 0);  // writes to bcBuf[0,1,2]
+
+    if (vkEndCommandBuffer(g_vk.cmd[0]) != VK_SUCCESS) return false;
+    LOGI("GPU adaln recorded for block %d", blockIdx);
     return true;
 }
 
@@ -1115,6 +1307,7 @@ void dit_destroy() {
     free_buf(g_outBuf); free_buf(g_t1); free_buf(g_tQ); free_buf(g_tK);
     free_buf(g_tV); free_buf(g_tO); free_buf(g_rBuf); free_buf(g_aBuf);
     free_buf(g_nBuf); free_buf(g_gBuf); free_buf(g_bcBuf);
+    free_buf(g_onesBuf); free_buf(g_loraBuf);
 
     if (g_vk.device) vkDestroyDevice(g_vk.device, nullptr);
     if (g_vk.instance) vkDestroyInstance(g_vk.instance, nullptr);

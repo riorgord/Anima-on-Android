@@ -880,6 +880,36 @@ Anima model card's recommended sampler. Our implementation produces incorrect re
 
 **11c**: **补全 DiT forward** — 2026-05-28 改策略：不在独立 C++ 引擎上堆 feature，改为在 phone_pipeline.py HybridOps 框架上逐模块替换。
 
+**当前进度 (2026-05-28 晚间)**:
+
+**AdaLN lora 修复** ✅ (C++ 引擎):
+- `dit_engine.cpp` 的 `adaln_gpu()` 补上 external lora addition: LoRA up ×3 之后加 3 次 `dispatch_scale_shift(tQ/tK/tV, onesBuf, g_loraBuf)` → out = in*1.0 + lora_component
+- GPU 直测 vs CPU reference: scale max_err=0.10, shift=0.013, gate=0.060
+- `g_loraBuf` 24KB, lora 布局 [3,M,D] = [3,2,2048] (3分量各 M×D 连续)
+- 已整合到 C++ 引擎 per-block recording (`record_one_block` → `adaln_gpu` → loraBuf)
+
+**C++ CPU lora 计算** ✅ (dit_engine.cpp):
+- `dit_compute_timestep(sigma)`: sinusoidal嵌入 → SiLU(GEMM(sin,w1)) → GEMM(h1,w2) → chunk [3,M,D] → g_loraBuf
+- 同时算 t_emb = RMSNorm(sin, w_ln) → g_tEmbBuf
+- CPU 耗时 ~0.5ms, vs PC torch: t_emb max_err=0.00006, lora max_err=0.016
+- **不再依赖 PC 预计算** (原先 prep_pipeline_data.py 算 lora → .bin → adb push)
+
+**AdaLN 在 HybridOps 管线** ❌ (phone_pipeline.py):
+- 未替换。HybridOps 管线仍用 torch 算 AdaLN + lora。两次 monkey-patch 尝试均失败:
+  - F.layer_norm 替换 → PyTorch BLAS 内存崩溃
+  - t_embedder[1].forward 替换 → RoPE 维度不匹配 (256 vs 512)
+- 结论: monkey-patch 不可靠。正确方式需走 **HybridAdaLN(nn.Module)** 子类——跟 HybridLinear 替换 nn.Linear 同模式:
+  - 在 `predict2.py` 构造时注入 `HybridAdaLN`，forward 内调 CPU numpy 算 lora → torch tensor [B, 3D]
+  - 不 monkey-patch，不碰 torch 内部模块，已验证 HybridLinear 这条路安全可行
+
+**其他**:
+- ✅ libvk_hybrid.so: 通用 Vulkan dispatch wrapper + GPU 时间戳
+- ✅ SiLU / LayerNorm / GELU shader 独立验证通过
+- ✅ HybridOps 管线 50s/步 (不绑核 + Scene 调度器)
+- ✅ C++ 引擎 skip-attn 管线含 lora: 18s/步 (latent only)
+- ⏳ RoPE shader 重写 + C++ 引擎集成 — Step 3
+- ⏳ Attention 3-shader 拆分 — Step 5
+
 **参考来源**: 本地 clone 的 ExecuTorch 仓库 `D:\AI\手坤的anima\参考\sdpa找不到了，只能克隆了\executorch\`，重点参考其 Vulkan backend 的 GLSL shader 实现。官方用模板系统（`${}` 宏）生成 shader，我们直接读展开后的逻辑。与自研 shader 的逐模块对比结论：
 
 | 模块 | 决策 | 理由 |

@@ -81,19 +81,25 @@ print(f"ctx: {ctx.shape}")
 # ============================================================
 # t_emb for each sigma
 # ============================================================
-def make_t_emb(sigma_val):
+def make_t_emb_and_lora(sigma_val):
     sigma=torch.tensor([sigma_val,sigma_val]).unsqueeze(1)
     half_dim=D//2
     exponent=-np.log(10000)*np.arange(half_dim,dtype=np.float32)/half_dim
     emb_val=sigma.float().numpy()*np.exp(exponent)
     emb_sincos=np.concatenate([np.cos(emb_val),np.sin(emb_val)],-1)
     t_input=torch.from_numpy(emb_sincos).float()
-    _=F.linear(F.silu(F.linear(t_input,t_w1)),t_w2)
-    return F.rms_norm(t_input.squeeze(1),(D,),weight=t_ln_w,eps=1e-6).numpy().astype(np.float16)
+    # lora = SiLU(Linear(SiLU(Linear(sinusoidal))))
+    lora=F.linear(F.silu(F.linear(t_input,t_w1)),t_w2)  # [M, 3D]
+    t_emb=F.rms_norm(t_input.squeeze(1),(D,),weight=t_ln_w,eps=1e-6).numpy().astype(np.float16)
+    # Arrange lora as [3, M, D] for GPU (components grouped contiguous)
+    shift,scale,gate = torch.chunk(lora,3,dim=-1)
+    lora_np = torch.stack([shift.squeeze(1), scale.squeeze(1), gate.squeeze(1)], dim=0).numpy().astype(np.float16)
+    return t_emb, lora_np
 
 for step,s in enumerate([1.0,0.667,0.333]):
-    te=make_t_emb(s)
+    te,lora=make_t_emb_and_lora(s)
     te.tofile(f"{OUT}/t_step{step}.bin")
-    print(f"t_step{step} (sigma={s:.3f}): {te.shape}")
+    lora.tofile(f"{OUT}/lora_step{step}.bin")
+    print(f"t_step{step} (sigma={s:.3f}): t_emb={te.shape} lora={lora.shape} ({lora.nbytes}B)")
 
 print("DONE — all data ready for phone")

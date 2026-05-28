@@ -34,6 +34,7 @@ dit.eval()
 del dit_sd; gc.collect()
 print("DiT loaded")
 
+
 # Scheduler
 def time_snr_shift(a, t): return a * t / (1.0 + (a - 1.0) * t)
 linear = torch.linspace(1.0, 0.0, STEPS + 1)[:-1]

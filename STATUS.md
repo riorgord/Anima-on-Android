@@ -25,10 +25,27 @@
 
 注：2026-05-28 去掉了 `taskset f0` 绑定大核，配合 Scene 调度器优化，HybridOps 稳定在 50s/步。之前 56-57s 是单纯 taskset 限制 4 核的结果。
 
-## 当前状态 (2026-05-27 晚间): C++ 引擎重写成功
+## C++ 引擎状态 (libdit_vk.so v2)
 
-**libdit_vk.so v2**：完全重写，架构改为 per-block cmd buffer（28 个，每个 16 dispatches），回避了旧版 monolithic cmd buffer 的 Adreno submit 失败问题。
-⚠️ **已知缺陷**：GPU AdaLN 缺少第二个 SiLU 和 external lora 加法；attention 是 skip 模式（V→O），非真正的 QK^T+softmax。
+完全重写，架构改为 per-block cmd buffer（28 个，每个 16 dispatches），回避了旧版 monolithic cmd buffer 的 Adreno submit 失败问题。
+
+⚠️ **C++ 引擎已知缺陷**：
+- Attention 是 skip 模式（V→O），非真正 QK^T+softmax
+- RoPE 未集成到 block recording
+
+## 当前状态 (2026-05-28 晚间): AdaLN lora 修复完成 + C++ CPU lora 计算
+
+**管线速度**: 50s/步 (HybridOps Vulkan GEMM, 不绑核 + Scene 调度器)
+
+**libvk_hybrid.so**: 通用 Vulkan compute dispatch wrapper + GPU 时间戳。独立验证 SiLU(317μs) / LayerNorm(265μs) / GELU 通过。
+
+**C++ 引擎 AdaLN lora 修复** ✅: `adaln_gpu()` 补上 external lora addition (3次 dispatch_scale_shift)。GPU 直测 vs CPU reference: max_err=0.10(scale)/0.013(shift)/0.060(gate)。lora 布局 [3,M,D] = [3,2,2048] (24KB)。
+
+**C++ CPU lora 计算** ✅: `dit_compute_timestep(sigma)` 在 C++ 引擎 CPU 上原地算 lora + t_emb ~0.5ms。vs PC torch: t_emb max_err=0.00006, lora max_err=0.016。不再依赖 PC 预计算。
+
+**HybridOps 管线 lora 注入** ❌: 尝试 monkey-patch `t_embedder[1].forward` 用 numpy lora 替换 torch lora，触发 RoPE 维度不匹配崩溃 (256 vs 512)。monkey-patch 路线已确认不可靠（之前 F.layer_norm 也崩过 BLAS）。正确做法需走 HybridOps 自定义 Module 子类注入。
+
+**下一步**: Step 3 — RoPE shader 重写并集成到 C++ 引擎 block recording。
 
 ### 已验证通过的链路 (PyTorch reference 对比)
 

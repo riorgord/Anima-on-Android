@@ -40,6 +40,7 @@ with torch.no_grad():
     ts = sigma.repeat(2).unsqueeze(1).to(DTYPE)
     t_emb_out, adaln_lora = dit.t_embedder[1](dit.t_embedder[0](ts).to(DTYPE))
     t_emb = dit.t_embedding_norm(t_emb_out).float()
+    print(f"lora shape: {adaln_lora.shape}  dtype: {adaln_lora.dtype}  range: [{float(adaln_lora.min()):.3f}, {float(adaln_lora.max()):.3f}]")
 
 print(f"x_in range: [{float(x_in.min()):.3f}, {float(x_in.max()):.3f}]")
 print(f"t_emb range: [{float(t_emb.min()):.3f}, {float(t_emb.max()):.3f}]")
@@ -57,10 +58,12 @@ print("Inputs saved")
 print("Computing AdaLN for 28 blocks...")
 adaln_all = np.zeros(28 * 9 * n_elem, dtype=np.uint16)
 
-def adaln(emb, w1, w2):
+def adaln(emb, w1, w2, lora_part=None):
     h = F.silu(emb.float())
     h = F.linear(h, w1.float())
     h = F.linear(h, w2.float())
+    if lora_part is not None:
+        h = h + lora_part.float()  # add external lora
     sh, sc, ga = torch.chunk(h, 3, dim=-1)
     sc = sc + 1.0
     return (sc.repeat_interleave(S,0).numpy().astype(np.float16).ravel().view(np.uint16),
@@ -72,13 +75,13 @@ for i in range(28):
     pfx = f"blocks.{i}."
     sc_s, sh_s, ga_s = adaln(t_emb,
         sd[pfx+"adaln_modulation_self_attn.1.weight"],
-        sd[pfx+"adaln_modulation_self_attn.2.weight"])
+        sd[pfx+"adaln_modulation_self_attn.2.weight"], adaln_lora)
     sc_c, sh_c, ga_c = adaln(t_emb,
         sd[pfx+"adaln_modulation_cross_attn.1.weight"],
-        sd[pfx+"adaln_modulation_cross_attn.2.weight"])
+        sd[pfx+"adaln_modulation_cross_attn.2.weight"], adaln_lora)
     sc_m, sh_m, ga_m = adaln(t_emb,
         sd[pfx+"adaln_modulation_mlp.1.weight"],
-        sd[pfx+"adaln_modulation_mlp.2.weight"])
+        sd[pfx+"adaln_modulation_mlp.2.weight"], adaln_lora)
 
     base = i * 9 * n_elem
     adaln_all[base+0*n_elem:base+1*n_elem] = sc_s
@@ -137,6 +140,8 @@ for i in range(28):
 # Save
 adaln_all.tofile(f"{OUT}/adaln_all.bin")
 np.save(f"{OUT}/ref_out.npy", x_ref.half().numpy())
+adaln_lora.half().numpy().tofile(f"{OUT}/lora.bin")
+print(f"lora saved: {adaln_lora.shape} ({os.path.getsize(f'{OUT}/lora.bin')}B)")
 print(f"AdaLN + reference saved ({adaln_all.nbytes/1e6:.1f}MB + {x_ref.nbytes/1e6:.1f}MB)")
 
 del sd, dit  # UNLOAD PyTorch
