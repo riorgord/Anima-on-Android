@@ -17,11 +17,13 @@
 |------|------|--------|------|
 | CPU only (亮屏) | 120s/步 | 1× | ✅ |
 | Python ctypes per-layer Vulkan | 56s/步 | 2.1× | ✅ |
+| **phone_pipeline.py (HybridOps)** | **50s/歩** | **2.4×** | **✅ 管线级正确 (81KB PNG)** |
 | C++ 引擎 self-attn+MLP only | 9.9s/步 | 12× | ✅ |
 | C++ 引擎 +cross-attn | 13.3s/步 | 9× | ✅ |
 | **C++ 引擎 +GPU AdaLN** | **13.06s/步** | **9.2×** | benchmark 通过, 管线未验证 |
-| **phone_pipeline.py (HybridOps)** | **57s/步** | **2.1×** | **✅ 管线级正确 (81KB PNG)** |
 | C++ 引擎 +RoPE+Attention (目标) | ~15s/步 | 8× | ⏳ 开发中 |
+
+注：2026-05-28 去掉了 `taskset f0` 绑定大核，配合 Scene 调度器优化，HybridOps 稳定在 50s/步。之前 56-57s 是单纯 taskset 限制 4 核的结果。
 
 ## 当前状态 (2026-05-27 晚间): C++ 引擎重写成功
 

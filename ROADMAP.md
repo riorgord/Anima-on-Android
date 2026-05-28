@@ -879,10 +879,38 @@ Anima model card's recommended sampler. Our implementation produces incorrect re
 **11b**: ✅ **C++ DiT engine v2** — libdit_vk.so (~600KB). 28 per-block cmd buffers, GPU AdaLN, 13.06s/step (9.2× vs CPU). Verified: GEMM, LN, RMSNorm, SiLU, ScaleShift, self+cross+MLP blocks with skip-attention. Pending: RoPE+Attention (shader layout fixed, workgroup too many), x_embedder/t_embedder/final_layer.
 
 **11c**: **补全 DiT forward** — 2026-05-28 改策略：不在独立 C++ 引擎上堆 feature，改为在 phone_pipeline.py HybridOps 框架上逐模块替换。
-- AdaLN 已定位 bug（缺 SiLU + 缺 external lora），待接入 HybridOps 验证
-- Attention 待参考 online softmax + subgroup reduce 重写
-- RoPE shader 已写待验证
-- 目标：最终全 DiT block GPU 驻留，消除包装搬运开销
+
+**参考来源**: 本地 clone 的 ExecuTorch 仓库 `D:\AI\手坤的anima\参考\sdpa找不到了，只能克隆了\executorch\`，重点参考其 Vulkan backend 的 GLSL shader 实现。官方用模板系统（`${}` 宏）生成 shader，我们直接读展开后的逻辑。与自研 shader 的逐模块对比结论：
+
+| 模块 | 决策 | 理由 |
+|------|------|------|
+| **GEMM** | ✅ 保留 | f16vec4+dot + 无 shared memory 恰好是 Adreno 最优解；ET 的 shared memory tiling 在 Adreno 上 2× 更慢（已验证） |
+| **SiLU** | ✅ 保留 | 简单逐元素 op，不会出错 |
+| **ScaleShift** | 🔧 融合进 LN | 省一次 dispatch，不再独立存在 |
+| **RoPE** | ❌ 重写 | 当前每行 1 线程，并行度极低；改为 ET 的 per-texel dispatch + interleaved `[r0,i0,r1,i1]` layout |
+| **LayerNorm** | 🔧 改造 | 加 affine (weight+bias) 融合；workgroup size 从 256 调到 64（省 shared memory） |
+| **Attention** | ❌ 拆 3 重写 | 单 shader 做 QK^T+softmax+SV 寄存器炸、barrier 链太复杂、Adreno 并行 dispatch 出错。改为 ET 的 3-shader 拆分 |
+
+**Attention 拆分策略**（参考 `sdpa_compute_attn_weights_coop.glsl` + `sdpa_attn_weights_softmax.glsl` + `sdpa_compute_out_coop.glsl`）：
+
+```
+Q·K^T (compute_attn_weights)  →  中间 buffer: attn_weights [B, H, S, C]
+softmax (attn_weights_softmax) →  中间 buffer: attn_softmax [B, H, S, C]  
+softmax(A)·V (compute_out)    →  最终 output [B, H, S, D]
+```
+
+3 个 dispatch 独立验证，中间结果可 dump 对比 PyTorch。每个 shader 用 cooperative reduction (64 workers) 分摊 head_dim/context_len 维度。
+
+**RoPE 重写要点**（参考 `apply_rotary_emb_interleaved.glsl`）：
+- 输入改为 interleaved layout: `[cos0, sin0, cos1, sin1, ...]`（当前存 4 值/对有冗余）
+- Dispatch per-texel（4 元素/线程），不再 per-row 单线程
+- Freqs 改为 flat buffer 索引，不依赖 rank
+
+**LayerNorm 改造要点**（参考 `native_layer_norm_buffer.glsl`）：
+- 加 weight/bias affine 参数
+- workgroup size 从 256 → 64（Adreno shared memory 稀缺）
+- 保留现有 3-pass tree reduction 结构（与 ET 一致）
+
 - **约束**：每个替换模块必须与 PyTorch 做元素级对齐验证（max_err < 1），不可仅靠 pipeline 端到端结果判断。新写的 C++ 代码需仔细检查与 torch 计算的一致性。
 
 **11d**: VAE decoder → Qualcomm QNN for NPU (project plan priority item)

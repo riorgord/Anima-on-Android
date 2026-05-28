@@ -11,11 +11,11 @@
 ## 快速开始
 
 ```bash
-# 手机端 (Termux + root)
-taskset f0 python -B /sdcard/anima_on_android/scripts/phone_pipeline.py
+# 手机端 (Termux + root, 配合 Scene 调度器优化)
+python -B /sdcard/anima_on_android/scripts/phone_pipeline.py
 ```
 
-输出：256×256 PNG，约 120s/步（CPU），3 步共约 6 分钟。
+输出：256×256 PNG，约 50s/步（HybridOps Vulkan GEMM），3 步共约 3 分钟。
 
 ## 管线
 
