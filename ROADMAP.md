@@ -878,37 +878,62 @@ Anima model card's recommended sampler. Our implementation produces incorrect re
 
 **11b**: ✅ **C++ DiT engine v2** — libdit_vk.so (~600KB). 28 per-block cmd buffers, GPU AdaLN, 13.06s/step (9.2× vs CPU). Verified: GEMM, LN, RMSNorm, SiLU, ScaleShift, self+cross+MLP blocks with skip-attention. Pending: RoPE+Attention (shader layout fixed, workgroup too many), x_embedder/t_embedder/final_layer.
 
-**11c**: **补全 DiT forward** — 2026-05-28 改策略：不在独立 C++ 引擎上堆 feature，改为在 phone_pipeline.py HybridOps 框架上逐模块替换。
+**11c**: **补全 DiT forward** — 策略：在 HybridOps 框架上逐模块用 Vulkan 替换 PyTorch，每次替换后管线级验证。
 
-**当前进度 (2026-05-28 晚间)**:
+**当前进度 (2026-05-29)**:
 
-**AdaLN lora 修复** ✅ (C++ 引擎):
-- `dit_engine.cpp` 的 `adaln_gpu()` 补上 external lora addition: LoRA up ×3 之后加 3 次 `dispatch_scale_shift(tQ/tK/tV, onesBuf, g_loraBuf)` → out = in*1.0 + lora_component
-- GPU 直测 vs CPU reference: scale max_err=0.10, shift=0.013, gate=0.060
-- `g_loraBuf` 24KB, lora 布局 [3,M,D] = [3,2,2048] (3分量各 M×D 连续)
-- 已整合到 C++ 引擎 per-block recording (`record_one_block` → `adaln_gpu` → loraBuf)
+### AdaLN GPU 注入 ✅ (phone_pipeline.py)
 
-**C++ CPU lora 计算** ✅ (dit_engine.cpp):
-- `dit_compute_timestep(sigma)`: sinusoidal嵌入 → SiLU(GEMM(sin,w1)) → GEMM(h1,w2) → chunk [3,M,D] → g_loraBuf
-- 同时算 t_emb = RMSNorm(sin, w_ln) → g_tEmbBuf
-- CPU 耗时 ~0.5ms, vs PC torch: t_emb max_err=0.00006, lora max_err=0.016
-- **不再依赖 PC 预计算** (原先 prep_pipeline_data.py 算 lora → .bin → adb push)
+**方法**: PrecomputedAdaLN(nn.Module) 子类替换 `block.adaln_modulation_*`，不用 monkey-patch，走标准 nn.Module 替换路线——跟 HybridLinear 替换 nn.Linear 同模式。
 
-**AdaLN 在 HybridOps 管线** ❌ (phone_pipeline.py):
-- 未替换。HybridOps 管线仍用 torch 算 AdaLN + lora。两次 monkey-patch 尝试均失败:
-  - F.layer_norm 替换 → PyTorch BLAS 内存崩溃
-  - t_embedder[1].forward 替换 → RoPE 维度不匹配 (256 vs 512)
-- 结论: monkey-patch 不可靠。正确方式需走 **HybridAdaLN(nn.Module)** 子类——跟 HybridLinear 替换 nn.Linear 同模式:
-  - 在 `predict2.py` 构造时注入 `HybridAdaLN`，forward 内调 CPU numpy 算 lora → torch tensor [B, 3D]
-  - 不 monkey-patch，不碰 torch 内部模块，已验证 HybridLinear 这条路安全可行
+**架构**:
+```
+init: dit_init_adaln_only() → 轻量加载 173 个 AdaLN tensor (390MB, 非全量 3.9GB)
+      → 4 个 shader pipeline (gemm, silu, scale_shift, broadcast)
+      → 预录制 28 个 cmd buffer (每个 36 dispatch = 3 通道 × 12 op)
+      → 描述符池只分配一次，无碎片化
 
-**其他**:
-- ✅ libvk_hybrid.so: 通用 Vulkan dispatch wrapper + GPU 时间戳
-- ✅ SiLU / LayerNorm / GELU shader 独立验证通过
-- ✅ HybridOps 管线 50s/步 (不绑核 + Scene 调度器)
-- ✅ C++ 引擎 skip-attn 管线含 lora: 18s/步 (latent only)
-- ⏳ RoPE shader 重写 + C++ 引擎集成 — Step 3
-- ⏳ Attention 3-shader 拆分 — Step 5
+step: t_embedder(PyTorch) → t_emb + lora → dit_write_buf + dit_write_lora
+      → for blk 0..27: submit cmd[blk] + wait + read bcBuf → [9,M,D] fp16
+      → PrecomputedAdaLN 注入 28 个 block 的 3 个 adaln_modulation 模块
+      → use_adaln_lora=False (lora 已 baked in)
+      → dit.forward() (PyTorch, blocks 用预计算 AdaLN)
+      → 恢复 use_adaln_lora=True
+
+验证: 管线出图 256×256 PNG 86KB, 无 grid artifact, 与纯 PyTorch 基准一致
+```
+
+**速度**: 57s/步。AdaLN GPU 开销 **<1s/步** (28 次 submit, 每次 36 dispatch 已预录制)。
+
+### 速度分析 — 瓶颈在哪
+
+| 组件 | 每步耗时 | 加速状态 | 可节省 |
+|------|---------|---------|--------|
+| **GEMM** (281 次) | ~25s | ✅ HybridLinear (libvk_gemm.so) | — |
+| **Attention** (self+cross, 28 blocks) | ~15s | ❌ PyTorch CPU | **-15s** |
+| **LayerNorm/RMSNorm** (28×3+1=85 次) | ~5s | ❌ PyTorch CPU | **-5s** |
+| **SiLU/GELU** (28×4=112 次) | ~2s | ❌ PyTorch CPU | **-2s** |
+| **AdaLN** | <1s | ✅ C++ GPU (本次完成) | — |
+| Python/Vulkan 来回 + 管线开销 | ~9s | — | — |
+| **总计** | **~57s** | | **理论可省 ~22s → 35s/步** |
+
+### 已造好但未装的轮子 (libvk_hybrid.so)
+
+`libvk_hybrid.so` 已验证通过（独立测试），只需按 HybridOps 模式注入：
+
+| Shader | 已验证耗时 | 替换方法 | 每步调用次数 | 理论省时 |
+|--------|----------|---------|------------|---------|
+| **SiLU** | 317μs/次 | HybridSiLU(nn.Module) | 112 次 | ~2s |
+| **LayerNorm** | 265μs/次 | HybridLayerNorm(nn.Module) | 85 次 | ~5s |
+| **GELU** | — | HybridGELU(nn.Module) | 28 次 | <1s |
+
+替换模式一致：`HybridSiLU(nn.Module)` 子类，forward 调 ctypes dispatch libvk_hybrid.so，不改 predict2.py 内部逻辑。跟 HybridLinear 和 PrecomputedAdaLN 完全一样的套路。
+
+### 下步路线
+
+1. **替换 LayerNorm/RMSNorm** (最稳，省 5s/步) — 已有验证过的 shader，改 HybridOps 加入 `RMSNorm = HybridRMSNorm` 即可。predict2.py 本身就通过 `operations.RMSNorm` 构造，无需改模型代码
+2. **替换 SiLU** (省 2s/步) — 简单逐元素 op，在 predict2.py 的 MLP/adaln 里替换
+3. **Attention** (最重，省 15s/步) — 需 3-shader 拆分 (QK^T / softmax / SV)，先单层验证再逐 block 替换
 
 **参考来源**: 本地 clone 的 ExecuTorch 仓库 `D:\AI\手坤的anima\参考\sdpa找不到了，只能克隆了\executorch\`，重点参考其 Vulkan backend 的 GLSL shader 实现。官方用模板系统（`${}` 宏）生成 shader，我们直接读展开后的逻辑。与自研 shader 的逐模块对比结论：
 

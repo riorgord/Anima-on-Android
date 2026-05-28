@@ -327,7 +327,80 @@ static bool load_weights(VulkanCtx& ctx, const char* path,
 }
 
 // ============================================================
-// Command buffer recording context
+// Lightweight init — AdaLN only (no block GEMM weights)
+// ============================================================
+static bool load_adaln_weights(VulkanCtx& ctx, const char* path,
+                                std::unordered_map<std::string, WeightInfo>& weights) {
+    FILE* f = fopen(path, "rb");
+    if (!f) { LOGE("Cannot open %s", path); return false; }
+
+    uint32_t N;
+    if (fread(&N, sizeof(N), 1, f) != 1) { fclose(f); return false; }
+
+    // First pass: find all adaln-related tensors
+    std::vector<size_t> offsets, sizes;
+    std::vector<std::string> names;
+    size_t total = 0;
+    for (uint32_t i = 0; i < N; i++) {
+        uint16_t nl; fread(&nl, sizeof(nl), 1, f);
+        char* tmp = (char*)alloca(nl+1);
+        fread(tmp, 1, nl, f); tmp[nl] = 0;
+        std::string name(tmp, nl);
+        uint8_t nd; fread(&nd, 1, 1, f);
+        uint32_t sh[4] = {1,1,1,1}; size_t elems = 1;
+        for (uint8_t d = 0; d < nd; d++) { fread(&sh[d], 4, 1, f); elems *= sh[d]; }
+
+        bool want = (name.find("adaln_modulation") != std::string::npos)
+                 || (name.find("t_embedder") != std::string::npos)
+                 || (name == "t_embedding_norm.weight");
+        if (want) {
+            offsets.push_back(ftell(f));  // data starts here
+            sizes.push_back(elems * 2);
+            names.push_back(name);
+            total += elems * 2;
+        }
+        fseek(f, (long)(elems * 2), SEEK_CUR);
+    }
+    LOGI("AdaLN-only: %u tensors (%.1f KB)", (uint32_t)names.size(), total/1e3);
+
+    // Second pass: read selected tensors
+    VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    uint8_t* buf = new (std::nothrow) uint8_t[total];
+    if (!buf) { fclose(f); return false; }
+    size_t off = 0;
+    for (size_t j = 0; j < names.size(); j++) {
+        fseek(f, (long)offsets[j], SEEK_SET);
+        fread(buf + off, 1, sizes[j], f);
+        auto& w = weights[names[j]];
+        w.name = names[j];
+        w.size = sizes[j];
+        w.ndim = 2;
+        if (!create_buffer(ctx, sizes[j], usage, w.buf)) {
+            LOGE("Failed buffer for %s", names[j].c_str());
+            delete[] buf; fclose(f); return false;
+        }
+        memcpy(w.buf.mapped, buf + off, sizes[j]);
+        off += sizes[j];
+    }
+    delete[] buf; fclose(f);
+    LOGI("AdaLN weights loaded: %u tensors", (uint32_t)weights.size());
+    return true;
+}
+
+static bool create_adaln_pipelines(VulkanCtx& ctx, const char* spv_dir) {
+    char p[256];
+    #define CP(name, bindings, pushSize) \
+        snprintf(p, sizeof(p), "%s/%s.spv", spv_dir, #name); \
+        if (!create_shader_pipe(ctx, p, bindings, pushSize, ctx.name)) return false;
+    CP(gemm, 3, sizeof(PC_Gemm));
+    CP(silu, 2, sizeof(PC_Silu));
+    CP(scale_shift, 4, sizeof(PC_ScaleShift));
+    CP(broadcast, 2, sizeof(PC_Broadcast));
+    #undef CP
+    LOGI("AdaLN pipelines created (gemm, silu, scale_shift, broadcast)");
+    return true;
+}
+
 // ============================================================
 // Forward declaration for adaln_gpu access
 static Buffer g_loraBuf;
@@ -603,6 +676,61 @@ bool dit_init(const char* weight_path, const char* spv_dir) {
     for (int i = 0; i < 2048; i++) ones[i] = 0x3C00;  // fp16 1.0
 
     LOGI("dit_init OK — %u buffers allocated", 15);
+    g_init = true;
+    return true;
+}
+
+// Forward declaration for pre-recording AdaLN blocks
+static bool record_adaln_block(int blockIdx, int cmdIdx);
+bool dit_record_all_adaln_blocks(void);
+
+// Lightweight init: AdaLN weights only (~340KB), no GEMM/attention weights.
+bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
+    if (g_init) return true;
+    LOGI("dit_init_adaln_only: weights=%s spv=%s", weight_path, spv_dir);
+
+    if (!init_vulkan(g_vk)) { LOGE("Vulkan init failed"); return false; }
+    if (!create_adaln_pipelines(g_vk, spv_dir)) { LOGE("Pipeline creation failed"); return false; }
+    if (!create_descriptor_pool(g_vk)) { LOGE("Descriptor pool failed"); return false; }
+
+    if (weight_path && weight_path[0]) {
+        if (!load_adaln_weights(g_vk, weight_path, g_weights)) {
+            LOGE("AdaLN weight loading failed"); return false;
+        }
+    }
+
+    VkBufferUsageFlags u = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    size_t bSz = MS * D * 2;
+    size_t adalnSz = M * D3 * 2;
+    size_t bcastSz = 9 * MS * D * 2;
+
+    if (!create_buffer(g_vk, M * D * 2, u, g_tEmbBuf)) return false;
+    if (!create_buffer(g_vk, adalnSz, u, g_aBuf)) return false;
+    if (!create_buffer(g_vk, M * ADALN_LORA_DIM * 2, u, g_t1)) return false;
+    if (!create_buffer(g_vk, M * D * 2, u, g_tQ)) return false;
+    if (!create_buffer(g_vk, M * D * 2, u, g_tK)) return false;
+    if (!create_buffer(g_vk, M * D * 2, u, g_tV)) return false;
+    if (!create_buffer(g_vk, bcastSz, u, g_bcBuf)) return false;
+
+    if (!create_buffer(g_vk, 3 * M * D * 2, u, g_loraBuf)) return false;
+
+    if (!create_buffer(g_vk, 4096, u, g_onesBuf)) return false;
+    uint16_t* ones = (uint16_t*)g_onesBuf.mapped;
+    for (int i = 0; i < 2048; i++) ones[i] = 0x3C00;
+
+    // Dummy buffers for xBuf/ctxBuf/outBuf (RC references them, not used by adaln_gpu)
+    if (!create_buffer(g_vk, bSz, u, g_xBuf)) return false;
+    if (!create_buffer(g_vk, bSz, u, g_outBuf)) return false;
+    if (!create_buffer(g_vk, M * Nctx * CtxD * 2, u, g_ctxBuf)) return false;
+
+    LOGI("dit_init_adaln_only OK — %u buffers", 12);
+
+    // Pre-record all 28 AdaLN blocks (avoids per-step recording / pool exhaustion)
+    if (!dit_record_all_adaln_blocks()) {
+        LOGE("Failed to pre-record AdaLN blocks");
+        return false;
+    }
+
     g_init = true;
     return true;
 }
@@ -1275,6 +1403,111 @@ bool dit_forward_28blocks(void* x_data, void* t_emb_data, void* ctx_data, void* 
     }
 
     memcpy(out_data, g_outBuf.mapped, xBytes);
+    return true;
+}
+
+static bool record_adaln_block(int blockIdx, int cmdIdx) {
+    char w0_s[128], w2_s[128], w0_c[128], w2_c[128], w0_m[128], w2_m[128];
+    snprintf(w0_s, sizeof(w0_s), "blocks.%d.adaln_modulation_self_attn.1.weight", blockIdx);
+    snprintf(w2_s, sizeof(w2_s), "blocks.%d.adaln_modulation_self_attn.2.weight", blockIdx);
+    snprintf(w0_c, sizeof(w0_c), "blocks.%d.adaln_modulation_cross_attn.1.weight", blockIdx);
+    snprintf(w2_c, sizeof(w2_c), "blocks.%d.adaln_modulation_cross_attn.2.weight", blockIdx);
+    snprintf(w0_m, sizeof(w0_m), "blocks.%d.adaln_modulation_mlp.1.weight", blockIdx);
+    snprintf(w2_m, sizeof(w2_m), "blocks.%d.adaln_modulation_mlp.2.weight", blockIdx);
+
+    VkCommandBufferBeginInfo bi = {};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(g_vk.cmd[cmdIdx], &bi) != VK_SUCCESS) return false;
+
+    RC rc; memset(&rc, 0, sizeof(rc));
+    rc.vk = &g_vk; rc.cmd = g_vk.cmd[cmdIdx]; rc.weights = &g_weights;
+    rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
+    rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
+    rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf;
+    rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
+
+    rc.adaln_gpu(w0_s, w2_s, 0);  // self:  bcBuf[0,1,2]
+    rc.adaln_gpu(w0_c, w2_c, 3);  // cross: bcBuf[3,4,5]
+    rc.adaln_gpu(w0_m, w2_m, 6);  // mlp:   bcBuf[6,7,8]
+
+    return vkEndCommandBuffer(g_vk.cmd[cmdIdx]) == VK_SUCCESS;
+}
+
+bool dit_record_all_adaln_blocks(void) {
+    // Called during init before g_init is set, so no g_init check here.
+    for (int i = 0; i < 28; i++) {
+        if (!record_adaln_block(i, i)) {
+            LOGE("Failed to record adaln block %d", i);
+            return false;
+        }
+    }
+    LOGI("All 28 AdaLN blocks pre-recorded");
+    return true;
+}
+
+bool dit_adaln_one_block(int blockIdx, void* out_9MD) {
+    // Submit pre-recorded cmd[blockIdx], wait, read bcBuf back.
+    // tEmbBuf + g_loraBuf must already be uploaded before calling.
+    // Output [9, M, D] fp16 — reordered to [shift, scale, gate] per channel.
+    // Scale values have +1 undone (adaln_gpu adds 1 for broadcast; Block.forward adds it back).
+    if (!g_init || blockIdx < 0 || blockIdx >= 28) return false;
+
+    vkResetFences(g_vk.device, 1, &g_vk.fence);
+    VkSubmitInfo submit = {};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &g_vk.cmd[blockIdx];
+    if (vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.fence) != VK_SUCCESS) return false;
+    vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+
+    // Read first M rows from each bcBuf component
+    // bcBuf stores [scale+1, shift, gate] per channel; reorder to [shift, scale, gate]
+    // Reorder map: out[0]=bc[1] out[1]=bc[0] out[2]=bc[2] out[3]=bc[4] out[4]=bc[3] out[5]=bc[5] out[6]=bc[7] out[7]=bc[6] out[8]=bc[8]
+    static const int reorder[9] = {1, 0, 2, 4, 3, 5, 7, 6, 8};
+    // Scale components after reorder are at indices 1, 4, 7 (need -1 undo)
+    static const bool is_scale[9] = {false, true, false, false, true, false, false, true, false};
+
+    size_t mBytes = (size_t)M * D * 2;
+    uint16_t* out = (uint16_t*)out_9MD;
+    uint16_t* bc = (uint16_t*)g_bcBuf.mapped;
+
+    for (int c = 0; c < 9; c++) {
+        int src = reorder[c];
+        memcpy(out + c * M * D, bc + src * MS * D, mBytes);
+    }
+
+    // Undo scale+1 on components 1, 4, 7
+    for (int c = 0; c < 9; c++) {
+        if (!is_scale[c]) continue;
+        uint16_t* row = out + c * M * D;
+        for (size_t i = 0; i < (size_t)M * D; i++) {
+            // fp16 → fp32, subtract 1, fp32 → fp16
+            uint32_t h = row[i];
+            uint32_t sign = (h >> 15) & 1;
+            uint32_t exp  = (h >> 10) & 0x1f;
+            uint32_t mant = h & 0x3ff;
+            float val;
+            if (exp == 0) {
+                val = 0.0f;  // subnormals → 0 (scale values ~0-2, never subnormal)
+            } else if (exp == 31) {
+                continue;  // NaN/Inf, leave as-is
+            } else {
+                uint32_t f32 = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+                val = *(float*)&f32;
+            }
+            val -= 1.0f;
+            // fp32 → fp16
+            uint32_t bits = *(uint32_t*)&val;
+            uint32_t s16 = (bits >> 16) & 0x8000;
+            uint32_t e32 = (bits >> 23) & 0xff;
+            uint32_t m32 = bits & 0x7fffff;
+            if (e32 == 0) { row[i] = (uint16_t)s16; }
+            else if (e32 >= 143) { row[i] = (uint16_t)(s16 | 0x7c00); }
+            else if (e32 <= 112) { row[i] = (uint16_t)s16; }
+            else { row[i] = (uint16_t)(s16 | ((e32 - 112) << 10) | ((m32 + 0x1000) >> 13)); }
+        }
+    }
+
     return true;
 }
 
