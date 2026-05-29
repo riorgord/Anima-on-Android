@@ -23,6 +23,8 @@ _lib_vk.dit_write_lora.argtypes = [ctypes.c_void_p]
 _lib_vk.dit_write_lora.restype = None
 _lib_vk.dit_write_buf.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
 _lib_vk.dit_write_buf.restype = ctypes.c_bool
+_lib_vk.dit_compute_timestep.argtypes = [ctypes.c_float]
+_lib_vk.dit_compute_timestep.restype = ctypes.c_bool
 _lib_vk.dit_adaln_one_block.argtypes = [ctypes.c_int, ctypes.c_void_p]
 _lib_vk.dit_adaln_one_block.restype = ctypes.c_bool
 _lib_vk.dit_destroy.argtypes = []
@@ -84,20 +86,9 @@ for i in range(STEPS):
     sigma_next = sigmas[i + 1]
     ts = torch.tensor([sigma], dtype=DTYPE)
 
-    # Compute t_emb + lora for C++ GPU AdaLN (batch=2: cond+uncond)
-    ts_b2_emb = ts.repeat(2).unsqueeze(1)  # [2, 1]
-    with torch.no_grad():
-        sin_emb = dit.t_embedder[0](ts_b2_emb).to(DTYPE)            # [2,1,D] sinusoidal
-        t_emb_raw, lora_raw = dit.t_embedder[1](sin_emb)            # t_emb=[2,1,D], lora=[2,1,3D]
-        t_emb_norm = dit.t_embedding_norm(t_emb_raw)                # [2, 1, D]
-
-    t_emb_np = t_emb_norm.squeeze(1).cpu().numpy().astype(np.float16)  # [M, D]
-    lora_np = lora_raw.squeeze(1).cpu().numpy().astype(np.float16)      # [M, 3D]
-    lora_3MD = lora_np.reshape(M, 3, D).transpose(1, 0, 2).copy()      # [3, M, D]
-
-    # Upload t_emb + lora to C++ engine
-    _lib_vk.dit_write_buf(1, t_emb_np.ctypes.data_as(ctypes.c_void_p), t_emb_np.nbytes)
-    _lib_vk.dit_write_lora(lora_3MD.ctypes.data_as(ctypes.c_void_p))
+    # C++ CPU: compute t_emb + lora from sigma directly into GPU buffers (~0.5ms)
+    # Replaces PyTorch t_embedder sinusoidal→SiLU→GEMM×2→RMSNorm→numpy→upload (8 lines → 1 call)
+    _lib_vk.dit_compute_timestep(float(sigma))
 
     # GPU AdaLN for all 28 blocks
     t0_adaln = time.time()
