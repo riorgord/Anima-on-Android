@@ -141,7 +141,7 @@ output/       生成图片输出
 
 **已知 Adreno 730 限制**：疑似 TDR 250ms 看门狗（单 dispatch 不宜过大）；同一 cmd buffer 多 dispatch 可并行导致 binding confusion（已用 per-block cmd buffer 规避）；大 WG+大 buffer+密集 barrier 组合可触发尚未完全定位的内部 rivalry。
 
-**待开发**：GEMM 入 block 预录制 → Attention 入 block → RoPE GPU → 单实例 28 submit/step
+**待开发**：GEMM 预录（libvk_gemm.so 内部）→ RoPE GPU → Attention 入 block → ~40s/步
 
 ## 致谢
 

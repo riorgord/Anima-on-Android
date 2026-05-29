@@ -902,7 +902,7 @@ Anima model card's recommended sampler. Our implementation produces incorrect re
 
 | 组件 | 每步耗时 | 加速状态 | 可节省 |
 |------|---------|---------|--------|
-| **GEMM** (281 次) | ~25s | ✅ HybridLinear (libvk_gemm.so) | 入 libdit_vk.so 可省竞争 |
+| **GEMM** (281 次) | ~25s | ✅ HybridLinear (libvk_gemm.so) | libvk_gemm.so 内预录 |
 | **Self-attention** (28 blocks) | ~8s | ✅ 3-pass Vulkan batched | — |
 | **Cross-attention** (28 blocks) | ~8s | ✅ 3-pass Vulkan batched | — |
 | **LayerNorm** (85 次) | <1s | ✅ libdit_vk.so FP32 | — |
@@ -910,9 +910,10 @@ Anima model card's recommended sampler. Our implementation produces incorrect re
 | **GELU** (28 次) | <1s | ✅ libdit_vk.so FP16 | — |
 | **AdaLN** (28 blocks) | <1s | ✅ pre-recorded + pool swap | — |
 | **t_embedder** | <1s | ✅ C++ CPU | — |
-| **RoPE** (56 次) | ~3s | ❌ CPU | **-3s** |
-| Python/Vulkan submit 开销 | ~35s | — | 消 submit → ~15s/步 |
-| **总计** | **~77s/步** | | **目标 ~15s/步 (28 submit)** |
+| **RoPE** (56 次) | ~3s | ❌ CPU | GPU 化 -3s |
+| **final_layer** | <1s | PyTorch GEMM | C++ |
+| 其他（numpy/Python 开销） | ~5s | — | — |
+| **总计** | **~63s/步** | | **目标 ~40s（预录后）** |
 
 ### Cross-attention 修复 (2026-05-30)
 
@@ -932,10 +933,10 @@ Anima model card's recommended sampler. Our implementation produces incorrect re
 
 ### 下步路线 (2026-05-30 更新)
 
-1. **GEMM 入 libdit_vk.so** — 已验证 `dit_run_gemm` 正确性（与 libvk_gemm.so 结果一致）。下一步权重预加载 + block 预录，消 287 submit 和两实例竞争
-2. **Attention 入 block 预录制** — 需 shader 改造（8 行/WG 方向正确但需避 TDR）。预录后 448 attention submit → 0
-3. **RoPE GPU** — 56 次调用省 ~3s/步
-4. **最终目标** — 所有 dispatch 在 28 block cmd buffer 中，28 submit/step，预估 ~15s/步
+1. **GEMM 预录进 libvk_gemm.so block** — 保持双实例，在各自的 .so 内做预录消 submit。libvk_gemm.so 侧：权重预加载 + 28 block GEMM 预录，287 submit → 28。单实例合并已验证路线不通（根因未定位，暂搁置）
+2. **RoPE GPU** — 56 次调用省 ~3s/步
+3. **Attention 入 block 预录制** — shader 改造（8 行/WG 方向，WG 上限待解决）
+4. **最终目标** — 双实例各自 28 submit/step，GPU 交叉执行
 
 **参考来源**: 本地 clone 的 ExecuTorch 仓库 `D:\AI\手坤的anima\参考\sdpa找不到了，只能克隆了\executorch\`，重点参考其 Vulkan backend 的 GLSL shader 实现。官方用模板系统（`${}` 宏）生成 shader，我们直接读展开后的逻辑。与自研 shader 的逐模块对比结论：
 

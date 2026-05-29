@@ -82,6 +82,28 @@ AdaLN 重录时 `dit_adaln_one_block` 临时 swap `g_vk.descPool → g_vk.stepPo
 | **部分错误模式** | ROWS=8 时 max_err=0.28，非全零/随机，更像 cache eviction 或 barrier race 而非 TDR 硬复位 | ❓ 待确认 |
 | **官方手册** | 500 系手册 74 页 (本地)。7XX 系 docs.qualcomm.com 按平台代号查 | — |
 
+### GEMM 单实例合并实验 (2026-05-30，未成功)
+
+**目标**：把 GEMM 从 libvk_gemm.so 迁入 libdit_vk.so（单 Vulkan 实例），消两实例竞争。
+
+**实测**（4 次逐级测试）：
+
+| 测试 | 改动 | 结果 |
+|------|------|------|
+| 基线 | 双实例（当前架构） | 63s/步 ✅ |
+| 测试 1 | +32MB buffer, dit_run_gemm, 共享 fence+cBuf | 137s, GEMM 全 CPU |
+| 测试 2 | 测试 1 + 独立 GEMM fence | 135s, 同上 |
+| 测试 3 | 测试 1 + 独立 GEMM fence + 独立 cmdBuf | 133s, 同上 |
+| 烟雾测试 | 测试 3 + libvk_gemm.so 作为 idle 实例加载 | 不变, attn #1 开始全挂 |
+
+**现象**：只要 libdit_vk.so 额外分配 GEMM buffer（哪怕仅 32MB），第二个 attention 调用就失败（`attn #1 batch 0/8 failed` → 后续全 CPU）。不是 fence/cmdBuf 共享的问题。
+
+**当前判断**：根因未定位。怀疑与 Vulkan buffer 分配后 GPU 内存布局变化有关，可能纯属技巧问题而非架构缺陷。单实例路线暂搁置。
+
+**验证过的**：
+- `dit_run_gemm` 逻辑正确（新旧 GEMM 比特一致）
+- 双实例架构稳定（5+ 次管线验证）
+
 ### 剩余 PyTorch CPU 项
 
 | 模块 | 原因 |
@@ -91,19 +113,18 @@ AdaLN 重录时 `dit_adaln_one_block` 临时 swap `g_vk.descPool → g_vk.stepPo
 
 ### 速度分析 (2026-05-30)
 
-| 组件 | 每步耗时 | 状态 |
-|------|---------|------|
-| **GEMM** (281 次) | ~25s | libvk_gemm.so 独立实例 |
-| **Self-attention** (28 blocks) | ~8s | ✅ 3-pass Vulkan batched |
-| **Cross-attention** (28 blocks) | ~8s | ✅ 3-pass Vulkan batched |
-| **LayerNorm** (85 次) | <1s | ✅ libdit_vk.so FP32 |
-| **RMSNorm** (84 次) | <1s | ✅ libdit_vk.so FP16 |
-| **GELU** (28 次) | <1s | ✅ libdit_vk.so FP16 |
-| **AdaLN** (28 blocks) | <1s | ✅ pre-recorded + pool swap |
-| **t_embedder** | <1s | ✅ C++ CPU |
-| **RoPE** (56 次) | ~3s | ❌ CPU |
-| Python/Vulkan submit 开销 | ~35s | 两个实例抢队列 |
-| **总计** | **~77s/步** | |
+**基线**：63s/步（今晚实测，息屏+省电调度）
+
+| 组件 | 每步耗时 | 状态 | 下一步 |
+|------|---------|------|--------|
+| **GEMM** (281 次) | ~25s | ✅ libvk_gemm.so | 预录进 block（内部） |
+| **Self-attention** (28 blocks) | ~8s | ✅ 3-pass Vulkan | — |
+| **Cross-attention** (28 blocks) | ~8s | ✅ 3-pass Vulkan | — |
+| **RoPE** (56 次) | ~3s | ❌ CPU | GPU 化 |
+| **final_layer** | <1s | PyTorch GEMM | C++ |
+| 其他（LN/RMS/GELU/AdaLN/t_emb） | <2s | ✅ | — |
+| Python/Vulkan submit 开销 | ~17s | — | 预录消 submit |
+| **总计** | **~63s/步** | | **目标 ~40s（预录后）** |
 
 ### 已验证通过的链路 (PyTorch reference 对比)
 
