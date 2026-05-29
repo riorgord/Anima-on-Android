@@ -1809,45 +1809,42 @@ bool dit_run_av(void* A_fp16, void* V_fp16, void* O_fp16, int _M_q, int _M_kv, i
 
 static int _attn_call_count = 0;
 
-bool dit_run_attention(void* Q_fp16, void* K_fp16, void* V_fp16, void* O_fp16,
-                        int _M_q, int _M_kv, int _H, int _D, float scale) {
-    if (!g_init) return false;
-    int call_id = _attn_call_count++;
-    LOGI("attn #%d: M_q=%d M_kv=%d H=%d D=%d scale=%.4f", call_id, _M_q, _M_kv, _H, _D, scale);
-    uint32_t M_q = (uint32_t)_M_q, M_kv = (uint32_t)_M_kv, H = (uint32_t)_H, D = (uint32_t)_D;
-
-    // Upload Q/K/V
-    size_t qBytes = M_q * H * D * 2, kvBytes = M_kv * H * D * 2;
-    size_t aBytes = M_q * H * M_kv * 2;
-    memcpy(g_attnQ.mapped, Q_fp16, qBytes);
-    memcpy(g_attnK.mapped, K_fp16, kvBytes);
-    memcpy(g_attnV.mapped, V_fp16, kvBytes);
+// Record 3-pass attention (QK^T + softmax + A@V) into g_lnCmdBuf, submit, wait.
+// Q must already be uploaded to g_attnQ (batch_q * H * D elements).
+// K must already be uploaded to g_attnK (M_kv * H * D elements).
+// V must already be uploaded to g_attnV.
+// Result lands in g_attnO.mapped (batch_q * H * D elements).
+static bool submit_attn_3pass(uint32_t batch_q, uint32_t M_kv, uint32_t H, uint32_t D, float scale) {
+    size_t b_qBytes = batch_q * H * D * 2;
+    size_t b_kvBytes = M_kv * H * D * 2;
+    size_t b_aBytes = batch_q * H * M_kv * 2;
+    size_t b_oBytes = batch_q * H * D * 2;
 
     VkCommandBufferBeginInfo bi = {};
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     if (vkBeginCommandBuffer(g_lnCmdBuf, &bi) != VK_SUCCESS) return false;
 
-    // ── Pass 1: QK^T ──
     VkDescriptorSetAllocateInfo dsa = {};
     dsa.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     dsa.descriptorPool = g_vk.stepPool;
     dsa.descriptorSetCount = 1;
 
+    // ── Pass 1: QK^T ──
     VkDescriptorSet ds1;
     dsa.pSetLayouts = &g_vk.attn_qkt.dsl;
     vkAllocateDescriptorSets(g_vk.device, &dsa, &ds1);
-    VkDescriptorBufferInfo bQ = {g_attnQ.buf, 0, qBytes};
-    VkDescriptorBufferInfo bK = {g_attnK.buf, 0, kvBytes};
-    VkDescriptorBufferInfo bA = {g_attnA.buf, 0, aBytes};
+    VkDescriptorBufferInfo bQ = {g_attnQ.buf, 0, b_qBytes};
+    VkDescriptorBufferInfo bK = {g_attnK.buf, 0, b_kvBytes};
+    VkDescriptorBufferInfo bA = {g_attnA.buf, 0, b_aBytes};
     VkWriteDescriptorSet w1[3] = {};
     for (int i=0;i<3;i++){w1[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;w1[i].dstSet=ds1;w1[i].dstBinding=(uint32_t)i;w1[i].descriptorCount=1;w1[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;}
     w1[0].pBufferInfo=&bQ; w1[1].pBufferInfo=&bK; w1[2].pBufferInfo=&bA;
     vkUpdateDescriptorSets(g_vk.device,3,w1,0,nullptr);
     vkCmdBindPipeline(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_qkt.pipeline);
     vkCmdBindDescriptorSets(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_qkt.layout,0,1,&ds1,0,nullptr);
-    PC_AttnQKT pc1={M_q,M_kv,H,D,scale};
+    PC_AttnQKT pc1={batch_q,M_kv,H,D,scale};
     vkCmdPushConstants(g_lnCmdBuf,g_vk.attn_qkt.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pc1),&pc1);
-    vkCmdDispatch(g_lnCmdBuf, M_q*H, 1, 1);
+    vkCmdDispatch(g_lnCmdBuf, batch_q*H, 1, 1);
     {
         VkMemoryBarrier mb={};
         mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -1868,9 +1865,9 @@ bool dit_run_attention(void* Q_fp16, void* K_fp16, void* V_fp16, void* O_fp16,
     }
     vkCmdBindPipeline(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_softmax.pipeline);
     vkCmdBindDescriptorSets(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_softmax.layout,0,1,&ds2,0,nullptr);
-    PC_AttnSoftmax pc2={M_q,M_kv,H};
+    PC_AttnSoftmax pc2={batch_q,M_kv,H};
     vkCmdPushConstants(g_lnCmdBuf,g_vk.attn_softmax.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pc2),&pc2);
-    vkCmdDispatch(g_lnCmdBuf, M_q*H, 1, 1);
+    vkCmdDispatch(g_lnCmdBuf, batch_q*H, 1, 1);
     {
         VkMemoryBarrier mb={};
         mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -1883,16 +1880,16 @@ bool dit_run_attention(void* Q_fp16, void* K_fp16, void* V_fp16, void* O_fp16,
     VkDescriptorSet ds3;
     dsa.pSetLayouts=&g_vk.attn_out.dsl;
     vkAllocateDescriptorSets(g_vk.device,&dsa,&ds3);
-    VkDescriptorBufferInfo bV={g_attnV.buf,0,kvBytes}, bO={g_attnO.buf,0,qBytes};
+    VkDescriptorBufferInfo bV={g_attnV.buf,0,b_kvBytes}, bO={g_attnO.buf,0,b_oBytes};
     VkWriteDescriptorSet w3[3] = {};
     for (int i=0;i<3;i++){w3[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;w3[i].dstSet=ds3;w3[i].dstBinding=(uint32_t)i;w3[i].descriptorCount=1;w3[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;}
     w3[0].pBufferInfo=&bA; w3[1].pBufferInfo=&bV; w3[2].pBufferInfo=&bO;
     vkUpdateDescriptorSets(g_vk.device,3,w3,0,nullptr);
     vkCmdBindPipeline(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_out.pipeline);
     vkCmdBindDescriptorSets(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_out.layout,0,1,&ds3,0,nullptr);
-    PC_AttnOut pc3={M_q,M_kv,H,D};
+    PC_AttnOut pc3={batch_q,M_kv,H,D};
     vkCmdPushConstants(g_lnCmdBuf,g_vk.attn_out.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pc3),&pc3);
-    vkCmdDispatch(g_lnCmdBuf, M_q*H, 1, 1);
+    vkCmdDispatch(g_lnCmdBuf, batch_q*H, 1, 1);
     {
         VkMemoryBarrier mb2={};
         mb2.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -1910,9 +1907,42 @@ bool dit_run_attention(void* Q_fp16, void* K_fp16, void* V_fp16, void* O_fp16,
     submit.pCommandBuffers = &g_lnCmdBuf;
     if (vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.fence) != VK_SUCCESS) return false;
     vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+    return true;
+}
 
-    memcpy(O_fp16, g_attnO.mapped, qBytes);
-    // stepPool reset between steps — no per-call free
+bool dit_run_attention(void* Q_fp16, void* K_fp16, void* V_fp16, void* O_fp16,
+                        int _M_q, int _M_kv, int _H, int _D, float scale) {
+    if (!g_init) return false;
+    int call_id = _attn_call_count++;
+    uint32_t M_q = (uint32_t)_M_q, M_kv = (uint32_t)_M_kv, H = (uint32_t)_H, D = (uint32_t)_D;
+
+    const uint32_t MAX_WG = 1024;
+    uint32_t max_batch_q = MAX_WG / H;  // 64 for H=16
+    uint32_t n_batches = (M_q + max_batch_q - 1) / max_batch_q;
+    LOGI("attn #%d: M_q=%d M_kv=%d H=%d D=%d scale=%.4f batches=%d", call_id, _M_q, _M_kv, _H, _D, scale, n_batches);
+
+    size_t kvBytes = M_kv * H * D * 2;
+    size_t elemBytes = H * D * 2;
+
+    // Upload K, V once (same for all batches, persist in HOST_COHERENT memory)
+    memcpy(g_attnK.mapped, K_fp16, kvBytes);
+    memcpy(g_attnV.mapped, V_fp16, kvBytes);
+
+    for (uint32_t b = 0; b < n_batches; b++) {
+        uint32_t q_start = b * max_batch_q;
+        uint32_t batch_q = (q_start + max_batch_q <= M_q) ? max_batch_q : (M_q - q_start);
+
+        // Upload Q batch only (K/V already in place)
+        memcpy(g_attnQ.mapped, (uint8_t*)Q_fp16 + q_start * elemBytes, batch_q * elemBytes);
+
+        if (!submit_attn_3pass(batch_q, M_kv, H, D, scale)) {
+            LOGE("attn #%d batch %d/%d failed", call_id, b, n_batches);
+            return false;
+        }
+
+        memcpy((uint8_t*)O_fp16 + q_start * elemBytes, g_attnO.mapped, batch_q * elemBytes);
+    }
+
     return true;
 }
 

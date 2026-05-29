@@ -47,6 +47,7 @@
 | **RMSNorm** | libdit_vk.so FP16 | 84 | max_err 0.004 | HybridRMSNorm |
 | **GELU** | libdit_vk.so FP16 | 28 | max_err 0.0017 | post-init replace |
 | **Self-attention** | libdit_vk.so 3-pass | 28 | — | monkey-patch compute_attn |
+| **Cross-attention** | libdit_vk.so 3-pass batched | 28 | max_err 0.001 | monkey-patch compute_attn |
 | **t_embedder** | libdit_vk.so C++ CPU | 1 | max_err 6e-5 | dit_compute_timestep |
 
 ### 描述符池体系（最终方案）
@@ -58,21 +59,23 @@
 
 AdaLN 重录时 `dit_adaln_one_block` 临时 swap `g_vk.descPool → g_vk.stepPool`，录完换回。
 
-### Cross-attention 诊断 (2026-05-29)
+### Cross-attention 修复 (2026-05-29 晚间)
 
-| 发现 | 详情 |
-|------|------|
-| QK^T per-pass | max_err 0.004，单独提交OK |
-| WG 上限 | batch_q=64 (1024 WG) OK，≥68 (1088 WG) FAIL |
-| 单次 8192 WG | 提交成功，但后续 step AdaLN submit VK_ERROR_DEVICE_LOST |
-| 结论 | 单 call OK，跨步 GPU 状态污染（buffer overlap 嫌疑，未定位） |
-| 当前状态 | **CPU fallback**，pending further debug |
+**根因**: Adreno 730 单 dispatch WG 上限 ~1024。原 `dit_run_attention` 一次 dispatch `M_q*H = 512*16 = 8192 WG`，超过限制后 GPU 状态污染导致跨步 DEVICE_LOST。
+
+**修复**: `dit_run_attention` 内部将 Q 维度拆分为 `batch_q = 64` 的批次（每批 `64*16 = 1024 WG`），逐批 submit+wait。K/V 上传一次复用，Q 分批上传。
+
+| 参数 | 值 |
+|------|-----|
+| batch_q | 64 (1024 WG) |
+| 每 attn 调用 submit 数 | 8 (=512/64) |
+| max_err (cross-attn) | 0.0013 |
+| 跨步稳定性 | ✅ 3 steps 管线验证通过 |
 
 ### 剩余 PyTorch CPU 项
 
 | 模块 | 原因 |
 |------|------|
-| **Cross-attention** | Vulkan 跨步 GPU 状态污染，暂 CPU |
 | **RoPE** | 56 次 ~3s，仍在 compute_qkv 内 |
 | **final_layer** | 1 次，可忽略 |
 
