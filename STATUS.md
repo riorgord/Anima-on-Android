@@ -33,35 +33,38 @@
 - Attention 是 skip 模式（V→O），非真正 QK^T+softmax
 - RoPE 未集成到 block recording
 
-## 当前状态 (2026-05-29): HybridOps + GPU AdaLN + GPU LayerNorm
+## 当前状态 (2026-05-29 深夜): 自注意力 GPU 化完成，跨注意力 shader debug 中
 
-**管线速度**: 63s/步 (HybridOps GEMM + libdit_vk.so AdaLN+LN, 不绑核 + Scene 调度器)
+**管线速度**: 68s/步 (息屏，亮屏应该 ~60s)
 
-### 已注入 HybridOps 的 GPU 模块
+### 已注入的 GPU 模块（全部管线验证通过，87KB PNG）
 
-| 模块 | 引擎 | 每步调用 | 单次精度 | 注入方式 |
-|------|------|---------|---------|---------|
-| **GEMM** | libvk_gemm.so | 281 | max_err ~0.01 | HybridLinear(nn.Linear) |
-| **AdaLN** | libdit_vk.so | 28 blocks | shader chain verified | PrecomputedAdaLN(nn.Module) |
-| **LayerNorm** | libdit_vk.so | 85 | max_err 0.000002 | HybridLayerNorm(nn.LayerNorm) |
+| 模块 | 引擎 | 每步调用 | 精度 | 注入方式 |
+|------|------|---------|------|---------|
+| **GEMM** | libvk_gemm.so | 281 | max_err ~0.01 | HybridLinear |
+| **AdaLN** | libdit_vk.so | 28 blocks | — | PrecomputedAdaLN |
+| **LayerNorm** | libdit_vk.so FP32 | 85 | max_err 2e-6 | HybridLayerNorm |
+| **RMSNorm** | libdit_vk.so FP16 | 84 | max_err 0.004 | HybridRMSNorm |
+| **GELU** | libdit_vk.so FP16 | 28 | max_err 0.0017 | post-init replace |
+| **Self-attention** | libdit_vk.so 3-pass | 28 | — | monkey-patch compute_attn |
+| **t_embedder** | libdit_vk.so C++ CPU | 1 | max_err 6e-5 | dit_compute_timestep |
 
-全部通过管线级验证：出图 86KB PNG, 干净无雪花。
+### 描述符池体系（2026-05-29 debug 最终方案）
 
-### 注入模式确立
+| 池 | 用途 | 手动 free | 步间 reset | 容量 |
+|---|------|----------|-----------|------|
+| **descPool** | init 时 AdaLN 预录（仅一次） | 否 | 永不 | maxSets=6000 |
+| **stepPool** | 运行时 LN/RMS/GELU/AdaLN/attn 录制 | 否 | 每步 vkResetDescriptorPool | maxSets=3000 |
 
-不用 monkey-patch。标准方法：`nn.Module` 子类 → `HybridOps` 记名 → `predict2.py` 的 `operations.X()` 自动拾取。
+AdaLN 录制时 `dit_adaln_one_block` 临时 swap `g_vk.descPool → g_vk.stepPool`，录完换回。
 
-### 已造好待装的轮子
+### 待解决
 
-| 模块 | Shader | 位置 | 替换方式 | 理论省时 |
-|------|--------|------|---------|---------|
-| **RMSNorm** | rms_norm_fp16.comp (已验证) | libdit_vk.so | HybridRMSNorm(nn.RMSNorm) → HybridOps.RMSNorm | ~3s |
-| **SiLU** | silu_fp16.comp (已验证) | libdit_vk.so | HybridSiLU → 改 predict2.py 的 nn.SiLU() | ~2s |
-| **GELU** | gelu_fp16.comp (已验证) | libdit_vk.so | 同上 | <1s |
-
-### libvk_hybrid.so 教训
-
-独立验证 OK，但生产不可靠——buffer 交付路径在逐 op 调用场景下偶发数据不一致（三实例互抢排除了，shader 精度排除了，最终定位到 `vk_hybrid_download` 的缓存一致性问题）。结论：每个 op 类型的 dispatch 都应归入 libdit_vk.so 统一管理，不引入额外 Vulkan 实例。
+| 模块 | 状态 | 说明 |
+|------|------|------|
+| **Cross-attention** | VK_ERROR_DEVICE_LOST | 自注意力 M_kv=512 正常；跨注意力 M_kv=1024 第一次调用即 GPU 崩溃。shader OOB 嫌疑，需独立测试 |
+| **RoPE** | 仍在 PyTorch CPU | 56 次调用 ~3s |
+| **final_layer** | 仍在 PyTorch CPU | 1 次，可忽略 |
 
 ### 已验证通过的链路 (PyTorch reference 对比)
 
