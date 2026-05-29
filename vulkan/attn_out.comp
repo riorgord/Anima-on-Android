@@ -1,0 +1,43 @@
+#version 450
+// Attention output: O[m_q, h, d] = sum_{m_kv} A[m_q,h,m_kv] * V[m_kv,h,d]
+// FP16 I/O, FP32 reduction. Per (query_row, head) workgroup.
+// A is post-softmax attention weights.
+#extension GL_EXT_shader_16bit_storage: require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16: require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer Abuf { float16_t A[]; };  // [M_q * H * M_kv]
+layout(binding = 1) readonly  buffer Vbuf { float16_t V[]; };  // [M_kv * H * D]
+layout(binding = 2) writeonly buffer Obuf { float16_t O[]; };  // [M_q * H * D]
+
+layout(push_constant) uniform PC {
+    uint M_q;
+    uint M_kv;
+    uint H;
+    uint D;
+} pc;
+
+void main() {
+    uint gid = gl_WorkGroupID.x;
+    uint total_q = pc.M_q * pc.H;
+    if (gid >= total_q) return;
+
+    uint m_q = gid / pc.H;
+    uint h   = gid % pc.H;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint a_off = gid * pc.M_kv;
+    uint o_off = m_q * pc.H * pc.D + h * pc.D;
+
+    // Each thread handles one output dimension d, summing over M_kv
+    for (uint d = tid; d < pc.D; d += 256u) {
+        float sum = 0.0;
+        for (uint m_kv = 0u; m_kv < pc.M_kv; m_kv++) {
+            float a = float(A[a_off + m_kv]);
+            uint v_idx = m_kv * pc.H * pc.D + h * pc.D + d;
+            sum += a * float(V[v_idx]);
+        }
+        O[o_off + d] = float16_t(sum);
+    }
+}

@@ -106,6 +106,9 @@ try:
     _lib_dit.dit_run_rmsnorm.restype = _ct.c_bool
     _lib_dit.dit_run_gelu.argtypes = [_ct.c_void_p, _ct.c_void_p, _ct.c_int]
     _lib_dit.dit_run_gelu.restype = _ct.c_bool
+    _lib_dit.dit_run_attention.argtypes = [_ct.c_void_p, _ct.c_void_p, _ct.c_void_p, _ct.c_void_p,
+        _ct.c_int, _ct.c_int, _ct.c_int, _ct.c_int, _ct.c_float]
+    _lib_dit.dit_run_attention.restype = _ct.c_bool
     _VK_LN_AVAILABLE = True
 except Exception:
     _VK_LN_AVAILABLE = False

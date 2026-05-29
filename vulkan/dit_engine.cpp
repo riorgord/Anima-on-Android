@@ -42,6 +42,9 @@ struct PC_ScaleShift{ uint32_t n_total, scale_stride, shift_stride; };
 struct PC_Rope      { uint32_t N, head_dim; };
 struct PC_Attention { uint32_t total_q, total_kv, head_dim, S_kv; float scale; };
 struct PC_Broadcast { uint32_t M, D, repeat; };
+struct PC_AttnQKT     { uint32_t M_q, M_kv, H, D; float scale; };
+struct PC_AttnSoftmax { uint32_t M_q, M_kv, H; };
+struct PC_AttnOut     { uint32_t M_q, M_kv, H, D; };
 
 // ============================================================
 // Vulkan resource structs
@@ -74,6 +77,7 @@ struct VulkanCtx {
     VkPhysicalDeviceMemoryProperties memProps = {};
 
     ShaderPipe gemm, rms_norm, layer_norm, silu, scale_shift, rope, attention, broadcast, gelu;
+    ShaderPipe attn_qkt, attn_softmax, attn_out;
 };
 
 struct WeightInfo {
@@ -399,8 +403,11 @@ static bool create_adaln_pipelines(VulkanCtx& ctx, const char* spv_dir) {
     CP(layer_norm, 2, sizeof(PC_LayerNorm));
     CP(rms_norm, 3, sizeof(PC_RmsNorm));
     CP(gelu, 2, sizeof(PC_Silu));
+    CP(attn_qkt, 3, sizeof(PC_AttnQKT));
+    CP(attn_softmax, 1, sizeof(PC_AttnSoftmax));
+    CP(attn_out, 3, sizeof(PC_AttnOut));
     #undef CP
-    LOGI("AdaLN pipelines created (gemm, silu, scale_shift, broadcast, layer_norm, rms_norm, gelu)");
+    LOGI("AdaLN pipelines created (9 types + 3 attn)");
     return true;
 }
 
@@ -415,6 +422,8 @@ static Buffer g_rmsOutBuf;  // FP16 RMSNorm output
 static Buffer g_rmsWgtBuf;  // FP16 RMSNorm weight (max D=2048)
 static Buffer g_geluInBuf;  // FP16 GELU input (M=512,D=8192 → 8.4MB)
 static Buffer g_geluOutBuf; // FP16 GELU output
+// Attention FP16 buffers — allocated at init, sized for cross-attn worst case
+static Buffer g_attnQ, g_attnK, g_attnV, g_attnA, g_attnO;
 
 struct RC {
     VulkanCtx* vk;
@@ -742,6 +751,14 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
     size_t geluSz = MS * MLP_HIDDEN * 2;
     if (!create_buffer(g_vk, geluSz, u, g_geluInBuf)) return false;
     if (!create_buffer(g_vk, geluSz, u, g_geluOutBuf)) return false;
+
+    // Attention FP16 buffers (sized for cross-attn: M_q=512, M_kv=1024, H=16, D=128)
+    // Q: M_q*H*D*2=2MB, K: M_kv*H*D*2=4MB, V: 4MB, A: M_q*H*M_kv*2=16.8MB, O: 2MB
+    if (!create_buffer(g_vk, MS * N_HEADS * HEAD_DIM * 2, u, g_attnQ)) return false;
+    if (!create_buffer(g_vk, M * Nctx * N_HEADS * HEAD_DIM * 2, u, g_attnK)) return false;
+    if (!create_buffer(g_vk, M * Nctx * N_HEADS * HEAD_DIM * 2, u, g_attnV)) return false;
+    if (!create_buffer(g_vk, MS * N_HEADS * (M * Nctx) * 2, u, g_attnA)) return false;
+    if (!create_buffer(g_vk, MS * N_HEADS * HEAD_DIM * 2, u, g_attnO)) return false;
 
     if (!create_buffer(g_vk, 4096, u, g_onesBuf)) return false;
     uint16_t* ones = (uint16_t*)g_onesBuf.mapped;
@@ -1640,6 +1657,114 @@ bool dit_run_layernorm(void* in_fp32, void* out_fp32, int _M, int _D, float eps)
     return true;
 }
 
+bool dit_run_attention(void* Q_fp16, void* K_fp16, void* V_fp16, void* O_fp16,
+                        int _M_q, int _M_kv, int _H, int _D, float scale) {
+    // 3-pass attention: QK^T → softmax → A@V. One cmd buffer, one submit.
+    if (!g_init) return false;
+    uint32_t M_q = (uint32_t)_M_q, M_kv = (uint32_t)_M_kv, H = (uint32_t)_H, D = (uint32_t)_D;
+
+    // Upload Q/K/V
+    size_t qBytes = M_q * H * D * 2, kvBytes = M_kv * H * D * 2;
+    size_t aBytes = M_q * H * M_kv * 2;
+    memcpy(g_attnQ.mapped, Q_fp16, qBytes);
+    memcpy(g_attnK.mapped, K_fp16, kvBytes);
+    memcpy(g_attnV.mapped, V_fp16, kvBytes);
+
+    VkCommandBufferBeginInfo bi = {};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(g_lnCmdBuf, &bi) != VK_SUCCESS) return false;
+
+    // ── Pass 1: QK^T ──
+    VkDescriptorSetAllocateInfo dsa = {};
+    dsa.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsa.descriptorPool = g_vk.descPool;
+    dsa.descriptorSetCount = 1;
+
+    VkDescriptorSet ds1;
+    dsa.pSetLayouts = &g_vk.attn_qkt.dsl;
+    vkAllocateDescriptorSets(g_vk.device, &dsa, &ds1);
+    VkDescriptorBufferInfo bQ = {g_attnQ.buf, 0, qBytes};
+    VkDescriptorBufferInfo bK = {g_attnK.buf, 0, kvBytes};
+    VkDescriptorBufferInfo bA = {g_attnA.buf, 0, aBytes};
+    VkWriteDescriptorSet w1[3] = {};
+    for (int i=0;i<3;i++){w1[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;w1[i].dstSet=ds1;w1[i].dstBinding=(uint32_t)i;w1[i].descriptorCount=1;w1[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;}
+    w1[0].pBufferInfo=&bQ; w1[1].pBufferInfo=&bK; w1[2].pBufferInfo=&bA;
+    vkUpdateDescriptorSets(g_vk.device,3,w1,0,nullptr);
+    vkCmdBindPipeline(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_qkt.pipeline);
+    vkCmdBindDescriptorSets(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_qkt.layout,0,1,&ds1,0,nullptr);
+    PC_AttnQKT pc1={M_q,M_kv,H,D,scale};
+    vkCmdPushConstants(g_lnCmdBuf,g_vk.attn_qkt.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pc1),&pc1);
+    vkCmdDispatch(g_lnCmdBuf, M_q*H, 1, 1);
+    {
+        VkMemoryBarrier mb={};
+        mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(g_lnCmdBuf,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,nullptr,0,nullptr);
+    }
+
+    // ── Pass 2: softmax in-place ──
+    VkDescriptorSet ds2;
+    dsa.pSetLayouts=&g_vk.attn_softmax.dsl;
+    vkAllocateDescriptorSets(g_vk.device,&dsa,&ds2);
+    {
+        VkWriteDescriptorSet w2={};
+        w2.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w2.dstSet=ds2; w2.dstBinding=0; w2.descriptorCount=1;
+        w2.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w2.pBufferInfo=&bA;
+        vkUpdateDescriptorSets(g_vk.device,1,&w2,0,nullptr);
+    }
+    vkCmdBindPipeline(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_softmax.pipeline);
+    vkCmdBindDescriptorSets(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_softmax.layout,0,1,&ds2,0,nullptr);
+    PC_AttnSoftmax pc2={M_q,M_kv,H};
+    vkCmdPushConstants(g_lnCmdBuf,g_vk.attn_softmax.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pc2),&pc2);
+    vkCmdDispatch(g_lnCmdBuf, M_q*H, 1, 1);
+    {
+        VkMemoryBarrier mb={};
+        mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(g_lnCmdBuf,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,nullptr,0,nullptr);
+    }
+
+    // ── Pass 3: A @ V ──
+    VkDescriptorSet ds3;
+    dsa.pSetLayouts=&g_vk.attn_out.dsl;
+    vkAllocateDescriptorSets(g_vk.device,&dsa,&ds3);
+    VkDescriptorBufferInfo bV={g_attnV.buf,0,kvBytes}, bO={g_attnO.buf,0,qBytes};
+    VkWriteDescriptorSet w3[3] = {};
+    for (int i=0;i<3;i++){w3[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;w3[i].dstSet=ds3;w3[i].dstBinding=(uint32_t)i;w3[i].descriptorCount=1;w3[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;}
+    w3[0].pBufferInfo=&bA; w3[1].pBufferInfo=&bV; w3[2].pBufferInfo=&bO;
+    vkUpdateDescriptorSets(g_vk.device,3,w3,0,nullptr);
+    vkCmdBindPipeline(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_out.pipeline);
+    vkCmdBindDescriptorSets(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_out.layout,0,1,&ds3,0,nullptr);
+    PC_AttnOut pc3={M_q,M_kv,H,D};
+    vkCmdPushConstants(g_lnCmdBuf,g_vk.attn_out.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pc3),&pc3);
+    vkCmdDispatch(g_lnCmdBuf, M_q*H, 1, 1);
+    {
+        VkMemoryBarrier mb2={};
+        mb2.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb2.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;
+        mb2.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(g_lnCmdBuf,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&mb2,0,nullptr,0,nullptr);
+    }
+
+    if (vkEndCommandBuffer(g_lnCmdBuf) != VK_SUCCESS) return false;
+
+    vkResetFences(g_vk.device, 1, &g_vk.fence);
+    VkSubmitInfo submit = {};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &g_lnCmdBuf;
+    if (vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.fence) != VK_SUCCESS) return false;
+    vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+
+    memcpy(O_fp16, g_attnO.mapped, qBytes);
+    vkFreeDescriptorSets(g_vk.device, g_vk.descPool, 1, &ds1);
+    vkFreeDescriptorSets(g_vk.device, g_vk.descPool, 1, &ds2);
+    vkFreeDescriptorSets(g_vk.device, g_vk.descPool, 1, &ds3);
+    return true;
+}
+
 bool dit_run_gelu(void* in_fp16, void* out_fp16, int _N) {
     if (!g_init) return false;
     uint32_t N = (uint32_t)_N;
@@ -1771,6 +1896,7 @@ void dit_destroy() {
     free_sp(g_vk.gemm); free_sp(g_vk.rms_norm); free_sp(g_vk.layer_norm);
     free_sp(g_vk.silu); free_sp(g_vk.scale_shift); free_sp(g_vk.rope);
     free_sp(g_vk.attention); free_sp(g_vk.broadcast); free_sp(g_vk.gelu);
+    free_sp(g_vk.attn_qkt); free_sp(g_vk.attn_softmax); free_sp(g_vk.attn_out);
 
     if (g_vk.descPool) vkDestroyDescriptorPool(g_vk.device, g_vk.descPool, nullptr);
     if (g_lnCmdBuf) vkFreeCommandBuffers(g_vk.device, g_vk.cmdPool, 1, &g_lnCmdBuf);
@@ -1789,6 +1915,7 @@ void dit_destroy() {
     free_buf(g_onesBuf); free_buf(g_loraBuf);
     free_buf(g_lnInBuf); free_buf(g_lnOutBuf);
     free_buf(g_geluInBuf); free_buf(g_geluOutBuf);
+    free_buf(g_attnQ); free_buf(g_attnK); free_buf(g_attnV); free_buf(g_attnA); free_buf(g_attnO);
     free_buf(g_rmsInBuf); free_buf(g_rmsOutBuf); free_buf(g_rmsWgtBuf);
 
     if (g_vk.device) vkDestroyDevice(g_vk.device, nullptr);
