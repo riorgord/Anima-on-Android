@@ -99,7 +99,7 @@ for blk in dit.blocks:
             return orig.output_dropout(orig.output_proj(o_t.to(q.dtype)))
         return vk_compute_attention
     blk.self_attn.compute_attention = _make_vk_attn()
-    # Cross-attention: stay on PyTorch for now (debugging descriptor pool issue)
+    # Cross-attn: TODO — Vulkan shader causes VK_ERROR_DEVICE_LOST after 56 calls
 
 # Scheduler
 def time_snr_shift(a, t): return a * t / (1.0 + (a - 1.0) * t)
@@ -157,7 +157,7 @@ for i in range(STEPS):
     for blk in dit.blocks:
         blk.use_adaln_lora = True
 
-    # Reset descriptor pool (re-records AdaLN blocks for next step)
+    # Reset descriptor pool between steps
     _lib_vk.dit_reset_step_pool()
 
     v_cond = v_b[0:1].float()

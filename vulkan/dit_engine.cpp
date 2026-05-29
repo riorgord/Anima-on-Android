@@ -73,6 +73,7 @@ struct VulkanCtx {
     VkCommandPool cmdPool = VK_NULL_HANDLE;
     VkCommandBuffer cmd[28] = {};
     VkFence fence = VK_NULL_HANDLE;
+    VkFence stepFence = VK_NULL_HANDLE;  // per-step ops fence
     VkDescriptorPool descPool = VK_NULL_HANDLE;
     VkDescriptorPool stepPool = VK_NULL_HANDLE;  // per-step pool, reset between steps
     VkPhysicalDeviceMemoryProperties memProps = {};
@@ -713,6 +714,15 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
     if (!init_vulkan(g_vk)) { LOGE("Vulkan init failed"); return false; }
     if (!create_adaln_pipelines(g_vk, spv_dir)) { LOGE("Pipeline creation failed"); return false; }
     if (!create_descriptor_pool(g_vk)) { LOGE("Descriptor pool failed"); return false; }
+
+    // Per-step fence (separate from AdaLN fence)
+    {
+        VkFenceCreateInfo fi = {};
+        fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        if (vkCreateFence(g_vk.device, &fi, nullptr, &g_vk.stepFence) != VK_SUCCESS) {
+            LOGE("stepFence failed"); return false;
+        }
+    }
 
     // Second pool for per-step ops — reset each step to avoid fragmentation
     {
@@ -1516,27 +1526,36 @@ bool dit_record_all_adaln_blocks(void) {
 }
 
 bool dit_reset_step_pool(void) {
-    // Reset per-step descriptor pool (stepPool). descPool (AdaLN) is untouched.
     if (!g_init) return false;
     vkResetDescriptorPool(g_vk.device, g_vk.stepPool, 0);
+    LOGI("stepPool reset OK");
     return true;
 }
 
 bool dit_adaln_one_block(int blockIdx, void* out_9MD) {
-    // Submit pre-recorded cmd[blockIdx], wait, read bcBuf back.
-    // tEmbBuf + g_loraBuf must already be uploaded before calling.
-    // Output [9, M, D] fp16 — reordered to [shift, scale, gate] per channel.
-    // Scale values have +1 undone (adaln_gpu adds 1 for broadcast; Block.forward adds it back).
     if (!g_init) { LOGE("adaln_one_block: not initialized"); return false; }
     if (blockIdx < 0 || blockIdx >= 28) { LOGE("adaln_one_block: bad idx %d", blockIdx); return false; }
 
-    vkResetFences(g_vk.device, 1, &g_vk.fence);
+    // Re-record into cmd[0] using stepPool (then reset stepPool between steps)
+    // Swap descPool → stepPool so RC methods use the per-step pool
+    auto savedPool = g_vk.descPool;
+    g_vk.descPool = g_vk.stepPool;
+    bool ok = record_adaln_block(blockIdx, blockIdx);
+    g_vk.descPool = savedPool;
+    if (!ok) {
+        LOGE("adaln_one_block(%d): re-record failed", blockIdx); return false;
+    }
+
+    vkResetFences(g_vk.device, 1, &g_vk.stepFence);
     VkSubmitInfo submit = {};
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &g_vk.cmd[blockIdx];
-    if (vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.fence) != VK_SUCCESS) return false;
-    vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+    VkResult sr = vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.stepFence);
+    if (sr != VK_SUCCESS) {
+        LOGE("adaln_one_block(%d): submit failed (VkResult=%d)", blockIdx, (int)sr); return false;
+    }
+    vkWaitForFences(g_vk.device, 1, &g_vk.stepFence, VK_TRUE, UINT64_MAX);
 
     // Read first M rows from each bcBuf component
     // bcBuf stores [scale+1, shift, gate] per channel; reorder to [shift, scale, gate]
@@ -1601,10 +1620,10 @@ bool dit_run_layernorm(void* in_fp32, void* out_fp32, int _M, int _D, float eps)
     // Upload input to g_lnInBuf
     memcpy(g_lnInBuf.mapped, in_fp32, dataBytes);
 
-    // Record into dedicated LN command buffer (don't overwrite AdaLN pre-recorded cmds)
+    // Record into dedicated LN command buffer
     VkCommandBufferBeginInfo bi = {};
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    if (vkBeginCommandBuffer(g_lnCmdBuf, &bi) != VK_SUCCESS) return false;
+    if (vkBeginCommandBuffer(g_lnCmdBuf, &bi) != VK_SUCCESS) { LOGE("LN: begin cmd failed"); return false; }
 
     // Allocate descriptor set for LN
     VkDescriptorSetAllocateInfo dsInfo = {};
@@ -1679,10 +1698,13 @@ bool dit_run_layernorm(void* in_fp32, void* out_fp32, int _M, int _D, float eps)
     return true;
 }
 
+static int _attn_call_count = 0;
+
 bool dit_run_attention(void* Q_fp16, void* K_fp16, void* V_fp16, void* O_fp16,
                         int _M_q, int _M_kv, int _H, int _D, float scale) {
-    // 3-pass attention: QK^T → softmax → A@V. One cmd buffer, one submit.
     if (!g_init) return false;
+    int call_id = _attn_call_count++;
+    LOGI("attn #%d: M_q=%d M_kv=%d H=%d D=%d scale=%.4f", call_id, _M_q, _M_kv, _H, _D, scale);
     uint32_t M_q = (uint32_t)_M_q, M_kv = (uint32_t)_M_kv, H = (uint32_t)_H, D = (uint32_t)_D;
 
     // Upload Q/K/V
