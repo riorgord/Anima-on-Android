@@ -1,8 +1,10 @@
 """Hybrid ops: Vulkan for large GEMM, CPU for small."""
-import time
+import time, struct
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
+import ctypes as _ct
 
 try:
     import sys
@@ -11,6 +13,23 @@ try:
     _VK_AVAILABLE = True  # Vulkan enabled — dispatch swap bug fixed 2026-05-26
 except ImportError:
     _VK_AVAILABLE = False
+
+# ── libvk_hybrid.so (LayerNorm / SiLU / GELU shaders) ──
+try:
+    _lib_hy = _ct.CDLL("/data/local/tmp/libvk_hybrid.so")
+    _lib_hy.vk_hybrid_init.argtypes = []
+    _lib_hy.vk_hybrid_init.restype = _ct.c_bool
+    _lib_hy.vk_hybrid_load.argtypes = [_ct.c_char_p, _ct.c_int, _ct.c_int]
+    _lib_hy.vk_hybrid_load.restype = _ct.c_int
+    _lib_hy.vk_hybrid_upload.argtypes = [_ct.c_int, _ct.c_int, _ct.c_void_p, _ct.c_size_t]
+    _lib_hy.vk_hybrid_upload.restype = _ct.c_bool
+    _lib_hy.vk_hybrid_download.argtypes = [_ct.c_int, _ct.c_int, _ct.c_void_p, _ct.c_size_t]
+    _lib_hy.vk_hybrid_download.restype = _ct.c_bool
+    _lib_hy.vk_hybrid_run.argtypes = [_ct.c_int, _ct.c_uint32, _ct.c_uint32, _ct.c_uint32, _ct.c_void_p]
+    _lib_hy.vk_hybrid_run.restype = _ct.c_bool
+    _VK_HYBRID_AVAILABLE = True
+except Exception:
+    _VK_HYBRID_AVAILABLE = False
 
 # Threshold: Vulkan only when BOTH output dim >= 2048 AND batch (M) >= 64
 # Avoids Adreno 7xx driver bug at small workgroup sizes
@@ -25,7 +44,6 @@ _VK_GPU_TIME = 0.0  # pure GPU compute time (from Vulkan timestamps)
 
 # Register fp16-direct entry point (no f2h/h2f in .so)
 if _VK_AVAILABLE:
-    import ctypes as _ct
     _vk._lib.vk_gemm_run_fp16.argtypes = [_ct.c_void_p, _ct.c_void_p, _ct.c_void_p,
                                           _ct.c_int, _ct.c_int, _ct.c_int]
     _vk._lib.vk_gemm_run_fp16.restype = _ct.c_bool
@@ -79,11 +97,79 @@ class HybridLinear(nn.Linear):
         return out
 
 
+class HybridLayerNorm(nn.LayerNorm):
+    """nn.LayerNorm with Vulkan acceleration (no affine)."""
+    _handle = None
+    _out_buf = None
+    _out_shape = None
+
+    @classmethod
+    def _ensure_init(cls):
+        if cls._handle is not None:
+            return
+        if not _VK_HYBRID_AVAILABLE:
+            return
+        ok = _lib_hy.vk_hybrid_init()
+        if not ok:
+            return
+        h = _lib_hy.vk_hybrid_load(b"/data/local/tmp/layernorm_fp16.spv", 2, 12)
+        if h < 0:
+            return
+        cls._handle = h
+
+    _count = 0
+
+    def forward(self, x):
+        self._ensure_init()
+        # Fallback: no Vulkan, or has affine params (not supported by shader)
+        if self._handle is None or self.elementwise_affine:
+            return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+
+        *batch, D = x.shape
+        M = int(np.prod(batch)) if batch else 1
+        n_elems = D
+
+        x_f16 = x.reshape(M, D).cpu().contiguous().to(torch.float16).numpy().view(np.uint16)
+
+        # Pre-allocate output buffer if shape changed
+        out_bytes = M * D * 2
+        out_buf = np.zeros(M * D, dtype=np.uint16)
+
+        # Re-upload output buffer descriptor only when shape changes
+        if self._out_shape != (M * D):
+            _lib_hy.vk_hybrid_upload(self._handle, 1, out_buf.ctypes.data_as(_ct.c_void_p), out_bytes)
+            self._out_shape = M * D
+
+        # Upload input
+        _lib_hy.vk_hybrid_upload(self._handle, 0, x_f16.ctypes.data_as(_ct.c_void_p), out_bytes)
+
+        # Push constants: n_rows, n_elems, eps
+        push = struct.pack('<IIf', M, n_elems, float(self.eps))
+        _lib_hy.vk_hybrid_run(self._handle, M, 1, 1, push)
+
+        # Download result
+        _lib_hy.vk_hybrid_download(self._handle, 1, out_buf.ctypes.data_as(_ct.c_void_p), out_bytes)
+
+        result = torch.tensor(out_buf.view(np.float16), device=x.device)
+        result = result.reshape(*batch, D) if batch else result.squeeze(0)
+        result = result.to(x.dtype)
+
+        # Diagnostic: compare with F.layer_norm for first 5 calls
+        cls = type(self)
+        if cls._count < 5:
+            ref = F.layer_norm(x.float(), self.normalized_shape, None, None, self.eps)
+            err = (result.float() - ref.float()).abs().max().item()
+            print(f"  VkLN#{cls._count} M={M} D={D} max_err={err:.6f}")
+            cls._count += 1
+
+        return result
+
+
 class HybridOps:
     """Operations class with Vulkan acceleration for large Linear layers."""
     Linear = HybridLinear
     RMSNorm = nn.RMSNorm
-    LayerNorm = nn.LayerNorm
+    LayerNorm = nn.LayerNorm  # TODO: HybridLayerNorm精度问题, 85层累积成雪花
     Embedding = nn.Embedding
 
 
