@@ -1698,6 +1698,115 @@ bool dit_run_layernorm(void* in_fp32, void* out_fp32, int _M, int _D, float eps)
     return true;
 }
 
+// ── Single-pass attention debug functions ──
+// Each records one dispatch into g_lnCmdBuf, submits, waits, downloads result.
+
+static bool record_one_attn_dispatch(VkPipeline pipeline, VkPipelineLayout layout,
+    VkDescriptorSetLayout dsl, VkDescriptorSet* ds_out, int nBindings,
+    VkDescriptorBufferInfo* bindInfos, const void* pushData, size_t pushSize,
+    uint32_t dx, uint32_t dy, uint32_t dz) {
+    VkCommandBufferBeginInfo bi = {};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(g_lnCmdBuf, &bi) != VK_SUCCESS) return false;
+
+    VkDescriptorSetAllocateInfo dsa = {};
+    dsa.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsa.descriptorPool = g_vk.stepPool;
+    dsa.descriptorSetCount = 1;
+    dsa.pSetLayouts = &dsl;
+    VkDescriptorSet ds;
+    if (vkAllocateDescriptorSets(g_vk.device, &dsa, &ds) != VK_SUCCESS) return false;
+
+    for (int i = 0; i < nBindings; i++) {
+        VkWriteDescriptorSet w = {};
+        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstSet = ds;
+        w.dstBinding = (uint32_t)i;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w.pBufferInfo = &bindInfos[i];
+        vkUpdateDescriptorSets(g_vk.device, 1, &w, 0, nullptr);
+    }
+
+    vkCmdBindPipeline(g_lnCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdBindDescriptorSets(g_lnCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &ds, 0, nullptr);
+    if (pushSize > 0)
+        vkCmdPushConstants(g_lnCmdBuf, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, (uint32_t)pushSize, pushData);
+    vkCmdDispatch(g_lnCmdBuf, dx, dy, dz);
+
+    VkMemoryBarrier mb = {};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(g_lnCmdBuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+        0, 1, &mb, 0, nullptr, 0, nullptr);
+
+    if (vkEndCommandBuffer(g_lnCmdBuf) != VK_SUCCESS) return false;
+
+    vkResetFences(g_vk.device, 1, &g_vk.fence);
+    VkSubmitInfo si = {};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &g_lnCmdBuf;
+    VkResult sr = vkQueueSubmit(g_vk.queue, 1, &si, g_vk.fence);
+    if (sr != VK_SUCCESS) { LOGE("attn debug dispatch submit failed VkResult=%d", (int)sr); return false; }
+    vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+
+    if (ds_out) *ds_out = ds;
+    return true;
+}
+
+bool dit_run_qkt(void* Q_fp16, void* K_fp16, void* A_fp16, int _M_q, int _M_kv, int _H, int _D, float scale) {
+    if (!g_init) return false;
+    uint32_t M_q=(uint32_t)_M_q, M_kv=(uint32_t)_M_kv, H=(uint32_t)_H, D=(uint32_t)_D;
+    size_t qBytes=M_q*H*D*2, kvBytes=M_kv*H*D*2, aBytes=M_q*H*M_kv*2;
+    memcpy(g_attnQ.mapped,Q_fp16,qBytes);
+    memcpy(g_attnK.mapped,K_fp16,kvBytes);
+
+    VkDescriptorBufferInfo bi[3] = {
+        {g_attnQ.buf,0,qBytes}, {g_attnK.buf,0,kvBytes}, {g_attnA.buf,0,aBytes}
+    };
+    PC_AttnQKT pc={M_q,M_kv,H,D,scale};
+    if (!record_one_attn_dispatch(g_vk.attn_qkt.pipeline, g_vk.attn_qkt.layout,
+        g_vk.attn_qkt.dsl, nullptr, 3, bi, &pc, sizeof(pc), M_q*H, 1, 1)) return false;
+
+    memcpy(A_fp16,g_attnA.mapped,aBytes);
+    return true;
+}
+
+bool dit_run_softmax(void* A_fp16, int _M_q, int _M_kv, int _H) {
+    if (!g_init) return false;
+    uint32_t M_q=(uint32_t)_M_q, M_kv=(uint32_t)_M_kv, H=(uint32_t)_H;
+    size_t aBytes=M_q*H*M_kv*2;
+    memcpy(g_attnA.mapped,A_fp16,aBytes);
+
+    VkDescriptorBufferInfo bi = {g_attnA.buf,0,aBytes};
+    PC_AttnSoftmax pc={M_q,M_kv,H};
+    if (!record_one_attn_dispatch(g_vk.attn_softmax.pipeline, g_vk.attn_softmax.layout,
+        g_vk.attn_softmax.dsl, nullptr, 1, &bi, &pc, sizeof(pc), M_q*H, 1, 1)) return false;
+
+    memcpy(A_fp16,g_attnA.mapped,aBytes);
+    return true;
+}
+
+bool dit_run_av(void* A_fp16, void* V_fp16, void* O_fp16, int _M_q, int _M_kv, int _H, int _D) {
+    if (!g_init) return false;
+    uint32_t M_q=(uint32_t)_M_q, M_kv=(uint32_t)_M_kv, H=(uint32_t)_H, D=(uint32_t)_D;
+    size_t aBytes=M_q*H*M_kv*2, kvBytes=M_kv*H*D*2, oBytes=M_q*H*D*2;
+    memcpy(g_attnA.mapped,A_fp16,aBytes);
+    memcpy(g_attnV.mapped,V_fp16,kvBytes);
+
+    VkDescriptorBufferInfo bi[3] = {
+        {g_attnA.buf,0,aBytes}, {g_attnV.buf,0,kvBytes}, {g_attnO.buf,0,oBytes}
+    };
+    PC_AttnOut pc={M_q,M_kv,H,D};
+    if (!record_one_attn_dispatch(g_vk.attn_out.pipeline, g_vk.attn_out.layout,
+        g_vk.attn_out.dsl, nullptr, 3, bi, &pc, sizeof(pc), M_q*H, 1, 1)) return false;
+
+    memcpy(O_fp16,g_attnO.mapped,oBytes);
+    return true;
+}
+
 static int _attn_call_count = 0;
 
 bool dit_run_attention(void* Q_fp16, void* K_fp16, void* V_fp16, void* O_fp16,

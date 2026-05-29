@@ -99,7 +99,26 @@ for blk in dit.blocks:
             return orig.output_dropout(orig.output_proj(o_t.to(q.dtype)))
         return vk_compute_attention
     blk.self_attn.compute_attention = _make_vk_attn()
-    # Cross-attn: TODO — Vulkan shader causes VK_ERROR_DEVICE_LOST after 56 calls
+    _orig_cross = blk.cross_attn
+    _orig_ccomp = _orig_cross.compute_attention
+    def _make_vk_cross(orig=_orig_cross, orig_comp=_orig_ccomp):
+        scale = 1.0 / (orig.head_dim ** 0.5)
+        def vk_compute_attention(q, k, v, transformer_options={}):
+            B, S_q, H, D = q.shape; _, S_kv, _, _ = k.shape
+            M_q = B * S_q; M_kv = B * S_kv
+            q_f16 = q.reshape(M_q*H, D).cpu().contiguous().to(torch.float16).numpy().view(np.uint16)
+            k_f16 = k.reshape(M_kv*H, D).cpu().contiguous().to(torch.float16).numpy().view(np.uint16)
+            v_f16 = v.reshape(M_kv*H, D).cpu().contiguous().to(torch.float16).numpy().view(np.uint16)
+            o_flat = np.zeros(M_q * H * D, dtype=np.uint16)
+            ok = vk_ops._lib_dit.dit_run_attention(
+                q_f16.ctypes.data_as(ctypes.c_void_p), k_f16.ctypes.data_as(ctypes.c_void_p),
+                v_f16.ctypes.data_as(ctypes.c_void_p), o_flat.ctypes.data_as(ctypes.c_void_p),
+                M_q, M_kv, H, D, ctypes.c_float(scale))
+            if not ok: return orig_comp(q, k, v, transformer_options)
+            o_t = torch.tensor(o_flat.view(np.float16), device=q.device)
+            return orig.output_dropout(orig.output_proj(o_t.reshape(B, S_q, H, D).reshape(B, S_q, H*D).to(q.dtype)))
+        return vk_compute_attention
+    blk.cross_attn.compute_attention = _make_vk_cross()
 
 # Scheduler
 def time_snr_shift(a, t): return a * t / (1.0 + (a - 1.0) * t)
