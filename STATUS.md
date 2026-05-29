@@ -33,11 +33,11 @@
 - Attention 是 skip 模式（V→O），非真正 QK^T+softmax
 - RoPE 未集成到 block recording
 
-## 当前状态 (2026-05-29 深夜): 自注意力 GPU 化完成，跨注意力 shader debug 中
+## 当前状态 (2026-05-29 最终): 自注意力 GPU 化完成，跨注意力已诊断待修复
 
-**管线速度**: 68s/步 (息屏，亮屏应该 ~60s)
+**管线速度**: 68s/步 (息屏，亮屏 ~60s)
 
-### 已注入的 GPU 模块（全部管线验证通过，87KB PNG）
+### 已注入的 GPU 模块（全部管线验证通过）
 
 | 模块 | 引擎 | 每步调用 | 精度 | 注入方式 |
 |------|------|---------|------|---------|
@@ -49,22 +49,32 @@
 | **Self-attention** | libdit_vk.so 3-pass | 28 | — | monkey-patch compute_attn |
 | **t_embedder** | libdit_vk.so C++ CPU | 1 | max_err 6e-5 | dit_compute_timestep |
 
-### 描述符池体系（2026-05-29 debug 最终方案）
+### 描述符池体系（最终方案）
 
 | 池 | 用途 | 手动 free | 步间 reset | 容量 |
 |---|------|----------|-----------|------|
 | **descPool** | init 时 AdaLN 预录（仅一次） | 否 | 永不 | maxSets=6000 |
 | **stepPool** | 运行时 LN/RMS/GELU/AdaLN/attn 录制 | 否 | 每步 vkResetDescriptorPool | maxSets=3000 |
 
-AdaLN 录制时 `dit_adaln_one_block` 临时 swap `g_vk.descPool → g_vk.stepPool`，录完换回。
+AdaLN 重录时 `dit_adaln_one_block` 临时 swap `g_vk.descPool → g_vk.stepPool`，录完换回。
 
-### 待解决
+### Cross-attention 诊断 (2026-05-29)
 
-| 模块 | 状态 | 说明 |
-|------|------|------|
-| **Cross-attention** | VK_ERROR_DEVICE_LOST | 自注意力 M_kv=512 正常；跨注意力 M_kv=1024 第一次调用即 GPU 崩溃。shader OOB 嫌疑，需独立测试 |
-| **RoPE** | 仍在 PyTorch CPU | 56 次调用 ~3s |
-| **final_layer** | 仍在 PyTorch CPU | 1 次，可忽略 |
+| 发现 | 详情 |
+|------|------|
+| QK^T per-pass | max_err 0.004，单独提交OK |
+| WG 上限 | batch_q=64 (1024 WG) OK，≥68 (1088 WG) FAIL |
+| 单次 8192 WG | 提交成功，但后续 step AdaLN submit VK_ERROR_DEVICE_LOST |
+| 结论 | 单 call OK，跨步 GPU 状态污染（buffer overlap 嫌疑，未定位） |
+| 当前状态 | **CPU fallback**，pending further debug |
+
+### 剩余 PyTorch CPU 项
+
+| 模块 | 原因 |
+|------|------|
+| **Cross-attention** | Vulkan 跨步 GPU 状态污染，暂 CPU |
+| **RoPE** | 56 次 ~3s，仍在 compute_qkv 内 |
+| **final_layer** | 1 次，可忽略 |
 
 ### 已验证通过的链路 (PyTorch reference 对比)
 

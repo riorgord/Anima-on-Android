@@ -898,28 +898,36 @@ Anima model card's recommended sampler. Our implementation produces incorrect re
 
 **架构**: `dit_run_layernorm(in, out, M, D, eps)` — 每次调用现场录制 1 dispatch，用独立 cmd buffer（g_lnCmdBuf），不覆盖 AdaLN 预录缓冲区。
 
-### 速度分析 (2026-05-29 晚间)
+### 速度分析 (2026-05-29 最终)
 
 | 组件 | 每步耗时 | 加速状态 | 可节省 |
 |------|---------|---------|--------|
 | **GEMM** (281 次) | ~25s | ✅ HybridLinear | — |
 | **Self-attention** (28 blocks) | ~8s | ✅ 3-pass Vulkan | — |
-| **Cross-attention** (28 blocks) | ~7s | ❌ PyTorch CPU | **-7s** |
+| **Cross-attention** (28 blocks) | ~7s | ❌ CPU (Vulkan PD state corrupt) | **-7s** |
 | **LayerNorm** (85 次) | <1s | ✅ libdit_vk.so FP32 | — |
 | **RMSNorm** (84 次) | <1s | ✅ libdit_vk.so FP16 | — |
 | **GELU** (28 次) | <1s | ✅ libdit_vk.so FP16 | — |
-| **AdaLN** (28 blocks) | <1s | ✅ pre-recorded | — |
+| **AdaLN** (28 blocks) | <1s | ✅ pre-recorded + pool swap | — |
 | **t_embedder** | <1s | ✅ C++ CPU | — |
-| **RoPE** (56 次) | ~3s | ❌ PyTorch CPU | — |
+| **RoPE** (56 次) | ~3s | ❌ CPU | **-3s** |
 | Python/Vulkan 两实例竞争 | ~15s | — | 合并实例可省 |
-| **总计** | **~67s** | | **理论可省 ~10s → 57s/步** |
+| **总计** | **~68s** | | **理论可省 ~10s → 58s/步，单实例后 ~15s/步** |
+
+### Cross-attention Vulkan 诊断结果
+
+- QK^T per-pass: max_err 0.004 ✅
+- WG 上限: batch_q=64 (1024 WG) OK, ≥68 (1088 WG) Device Lost
+- 单次 8192 WG 提交: 成功, 但后续 step AdaLN submit VK_ERROR_DEVICE_LOST
+- 根因: 跨步 GPU 状态污染（buffer overlap 嫌疑, 未定位）
+- 暂 CPU fallback
 
 ### 下步路线
 
-1. **Debug cross-attention shader OOB** — M_kv=1024 时 VK_ERROR_DEVICE_LOST，独立测试定位越界
+1. **修跨注意力** — WG 上限 1024 已定位，方向：减单 dispatch WG 数 / 拆分 M_kv+多 pass
 2. **RoPE** — 56 次调用，省 ~3s/步
-3. **Attention 入 block 预录制** — 和 AdaLN 同架构，消灭 56×3=168 submit，省 ~5s
-4. **GEMM 入 libdit_vk.so** — 单实例，消灭两实例竞争，省 ~10s。最终 ~15s/步
+3. **Attention 入 block 预录制** — 和 AdaLN 同架构，消灭 submit 开销
+4. **GEMM 入 libdit_vk.so** — 单实例，最终 ~15s/步
 
 **参考来源**: 本地 clone 的 ExecuTorch 仓库 `D:\AI\手坤的anima\参考\sdpa找不到了，只能克隆了\executorch\`，重点参考其 Vulkan backend 的 GLSL shader 实现。官方用模板系统（`${}` 宏）生成 shader，我们直接读展开后的逻辑。与自研 shader 的逐模块对比结论：
 

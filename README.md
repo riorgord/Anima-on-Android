@@ -15,7 +15,7 @@
 python -B /sdcard/anima_on_android/scripts/phone_pipeline.py
 ```
 
-输出：256×256 PNG，约 68s/步（HybridOps GEMM + GPU AdaLN/LN/RMS/GELU/self-attn；息屏），3 步共约 3.5 分钟。
+输出：256×256 PNG，约 68s/步（HybridOps GEMM + GPU AdaLN/LN/RMS/GELU/self-attn；cross-attn CPU fallback），3 步共约 3.5 分钟。
 
 ## 管线
 
