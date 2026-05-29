@@ -74,6 +74,7 @@ struct VulkanCtx {
     VkCommandBuffer cmd[28] = {};
     VkFence fence = VK_NULL_HANDLE;
     VkDescriptorPool descPool = VK_NULL_HANDLE;
+    VkDescriptorPool stepPool = VK_NULL_HANDLE;  // per-step pool, reset between steps
     VkPhysicalDeviceMemoryProperties memProps = {};
 
     ShaderPipe gemm, rms_norm, layer_norm, silu, scale_shift, rope, attention, broadcast, gelu;
@@ -251,10 +252,10 @@ static bool create_all_pipelines(VulkanCtx& ctx, const char* spv_dir) {
 static bool create_descriptor_pool(VulkanCtx& ctx) {
     VkDescriptorPoolSize poolSize = {};
     poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSize.descriptorCount = 12000;  // 28 blocks × 53 dispatches × ~4 bindings
+    poolSize.descriptorCount = 24000;  // 28 blocks × 53 dispatches × ~4 bindings
     VkDescriptorPoolCreateInfo poolInfo = {};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolInfo.maxSets = 3000;
+    poolInfo.maxSets = 6000;
     poolInfo.poolSizeCount = 1;
     poolInfo.pPoolSizes = &poolSize;
     if (vkCreateDescriptorPool(ctx.device, &poolInfo, nullptr, &ctx.descPool) != VK_SUCCESS) return false;
@@ -712,6 +713,19 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
     if (!init_vulkan(g_vk)) { LOGE("Vulkan init failed"); return false; }
     if (!create_adaln_pipelines(g_vk, spv_dir)) { LOGE("Pipeline creation failed"); return false; }
     if (!create_descriptor_pool(g_vk)) { LOGE("Descriptor pool failed"); return false; }
+
+    // Second pool for per-step ops — reset each step to avoid fragmentation
+    {
+        VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 12000};
+        VkDescriptorPoolCreateInfo dp = {};
+        dp.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        dp.maxSets = 3000;
+        dp.poolSizeCount = 1;
+        dp.pPoolSizes = &ps;
+        if (vkCreateDescriptorPool(g_vk.device, &dp, nullptr, &g_vk.stepPool) != VK_SUCCESS) {
+            LOGE("Step pool failed"); return false;
+        }
+    }
 
     if (weight_path && weight_path[0]) {
         if (!load_adaln_weights(g_vk, weight_path, g_weights)) {
@@ -1501,12 +1515,20 @@ bool dit_record_all_adaln_blocks(void) {
     return true;
 }
 
+bool dit_reset_step_pool(void) {
+    // Reset per-step descriptor pool (stepPool). descPool (AdaLN) is untouched.
+    if (!g_init) return false;
+    vkResetDescriptorPool(g_vk.device, g_vk.stepPool, 0);
+    return true;
+}
+
 bool dit_adaln_one_block(int blockIdx, void* out_9MD) {
     // Submit pre-recorded cmd[blockIdx], wait, read bcBuf back.
     // tEmbBuf + g_loraBuf must already be uploaded before calling.
     // Output [9, M, D] fp16 — reordered to [shift, scale, gate] per channel.
     // Scale values have +1 undone (adaln_gpu adds 1 for broadcast; Block.forward adds it back).
-    if (!g_init || blockIdx < 0 || blockIdx >= 28) return false;
+    if (!g_init) { LOGE("adaln_one_block: not initialized"); return false; }
+    if (blockIdx < 0 || blockIdx >= 28) { LOGE("adaln_one_block: bad idx %d", blockIdx); return false; }
 
     vkResetFences(g_vk.device, 1, &g_vk.fence);
     VkSubmitInfo submit = {};
@@ -1587,7 +1609,7 @@ bool dit_run_layernorm(void* in_fp32, void* out_fp32, int _M, int _D, float eps)
     // Allocate descriptor set for LN
     VkDescriptorSetAllocateInfo dsInfo = {};
     dsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dsInfo.descriptorPool = g_vk.descPool;
+    dsInfo.descriptorPool = g_vk.stepPool;
     dsInfo.descriptorSetCount = 1;
     dsInfo.pSetLayouts = &g_vk.layer_norm.dsl;
     VkDescriptorSet ds;
@@ -1652,7 +1674,7 @@ bool dit_run_layernorm(void* in_fp32, void* out_fp32, int _M, int _D, float eps)
     memcpy(out_fp32, g_lnOutBuf.mapped, dataBytes);
 
     // Free descriptor set
-    vkFreeDescriptorSets(g_vk.device, g_vk.descPool, 1, &ds);
+    // descPool reset between steps — no per-call free
 
     return true;
 }
@@ -1677,7 +1699,7 @@ bool dit_run_attention(void* Q_fp16, void* K_fp16, void* V_fp16, void* O_fp16,
     // ── Pass 1: QK^T ──
     VkDescriptorSetAllocateInfo dsa = {};
     dsa.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dsa.descriptorPool = g_vk.descPool;
+    dsa.descriptorPool = g_vk.stepPool;
     dsa.descriptorSetCount = 1;
 
     VkDescriptorSet ds1;
@@ -1759,9 +1781,7 @@ bool dit_run_attention(void* Q_fp16, void* K_fp16, void* V_fp16, void* O_fp16,
     vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
 
     memcpy(O_fp16, g_attnO.mapped, qBytes);
-    vkFreeDescriptorSets(g_vk.device, g_vk.descPool, 1, &ds1);
-    vkFreeDescriptorSets(g_vk.device, g_vk.descPool, 1, &ds2);
-    vkFreeDescriptorSets(g_vk.device, g_vk.descPool, 1, &ds3);
+    // stepPool reset between steps — no per-call free
     return true;
 }
 
@@ -1777,7 +1797,7 @@ bool dit_run_gelu(void* in_fp16, void* out_fp16, int _N) {
 
     VkDescriptorSetAllocateInfo dsInfo = {};
     dsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dsInfo.descriptorPool = g_vk.descPool;
+    dsInfo.descriptorPool = g_vk.stepPool;
     dsInfo.descriptorSetCount = 1;
     dsInfo.pSetLayouts = &g_vk.gelu.dsl;
     VkDescriptorSet ds;
@@ -1816,7 +1836,7 @@ bool dit_run_gelu(void* in_fp16, void* out_fp16, int _N) {
     vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
 
     memcpy(out_fp16, g_geluOutBuf.mapped, bytes);
-    vkFreeDescriptorSets(g_vk.device, g_vk.descPool, 1, &ds);
+    // descPool reset between steps — no per-call free
     return true;
 }
 
@@ -1839,7 +1859,7 @@ bool dit_run_rmsnorm(void* in_fp16, void* weight_fp16, int wlen, void* out_fp16,
 
     VkDescriptorSetAllocateInfo dsInfo = {};
     dsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dsInfo.descriptorPool = g_vk.descPool;
+    dsInfo.descriptorPool = g_vk.stepPool;
     dsInfo.descriptorSetCount = 1;
     dsInfo.pSetLayouts = &g_vk.rms_norm.dsl;
     VkDescriptorSet ds;
@@ -1877,7 +1897,7 @@ bool dit_run_rmsnorm(void* in_fp16, void* weight_fp16, int wlen, void* out_fp16,
     vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
 
     memcpy(out_fp16, g_rmsOutBuf.mapped, inBytes);
-    vkFreeDescriptorSets(g_vk.device, g_vk.descPool, 1, &ds);
+    // descPool reset between steps — no per-call free
     return true;
 }
 
@@ -1898,6 +1918,7 @@ void dit_destroy() {
     free_sp(g_vk.attention); free_sp(g_vk.broadcast); free_sp(g_vk.gelu);
     free_sp(g_vk.attn_qkt); free_sp(g_vk.attn_softmax); free_sp(g_vk.attn_out);
 
+    if (g_vk.stepPool) vkDestroyDescriptorPool(g_vk.device, g_vk.stepPool, nullptr);
     if (g_vk.descPool) vkDestroyDescriptorPool(g_vk.device, g_vk.descPool, nullptr);
     if (g_lnCmdBuf) vkFreeCommandBuffers(g_vk.device, g_vk.cmdPool, 1, &g_lnCmdBuf);
     if (g_vk.cmd[0]) vkFreeCommandBuffers(g_vk.device, g_vk.cmdPool, 28, g_vk.cmd);

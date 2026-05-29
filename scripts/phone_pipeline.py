@@ -25,6 +25,8 @@ _lib_vk.dit_write_buf.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t
 _lib_vk.dit_write_buf.restype = ctypes.c_bool
 _lib_vk.dit_compute_timestep.argtypes = [ctypes.c_float]
 _lib_vk.dit_compute_timestep.restype = ctypes.c_bool
+_lib_vk.dit_reset_step_pool.argtypes = []
+_lib_vk.dit_reset_step_pool.restype = ctypes.c_bool
 _lib_vk.dit_adaln_one_block.argtypes = [ctypes.c_int, ctypes.c_void_p]
 _lib_vk.dit_adaln_one_block.restype = ctypes.c_bool
 _lib_vk.dit_destroy.argtypes = []
@@ -97,6 +99,7 @@ for blk in dit.blocks:
             return orig.output_dropout(orig.output_proj(o_t.to(q.dtype)))
         return vk_compute_attention
     blk.self_attn.compute_attention = _make_vk_attn()
+    # Cross-attention: stay on PyTorch for now (debugging descriptor pool issue)
 
 # Scheduler
 def time_snr_shift(a, t): return a * t / (1.0 + (a - 1.0) * t)
@@ -153,6 +156,9 @@ for i in range(STEPS):
     # Restore blocks for next step
     for blk in dit.blocks:
         blk.use_adaln_lora = True
+
+    # Reset descriptor pool (re-records AdaLN blocks for next step)
+    _lib_vk.dit_reset_step_pool()
 
     v_cond = v_b[0:1].float()
     v_uncond = v_b[1:2].float()
