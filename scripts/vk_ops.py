@@ -104,6 +104,8 @@ try:
     _lib_dit.dit_run_layernorm.restype = _ct.c_bool
     _lib_dit.dit_run_rmsnorm.argtypes = [_ct.c_void_p, _ct.c_void_p, _ct.c_int, _ct.c_void_p, _ct.c_int, _ct.c_int, _ct.c_float]
     _lib_dit.dit_run_rmsnorm.restype = _ct.c_bool
+    _lib_dit.dit_run_gelu.argtypes = [_ct.c_void_p, _ct.c_void_p, _ct.c_int]
+    _lib_dit.dit_run_gelu.restype = _ct.c_bool
     _VK_LN_AVAILABLE = True
 except Exception:
     _VK_LN_AVAILABLE = False
@@ -175,6 +177,39 @@ class HybridRMSNorm(nn.RMSNorm):
             ref = F.rms_norm(x.float(), self.normalized_shape, self.weight.float(), self.eps)
             err = (result.float() - ref.float()).abs().max().item()
             print(f"  VkRMS#{cls._count} M={M} D={D} max_err={err:.6f}")
+            cls._count += 1
+
+        return result
+
+
+class HybridGELU(nn.GELU):
+    """nn.GELU with Vulkan acceleration via libdit_vk.so (FP16 I/O)."""
+    _count = 0
+
+    def forward(self, x):
+        if not _VK_LN_AVAILABLE:
+            return F.gelu(x)
+
+        *batch, D = x.shape
+        N = int(np.prod(batch)) * D if batch else D
+        x_f16 = x.reshape(-1).cpu().contiguous().to(torch.float16).numpy().view(np.uint16)
+        out_buf = np.zeros(N, dtype=np.uint16)
+
+        ok = _lib_dit.dit_run_gelu(
+            x_f16.ctypes.data_as(_ct.c_void_p),
+            out_buf.ctypes.data_as(_ct.c_void_p),
+            N)
+        if not ok:
+            return F.gelu(x)
+
+        result = torch.tensor(out_buf.view(np.float16), device=x.device, dtype=x.dtype)
+        result = result.reshape(*batch, D) if batch else result.view(D)
+
+        cls = type(self)
+        if cls._count < 3:
+            ref = F.gelu(x.float())
+            err = (result.float() - ref.float()).abs().max().item()
+            print(f"  VkGELU#{cls._count} N={N} max_err={err:.6f}")
             cls._count += 1
 
         return result

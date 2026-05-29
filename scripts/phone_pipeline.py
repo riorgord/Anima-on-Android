@@ -69,6 +69,9 @@ if not ok:
 
 M, D = 2, 2048  # batch=2 (cond+uncond), hidden=2048
 
+# Replace MLP GELU with Vulkan version
+for blk in dit.blocks:
+    blk.mlp.activation = vk_ops.HybridGELU()
 
 # Scheduler
 def time_snr_shift(a, t): return a * t / (1.0 + (a - 1.0) * t)

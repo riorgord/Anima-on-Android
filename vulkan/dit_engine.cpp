@@ -73,7 +73,7 @@ struct VulkanCtx {
     VkDescriptorPool descPool = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties memProps = {};
 
-    ShaderPipe gemm, rms_norm, layer_norm, silu, scale_shift, rope, attention, broadcast;
+    ShaderPipe gemm, rms_norm, layer_norm, silu, scale_shift, rope, attention, broadcast, gelu;
 };
 
 struct WeightInfo {
@@ -398,8 +398,9 @@ static bool create_adaln_pipelines(VulkanCtx& ctx, const char* spv_dir) {
     CP(broadcast, 2, sizeof(PC_Broadcast));
     CP(layer_norm, 2, sizeof(PC_LayerNorm));
     CP(rms_norm, 3, sizeof(PC_RmsNorm));
+    CP(gelu, 2, sizeof(PC_Silu));
     #undef CP
-    LOGI("AdaLN pipelines created (gemm, silu, scale_shift, broadcast, layer_norm, rms_norm)");
+    LOGI("AdaLN pipelines created (gemm, silu, scale_shift, broadcast, layer_norm, rms_norm, gelu)");
     return true;
 }
 
@@ -412,6 +413,8 @@ static Buffer g_lnOutBuf;  // FP32 LayerNorm output
 static Buffer g_rmsInBuf;   // FP16 RMSNorm input (max M=16384,D=128 → 4.2MB)
 static Buffer g_rmsOutBuf;  // FP16 RMSNorm output
 static Buffer g_rmsWgtBuf;  // FP16 RMSNorm weight (max D=2048)
+static Buffer g_geluInBuf;  // FP16 GELU input (M=512,D=8192 → 8.4MB)
+static Buffer g_geluOutBuf; // FP16 GELU output
 
 struct RC {
     VulkanCtx* vk;
@@ -734,6 +737,11 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
 
     // FP16 RMSNorm weight buffer (max D=2048 → 4KB)
     if (!create_buffer(g_vk, D * 2, u, g_rmsWgtBuf)) return false;
+
+    // FP16 GELU I/O buffers (M=512, MLP_HIDDEN=8192 → 8.4MB each)
+    size_t geluSz = MS * MLP_HIDDEN * 2;
+    if (!create_buffer(g_vk, geluSz, u, g_geluInBuf)) return false;
+    if (!create_buffer(g_vk, geluSz, u, g_geluOutBuf)) return false;
 
     if (!create_buffer(g_vk, 4096, u, g_onesBuf)) return false;
     uint16_t* ones = (uint16_t*)g_onesBuf.mapped;
@@ -1632,6 +1640,61 @@ bool dit_run_layernorm(void* in_fp32, void* out_fp32, int _M, int _D, float eps)
     return true;
 }
 
+bool dit_run_gelu(void* in_fp16, void* out_fp16, int _N) {
+    if (!g_init) return false;
+    uint32_t N = (uint32_t)_N;
+    size_t bytes = N * 2;
+    memcpy(g_geluInBuf.mapped, in_fp16, bytes);
+
+    VkCommandBufferBeginInfo bi = {};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(g_lnCmdBuf, &bi) != VK_SUCCESS) return false;
+
+    VkDescriptorSetAllocateInfo dsInfo = {};
+    dsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsInfo.descriptorPool = g_vk.descPool;
+    dsInfo.descriptorSetCount = 1;
+    dsInfo.pSetLayouts = &g_vk.gelu.dsl;
+    VkDescriptorSet ds;
+    if (vkAllocateDescriptorSets(g_vk.device, &dsInfo, &ds) != VK_SUCCESS) return false;
+
+    VkDescriptorBufferInfo bIn  = { g_geluInBuf.buf, 0, bytes };
+    VkDescriptorBufferInfo bOut = { g_geluOutBuf.buf, 0, bytes };
+    VkWriteDescriptorSet w[2] = {};
+    w[0].sType = w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[0].dstSet = w[1].dstSet = ds;
+    w[0].dstBinding = 0; w[1].dstBinding = 1;
+    w[0].descriptorCount = w[1].descriptorCount = 1;
+    w[0].descriptorType = w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    w[0].pBufferInfo = &bIn; w[1].pBufferInfo = &bOut;
+    vkUpdateDescriptorSets(g_vk.device, 2, w, 0, nullptr);
+
+    vkCmdBindPipeline(g_lnCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk.gelu.pipeline);
+    vkCmdBindDescriptorSets(g_lnCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk.gelu.layout, 0, 1, &ds, 0, nullptr);
+    PC_Silu pc = { N };
+    vkCmdPushConstants(g_lnCmdBuf, g_vk.gelu.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(g_lnCmdBuf, (N + 255) / 256, 1, 1);
+
+    VkMemoryBarrier mb = {};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(g_lnCmdBuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    if (vkEndCommandBuffer(g_lnCmdBuf) != VK_SUCCESS) return false;
+
+    vkResetFences(g_vk.device, 1, &g_vk.fence);
+    VkSubmitInfo submit = {};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &g_lnCmdBuf;
+    if (vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.fence) != VK_SUCCESS) return false;
+    vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+
+    memcpy(out_fp16, g_geluOutBuf.mapped, bytes);
+    vkFreeDescriptorSets(g_vk.device, g_vk.descPool, 1, &ds);
+    return true;
+}
+
 bool dit_run_rmsnorm(void* in_fp16, void* weight_fp16, int wlen, void* out_fp16, int _M, int _D, float eps) {
     // Single RMSNorm dispatch: FP16 I/O + weight. Uses g_lnCmdBuf (shared w/ LN, sequential).
     if (!g_init) return false;
@@ -1707,7 +1770,7 @@ void dit_destroy() {
     };
     free_sp(g_vk.gemm); free_sp(g_vk.rms_norm); free_sp(g_vk.layer_norm);
     free_sp(g_vk.silu); free_sp(g_vk.scale_shift); free_sp(g_vk.rope);
-    free_sp(g_vk.attention); free_sp(g_vk.broadcast);
+    free_sp(g_vk.attention); free_sp(g_vk.broadcast); free_sp(g_vk.gelu);
 
     if (g_vk.descPool) vkDestroyDescriptorPool(g_vk.device, g_vk.descPool, nullptr);
     if (g_lnCmdBuf) vkFreeCommandBuffers(g_vk.device, g_vk.cmdPool, 1, &g_lnCmdBuf);
@@ -1725,6 +1788,7 @@ void dit_destroy() {
     free_buf(g_nBuf); free_buf(g_gBuf); free_buf(g_bcBuf);
     free_buf(g_onesBuf); free_buf(g_loraBuf);
     free_buf(g_lnInBuf); free_buf(g_lnOutBuf);
+    free_buf(g_geluInBuf); free_buf(g_geluOutBuf);
     free_buf(g_rmsInBuf); free_buf(g_rmsOutBuf); free_buf(g_rmsWgtBuf);
 
     if (g_vk.device) vkDestroyDevice(g_vk.device, nullptr);
