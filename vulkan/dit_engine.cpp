@@ -396,8 +396,9 @@ static bool create_adaln_pipelines(VulkanCtx& ctx, const char* spv_dir) {
     CP(silu, 2, sizeof(PC_Silu));
     CP(scale_shift, 4, sizeof(PC_ScaleShift));
     CP(broadcast, 2, sizeof(PC_Broadcast));
+    CP(layer_norm, 2, sizeof(PC_LayerNorm));
     #undef CP
-    LOGI("AdaLN pipelines created (gemm, silu, scale_shift, broadcast)");
+    LOGI("AdaLN pipelines created (gemm, silu, scale_shift, broadcast, layer_norm)");
     return true;
 }
 
@@ -405,6 +406,8 @@ static bool create_adaln_pipelines(VulkanCtx& ctx, const char* spv_dir) {
 // Forward declaration for adaln_gpu access
 static Buffer g_loraBuf;
 static Buffer g_onesBuf;
+static Buffer g_lnInBuf;   // FP32 LayerNorm input
+static Buffer g_lnOutBuf;  // FP32 LayerNorm output
 
 struct RC {
     VulkanCtx* vk;
@@ -617,6 +620,7 @@ struct RC {
 // Global state
 // ============================================================
 static VulkanCtx g_vk;
+static VkCommandBuffer g_lnCmdBuf = VK_NULL_HANDLE;  // dedicated LN cmd buf (not in g_vk.cmd[])
 static Buffer g_xBuf, g_tEmbBuf, g_ctxBuf, g_outBuf;
 static Buffer g_t1, g_tQ, g_tK, g_tV, g_tO, g_rBuf, g_aBuf, g_nBuf, g_gBuf, g_bcBuf;
 static std::unordered_map<std::string, WeightInfo> g_weights;
@@ -714,6 +718,10 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
 
     if (!create_buffer(g_vk, 3 * M * D * 2, u, g_loraBuf)) return false;
 
+    // FP32 LayerNorm I/O buffers (M_max=MS=512, D=2048 → 4MB each)
+    if (!create_buffer(g_vk, MS * D * 4, u, g_lnInBuf)) return false;
+    if (!create_buffer(g_vk, MS * D * 4, u, g_lnOutBuf)) return false;
+
     if (!create_buffer(g_vk, 4096, u, g_onesBuf)) return false;
     uint16_t* ones = (uint16_t*)g_onesBuf.mapped;
     for (int i = 0; i < 2048; i++) ones[i] = 0x3C00;
@@ -723,7 +731,17 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
     if (!create_buffer(g_vk, bSz, u, g_outBuf)) return false;
     if (!create_buffer(g_vk, M * Nctx * CtxD * 2, u, g_ctxBuf)) return false;
 
-    LOGI("dit_init_adaln_only OK — %u buffers", 12);
+    // Allocate dedicated LN command buffer (avoid overwriting AdaLN cmd[i])
+    VkCommandBufferAllocateInfo lnCbInfo = {};
+    lnCbInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    lnCbInfo.commandPool = g_vk.cmdPool;
+    lnCbInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    lnCbInfo.commandBufferCount = 1;
+    if (vkAllocateCommandBuffers(g_vk.device, &lnCbInfo, &g_lnCmdBuf) != VK_SUCCESS) {
+        LOGE("LN cmd buffer alloc failed"); return false;
+    }
+
+    LOGI("dit_init_adaln_only OK — %u buffers", 14);
 
     // Pre-record all 28 AdaLN blocks (avoids per-step recording / pool exhaustion)
     if (!dit_record_all_adaln_blocks()) {
@@ -1511,6 +1529,96 @@ bool dit_adaln_one_block(int blockIdx, void* out_9MD) {
     return true;
 }
 
+bool dit_run_layernorm(void* in_fp32, void* out_fp32, int _M, int _D, float eps) {
+    // Single LayerNorm dispatch: upload FP32 input, run shader, download FP32 output.
+    // Uses cmd[0] — one-shot recording, submit, wait, read back.
+    if (!g_init) return false;
+
+    uint32_t Mv = (uint32_t)_M;
+    uint32_t Dv = (uint32_t)_D;
+    size_t dataBytes = Mv * Dv * 4;  // float32 = 4 bytes
+
+    // Upload input to g_lnInBuf
+    memcpy(g_lnInBuf.mapped, in_fp32, dataBytes);
+
+    // Record into dedicated LN command buffer (don't overwrite AdaLN pre-recorded cmds)
+    VkCommandBufferBeginInfo bi = {};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(g_lnCmdBuf, &bi) != VK_SUCCESS) return false;
+
+    // Allocate descriptor set for LN
+    VkDescriptorSetAllocateInfo dsInfo = {};
+    dsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsInfo.descriptorPool = g_vk.descPool;
+    dsInfo.descriptorSetCount = 1;
+    dsInfo.pSetLayouts = &g_vk.layer_norm.dsl;
+    VkDescriptorSet ds;
+    if (vkAllocateDescriptorSets(g_vk.device, &dsInfo, &ds) != VK_SUCCESS) {
+        LOGE("LN: descriptor set alloc failed");
+        return false;
+    }
+
+    // Bind input buffer
+    VkDescriptorBufferInfo inInfo = { g_lnInBuf.buf, 0, dataBytes };
+    VkWriteDescriptorSet wIn = {};
+    wIn.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    wIn.dstSet = ds;
+    wIn.dstBinding = 0;
+    wIn.descriptorCount = 1;
+    wIn.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    wIn.pBufferInfo = &inInfo;
+
+    // Bind output buffer
+    VkDescriptorBufferInfo outInfo = { g_lnOutBuf.buf, 0, dataBytes };
+    VkWriteDescriptorSet wOut = {};
+    wOut.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    wOut.dstSet = ds;
+    wOut.dstBinding = 1;
+    wOut.descriptorCount = 1;
+    wOut.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    wOut.pBufferInfo = &outInfo;
+
+    VkWriteDescriptorSet writes[] = { wIn, wOut };
+    vkUpdateDescriptorSets(g_vk.device, 2, writes, 0, nullptr);
+
+    // Record dispatch
+    vkCmdBindPipeline(g_lnCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk.layer_norm.pipeline);
+    vkCmdBindDescriptorSets(g_lnCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+        g_vk.layer_norm.layout, 0, 1, &ds, 0, nullptr);
+
+    PC_LayerNorm pc = { Mv, Dv, eps };
+    vkCmdPushConstants(g_lnCmdBuf, g_vk.layer_norm.layout,
+        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(g_lnCmdBuf, Mv, 1, 1);
+
+    // Barrier: shader write → host read
+    VkMemoryBarrier mb = {};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(g_lnCmdBuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+
+    if (vkEndCommandBuffer(g_lnCmdBuf) != VK_SUCCESS) return false;
+
+    // Submit and wait
+    vkResetFences(g_vk.device, 1, &g_vk.fence);
+    VkSubmitInfo submit = {};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &g_lnCmdBuf;
+    if (vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.fence) != VK_SUCCESS) return false;
+    vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+
+    // Download result
+    memcpy(out_fp32, g_lnOutBuf.mapped, dataBytes);
+
+    // Free descriptor set
+    vkFreeDescriptorSets(g_vk.device, g_vk.descPool, 1, &ds);
+
+    return true;
+}
+
 void dit_destroy() {
     auto free_buf = [&](Buffer& b) {
         if (b.mapped) vkUnmapMemory(g_vk.device, b.mem);
@@ -1528,6 +1636,7 @@ void dit_destroy() {
     free_sp(g_vk.attention); free_sp(g_vk.broadcast);
 
     if (g_vk.descPool) vkDestroyDescriptorPool(g_vk.device, g_vk.descPool, nullptr);
+    if (g_lnCmdBuf) vkFreeCommandBuffers(g_vk.device, g_vk.cmdPool, 1, &g_lnCmdBuf);
     if (g_vk.cmd[0]) vkFreeCommandBuffers(g_vk.device, g_vk.cmdPool, 28, g_vk.cmd);
     if (g_vk.cmdPool) vkDestroyCommandPool(g_vk.device, g_vk.cmdPool, nullptr);
     if (g_vk.fence) vkDestroyFence(g_vk.device, g_vk.fence, nullptr);
@@ -1541,6 +1650,7 @@ void dit_destroy() {
     free_buf(g_tV); free_buf(g_tO); free_buf(g_rBuf); free_buf(g_aBuf);
     free_buf(g_nBuf); free_buf(g_gBuf); free_buf(g_bcBuf);
     free_buf(g_onesBuf); free_buf(g_loraBuf);
+    free_buf(g_lnInBuf); free_buf(g_lnOutBuf);
 
     if (g_vk.device) vkDestroyDevice(g_vk.device, nullptr);
     if (g_vk.instance) vkDestroyInstance(g_vk.instance, nullptr);

@@ -97,64 +97,41 @@ class HybridLinear(nn.Linear):
         return out
 
 
+# ── libdit_vk.so LayerNorm wrapper ──
+try:
+    _lib_dit = _ct.CDLL("/data/local/tmp/libdit_vk.so")
+    _lib_dit.dit_run_layernorm.argtypes = [_ct.c_void_p, _ct.c_void_p, _ct.c_int, _ct.c_int, _ct.c_float]
+    _lib_dit.dit_run_layernorm.restype = _ct.c_bool
+    _VK_LN_AVAILABLE = True
+except Exception:
+    _VK_LN_AVAILABLE = False
+
 class HybridLayerNorm(nn.LayerNorm):
-    """nn.LayerNorm with Vulkan acceleration (no affine)."""
-    _handle = None
-    _out_buf = None
-    _out_shape = None
-
-    @classmethod
-    def _ensure_init(cls):
-        if cls._handle is not None:
-            return
-        if not _VK_HYBRID_AVAILABLE:
-            return
-        ok = _lib_hy.vk_hybrid_init()
-        if not ok:
-            return
-        h = _lib_hy.vk_hybrid_load(b"/data/local/tmp/layernorm_fp16.spv", 2, 12)
-        if h < 0:
-            return
-        cls._handle = h
-
+    """nn.LayerNorm with Vulkan acceleration via libdit_vk.so (FP32 I/O)."""
     _count = 0
 
     def forward(self, x):
-        self._ensure_init()
         # Fallback: no Vulkan, or has affine params (not supported by shader)
-        if self._handle is None or self.elementwise_affine:
+        if not _VK_LN_AVAILABLE or self.elementwise_affine:
             return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
 
         *batch, D = x.shape
         M = int(np.prod(batch)) if batch else 1
-        n_elems = D
 
-        x_f16 = x.reshape(M, D).cpu().contiguous().to(torch.float16).numpy().view(np.uint16)
+        x_f32 = x.reshape(M, D).cpu().contiguous().float().numpy()
+        out_buf = np.zeros((M, D), dtype=np.float32)
 
-        # Pre-allocate output buffer if shape changed
-        out_bytes = M * D * 2
-        out_buf = np.zeros(M * D, dtype=np.uint16)
+        # Call libdit_vk.so LayerNorm (same Vulkan instance as AdaLN)
+        ok = _lib_dit.dit_run_layernorm(
+            x_f32.ctypes.data_as(_ct.c_void_p),
+            out_buf.ctypes.data_as(_ct.c_void_p),
+            M, D, _ct.c_float(self.eps))
+        if not ok:
+            return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
 
-        # Re-upload output buffer descriptor only when shape changes
-        if self._out_shape != (M * D):
-            _lib_hy.vk_hybrid_upload(self._handle, 1, out_buf.ctypes.data_as(_ct.c_void_p), out_bytes)
-            self._out_shape = M * D
-
-        # Upload input
-        _lib_hy.vk_hybrid_upload(self._handle, 0, x_f16.ctypes.data_as(_ct.c_void_p), out_bytes)
-
-        # Push constants: n_rows, n_elems, eps
-        push = struct.pack('<IIf', M, n_elems, float(self.eps))
-        _lib_hy.vk_hybrid_run(self._handle, M, 1, 1, push)
-
-        # Download result
-        _lib_hy.vk_hybrid_download(self._handle, 1, out_buf.ctypes.data_as(_ct.c_void_p), out_bytes)
-
-        result = torch.tensor(out_buf.view(np.float16), device=x.device)
+        result = torch.from_numpy(out_buf).to(device=x.device, dtype=x.dtype)
         result = result.reshape(*batch, D) if batch else result.squeeze(0)
-        result = result.to(x.dtype)
 
-        # Diagnostic: compare with F.layer_norm for first 5 calls
         cls = type(self)
         if cls._count < 5:
             ref = F.layer_norm(x.float(), self.normalized_shape, None, None, self.eps)
@@ -169,7 +146,7 @@ class HybridOps:
     """Operations class with Vulkan acceleration for large Linear layers."""
     Linear = HybridLinear
     RMSNorm = nn.RMSNorm
-    LayerNorm = nn.LayerNorm  # TODO: HybridLayerNorm精度问题, 85层累积成雪花
+    LayerNorm = HybridLayerNorm
     Embedding = nn.Embedding
 
 
