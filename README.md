@@ -139,7 +139,7 @@ output/       生成图片输出
 
 **C++ 引擎 `libdit_vk.so`**：28-block DiT forward **13.06s/步**（skip-attention 模式，vs CPU 120s, 9.2×）。含 GEMM + AdaLN + norms 预录，注意力暂走 Python monkey-patch。
 
-**已知 Adreno 730 限制**：TDR 250ms 看门狗 → 单 dispatch 不能过大；同一 cmd buffer 多 dispatch 可能并行执行导致 binding confusion（已用 per-block cmd buffer 规避）。
+**已知 Adreno 730 限制**：疑似 TDR 250ms 看门狗（单 dispatch 不宜过大）；同一 cmd buffer 多 dispatch 可并行导致 binding confusion（已用 per-block cmd buffer 规避）；大 WG+大 buffer+密集 barrier 组合可触发尚未完全定位的内部 rivalry。
 
 **待开发**：GEMM 入 block 预录制 → Attention 入 block → RoPE GPU → 单实例 28 submit/step
 

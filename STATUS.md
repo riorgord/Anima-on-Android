@@ -61,7 +61,7 @@ AdaLN 重录时 `dit_adaln_one_block` 临时 swap `g_vk.descPool → g_vk.stepPo
 
 ### Cross-attention 修复 (2026-05-30)
 
-**根因**: Adreno 730 有 250ms TDR (Timeout Detection & Recovery) 看门狗。单 dispatch 若 GPU 执行时间超过此阈值，驱动强制复位 → `VK_ERROR_DEVICE_LOST`。原 `dit_run_attention` 一次 dispatch `M_q*H = 512*16 = 8192 WG`，在息屏降频下 GPU 时间踩过 250ms 线。`maxComputeWorkGroupCount` 理论值 65535 没有实际意义。
+**根因（疑似）**: Adreno 730 可能存在 250ms TDR 看门狗（Qualcomm 文档提及）。单 dispatch 若 GPU 执行时间超过此阈值，驱动强制复位 → `VK_ERROR_DEVICE_LOST`。但我们的实测环境 GPU 底频 510MHz，全计算量理论上不应超时，且错误模式是 `max_err=0.28` 部分值错误而非全零/随机垃圾，更接近 GPU 内部资源冲突（L1 cache eviction 或 barrier 同步竞争）而非硬复位。确切根因待确认。
 
 **修复**: `dit_run_attention` 内部将 Q 维度拆分为 `batch_q = 64` 的批次（每批 `64*16 = 1024 WG`），逐批 submit+wait。每批 dispatch 在 TDR 窗口内完成。K/V 上传一次复用，Q 分批上传。
 
@@ -72,15 +72,15 @@ AdaLN 重录时 `dit_adaln_one_block` 临时 swap `g_vk.descPool → g_vk.stepPo
 | max_err (cross-attn) | 0.0013 |
 | 跨步稳定性 | ✅ 多次管线验证通过 |
 
-### Adreno 730 TDR 限制 & 驱动特性 (2026-05-30 发现)
+### Adreno 730 已知限制 & 疑似问题 (2026-05-30)
 
-| 发现 | 说明 |
-|------|------|
-| **TDR 250ms** | Qualcomm 文档 + 实测确认。单 dispatch GPU 时间 <250ms 安全，超过触发 DEVICE_LOST |
-| **WG 软上限** | `maxComputeWorkGroupCount=65535` 是理论值。实测 M_kv×WG数×barrier 密度 的综合负载有隐性边界 |
-| **并行 dispatch** | 同一 cmd buffer 内多个 dispatch 可并行执行，不同 binding 可能混淆 (Adreno 驱动 quirk) |
-| **barrier 开销** | 每行 3-pass softmax 产生 ~30 barrier/WG。大 WG 数 × 高 barrier 密度 可能触发驱动不稳定 |
-| **官方手册** | 500 系手册 74 页 (本地)。7XX 系需去 developer.qualcomm.com 匹配平台代号 |
+| 发现 | 说明 | 确定性 |
+|------|------|--------|
+| **TDR 250ms** | Qualcomm 文档提及看门狗阈值。单 dispatch 超时可能触发 DEVICE_LOST。但 510MHz 底频下计算量理论上不会超时 | ⚠️ 疑似 |
+| **WG 软上限** | `maxComputeWorkGroupCount=65535` 是理论值。实测大 M_kv+大 WG 数+密集 barrier 的组合触发不稳定 | ✅ 实测 |
+| **并行 dispatch binding confusion** | 同一 cmd buffer 内多 dispatch 可并行执行，不同 descriptor 可能混淆 | ✅ 已踩坑 |
+| **部分错误模式** | ROWS=8 时 max_err=0.28，非全零/随机，更像 cache eviction 或 barrier race 而非 TDR 硬复位 | ❓ 待确认 |
+| **官方手册** | 500 系手册 74 页 (本地)。7XX 系 docs.qualcomm.com 按平台代号查 | — |
 
 ### 剩余 PyTorch CPU 项
 

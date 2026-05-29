@@ -916,18 +916,19 @@ Anima model card's recommended sampler. Our implementation produces incorrect re
 
 ### Cross-attention 修复 (2026-05-30)
 
-**根因**: Adreno 730 TDR (Timeout Detection & Recovery) 250ms 看门狗。单 dispatch 超过 250ms 触发 GPU 硬复位 → DEVICE_LOST。原 `dit_run_attention` 一次性 dispatch 8192 WG 踩线。`maxComputeWorkGroupCount=65535` 是理论值，实际 WG 软上限由 TDR 和内部调度资源决定。
+**根因（疑似）**: Adreno 730 可能从 250ms TDR 看门狗，但 510MHz 底频下不应超时。错误模式 (max_err=0.28 部分错误) 更接近 GPU 内部资源竞争（L1 cache eviction / barrier 同步 / wave scheduler 竞争）。确切根因待确认。`maxComputeWorkGroupCount=65535` 是理论值，实际 WG 软上限由未尽文档化的内部限制决定。
 
 **修复**: 内部将 Q 拆为 batch_q=64 (1024 WG) 的分批，每批独立 submit+wait，保证每批 dispatch <250ms。M_kv=1024 时 batch=64 × 16 = 1024 WG 安全，M_kv=512 时也可全量 dispatch。
 
-### Adreno 730 已知限制 (2026-05-30)
+### Adreno 730 已知 & 疑似限制 (2026-05-30)
 
-| 限制 | 说明 |
-|------|------|
-| **TDR 250ms** | 单 dispatch GPU 时间 <250ms。大 WG 数 + 大 M_kv + 密集 barrier 的组合可能超时 |
-| **并行 dispatch binding confusion** | 同 cmd buffer 内多 dispatch 可并行，不同 descriptor binding 可能混淆。已用 per-block cmd buffer + per-batch submit 规避 |
-| **barrier 密集** | 3-pass 注意力每行 ~30 barrier，大 WG 数下驱动可能不稳定 |
-| **官方手册** | Adreno 530 手册 74 页 (本地)。7XX 需去 developer.qualcomm.com 按平台代号查 |
+| 限制 | 说明 | 确定性 |
+|------|------|--------|
+| **TDR 250ms** | Qualcomm 文档提及，但 510MHz 底频下纯计算不应超时 | ⚠️ 疑似 |
+| **WG 软上限** | 大 M_kv+大 WG+密集 barrier 的组合可复现触发不稳定 | ✅ 实测 |
+| **并行 dispatch binding confusion** | 同 cmd buffer 内多 dispatch 可并行，不同 descriptor 可能混淆 | ✅ 已踩坑 |
+| **部分错误模式** | ROWS=8 时 max_err=0.28，非全零/随机，更像 cache/barrier race | ❓ 待确认 |
+| **官方手册** | Adreno 530 手册 74 页 (本地)。7XX docs.qualcomm.com 按平台代号查 | — |
 
 ### 下步路线 (2026-05-30 更新)
 
