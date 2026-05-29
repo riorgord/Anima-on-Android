@@ -122,15 +122,26 @@ output/       生成图片输出
 
 ## Vulkan GPU 加速状态
 
-**HybridOps 管线**：GEMM + AdaLN + LayerNorm 已 GPU 化，~63s/步，出图干净。
+**HybridOps 管线**：全部 DiT 模块已 GPU 化（GEMM + AdaLN + LN + RMSNorm + GELU + Self-attn + Cross-attn）。~77s/步（息屏省电），出图干净。
 
-**C++ 引擎 `libdit_vk.so`**：28-block DiT forward **13.06s/步**（vs CPU 120s, 9.2×）。skip-attention 模式。
+**GPU 模块注入一览**：
 
-**已注入 HybridOps**：GEMM (libvk_gemm.so), AdaLN + LayerNorm (libdit_vk.so)。标准注入模式：nn.Module 子类 → HybridOps 记名。
+| 模块 | 引擎 | 注入方式 |
+|------|------|---------|
+| GEMM | libvk_gemm.so | HybridLinear |
+| AdaLN | libdit_vk.so | PrecomputedAdaLN |
+| LayerNorm | libdit_vk.so FP32 | HybridLayerNorm |
+| RMSNorm | libdit_vk.so FP16 | HybridRMSNorm |
+| GELU | libdit_vk.so FP16 | post-init replace |
+| Self-attention | libdit_vk.so 3-pass | monkey-patch |
+| Cross-attention | libdit_vk.so 3-pass batched | monkey-patch |
+| t_embedder | libdit_vk.so C++ CPU | dit_compute_timestep |
 
-**已验证但未注入**：RMSNorm、SiLU、GELU shader。
+**C++ 引擎 `libdit_vk.so`**：28-block DiT forward **13.06s/步**（skip-attention 模式，vs CPU 120s, 9.2×）。含 GEMM + AdaLN + norms 预录，注意力暂走 Python monkey-patch。
 
-**待开发**：Attention / RoPE（3-shader 拆分 + RoPE 重写）。
+**已知 Adreno 730 限制**：TDR 250ms 看门狗 → 单 dispatch 不能过大；同一 cmd buffer 多 dispatch 可能并行执行导致 binding confusion（已用 per-block cmd buffer 规避）。
+
+**待开发**：GEMM 入 block 预录制 → Attention 入 block → RoPE GPU → 单实例 28 submit/step
 
 ## 致谢
 

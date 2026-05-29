@@ -33,9 +33,9 @@
 - Attention 是 skip 模式（V→O），非真正 QK^T+softmax
 - RoPE 未集成到 block recording
 
-## 当前状态 (2026-05-29 最终): 自注意力 GPU 化完成，跨注意力已诊断待修复
+## 当前状态 (2026-05-30 更新): 自注意力 + 跨注意力 GPU 化完成
 
-**管线速度**: 68s/步 (息屏，亮屏 ~60s)
+**管线速度**: 77s/步 (息屏+省电调度)
 
 ### 已注入的 GPU 模块（全部管线验证通过）
 
@@ -59,18 +59,28 @@
 
 AdaLN 重录时 `dit_adaln_one_block` 临时 swap `g_vk.descPool → g_vk.stepPool`，录完换回。
 
-### Cross-attention 修复 (2026-05-29 晚间)
+### Cross-attention 修复 (2026-05-30)
 
-**根因**: Adreno 730 单 dispatch WG 上限 ~1024。原 `dit_run_attention` 一次 dispatch `M_q*H = 512*16 = 8192 WG`，超过限制后 GPU 状态污染导致跨步 DEVICE_LOST。
+**根因**: Adreno 730 有 250ms TDR (Timeout Detection & Recovery) 看门狗。单 dispatch 若 GPU 执行时间超过此阈值，驱动强制复位 → `VK_ERROR_DEVICE_LOST`。原 `dit_run_attention` 一次 dispatch `M_q*H = 512*16 = 8192 WG`，在息屏降频下 GPU 时间踩过 250ms 线。`maxComputeWorkGroupCount` 理论值 65535 没有实际意义。
 
-**修复**: `dit_run_attention` 内部将 Q 维度拆分为 `batch_q = 64` 的批次（每批 `64*16 = 1024 WG`），逐批 submit+wait。K/V 上传一次复用，Q 分批上传。
+**修复**: `dit_run_attention` 内部将 Q 维度拆分为 `batch_q = 64` 的批次（每批 `64*16 = 1024 WG`），逐批 submit+wait。每批 dispatch 在 TDR 窗口内完成。K/V 上传一次复用，Q 分批上传。
 
 | 参数 | 值 |
 |------|-----|
 | batch_q | 64 (1024 WG) |
 | 每 attn 调用 submit 数 | 8 (=512/64) |
 | max_err (cross-attn) | 0.0013 |
-| 跨步稳定性 | ✅ 3 steps 管线验证通过 |
+| 跨步稳定性 | ✅ 多次管线验证通过 |
+
+### Adreno 730 TDR 限制 & 驱动特性 (2026-05-30 发现)
+
+| 发现 | 说明 |
+|------|------|
+| **TDR 250ms** | Qualcomm 文档 + 实测确认。单 dispatch GPU 时间 <250ms 安全，超过触发 DEVICE_LOST |
+| **WG 软上限** | `maxComputeWorkGroupCount=65535` 是理论值。实测 M_kv×WG数×barrier 密度 的综合负载有隐性边界 |
+| **并行 dispatch** | 同一 cmd buffer 内多个 dispatch 可并行执行，不同 binding 可能混淆 (Adreno 驱动 quirk) |
+| **barrier 开销** | 每行 3-pass softmax 产生 ~30 barrier/WG。大 WG 数 × 高 barrier 密度 可能触发驱动不稳定 |
+| **官方手册** | 500 系手册 74 页 (本地)。7XX 系需去 developer.qualcomm.com 匹配平台代号 |
 
 ### 剩余 PyTorch CPU 项
 
@@ -78,6 +88,22 @@ AdaLN 重录时 `dit_adaln_one_block` 临时 swap `g_vk.descPool → g_vk.stepPo
 |------|------|
 | **RoPE** | 56 次 ~3s，仍在 compute_qkv 内 |
 | **final_layer** | 1 次，可忽略 |
+
+### 速度分析 (2026-05-30)
+
+| 组件 | 每步耗时 | 状态 |
+|------|---------|------|
+| **GEMM** (281 次) | ~25s | libvk_gemm.so 独立实例 |
+| **Self-attention** (28 blocks) | ~8s | ✅ 3-pass Vulkan batched |
+| **Cross-attention** (28 blocks) | ~8s | ✅ 3-pass Vulkan batched |
+| **LayerNorm** (85 次) | <1s | ✅ libdit_vk.so FP32 |
+| **RMSNorm** (84 次) | <1s | ✅ libdit_vk.so FP16 |
+| **GELU** (28 次) | <1s | ✅ libdit_vk.so FP16 |
+| **AdaLN** (28 blocks) | <1s | ✅ pre-recorded + pool swap |
+| **t_embedder** | <1s | ✅ C++ CPU |
+| **RoPE** (56 次) | ~3s | ❌ CPU |
+| Python/Vulkan submit 开销 | ~35s | 两个实例抢队列 |
+| **总计** | **~77s/步** | |
 
 ### 已验证通过的链路 (PyTorch reference 对比)
 

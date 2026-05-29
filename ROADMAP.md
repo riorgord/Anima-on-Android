@@ -898,36 +898,43 @@ Anima model card's recommended sampler. Our implementation produces incorrect re
 
 **架构**: `dit_run_layernorm(in, out, M, D, eps)` — 每次调用现场录制 1 dispatch，用独立 cmd buffer（g_lnCmdBuf），不覆盖 AdaLN 预录缓冲区。
 
-### 速度分析 (2026-05-29 最终)
+### 速度分析 (2026-05-30 更新)
 
 | 组件 | 每步耗时 | 加速状态 | 可节省 |
 |------|---------|---------|--------|
-| **GEMM** (281 次) | ~25s | ✅ HybridLinear | — |
-| **Self-attention** (28 blocks) | ~8s | ✅ 3-pass Vulkan | — |
-| **Cross-attention** (28 blocks) | ~7s | ❌ CPU (Vulkan PD state corrupt) | **-7s** |
+| **GEMM** (281 次) | ~25s | ✅ HybridLinear (libvk_gemm.so) | 入 libdit_vk.so 可省竞争 |
+| **Self-attention** (28 blocks) | ~8s | ✅ 3-pass Vulkan batched | — |
+| **Cross-attention** (28 blocks) | ~8s | ✅ 3-pass Vulkan batched | — |
 | **LayerNorm** (85 次) | <1s | ✅ libdit_vk.so FP32 | — |
 | **RMSNorm** (84 次) | <1s | ✅ libdit_vk.so FP16 | — |
 | **GELU** (28 次) | <1s | ✅ libdit_vk.so FP16 | — |
 | **AdaLN** (28 blocks) | <1s | ✅ pre-recorded + pool swap | — |
 | **t_embedder** | <1s | ✅ C++ CPU | — |
 | **RoPE** (56 次) | ~3s | ❌ CPU | **-3s** |
-| Python/Vulkan 两实例竞争 | ~15s | — | 合并实例可省 |
-| **总计** | **~68s** | | **理论可省 ~10s → 58s/步，单实例后 ~15s/步** |
+| Python/Vulkan submit 开销 | ~35s | — | 消 submit → ~15s/步 |
+| **总计** | **~77s/步** | | **目标 ~15s/步 (28 submit)** |
 
-### Cross-attention Vulkan 诊断结果
+### Cross-attention 修复 (2026-05-30)
 
-- QK^T per-pass: max_err 0.004 ✅
-- WG 上限: batch_q=64 (1024 WG) OK, ≥68 (1088 WG) Device Lost
-- 单次 8192 WG 提交: 成功, 但后续 step AdaLN submit VK_ERROR_DEVICE_LOST
-- 根因: 跨步 GPU 状态污染（buffer overlap 嫌疑, 未定位）
-- 暂 CPU fallback
+**根因**: Adreno 730 TDR (Timeout Detection & Recovery) 250ms 看门狗。单 dispatch 超过 250ms 触发 GPU 硬复位 → DEVICE_LOST。原 `dit_run_attention` 一次性 dispatch 8192 WG 踩线。`maxComputeWorkGroupCount=65535` 是理论值，实际 WG 软上限由 TDR 和内部调度资源决定。
 
-### 下步路线
+**修复**: 内部将 Q 拆为 batch_q=64 (1024 WG) 的分批，每批独立 submit+wait，保证每批 dispatch <250ms。M_kv=1024 时 batch=64 × 16 = 1024 WG 安全，M_kv=512 时也可全量 dispatch。
 
-1. **修跨注意力** — WG 上限 1024 已定位，方向：减单 dispatch WG 数 / 拆分 M_kv+多 pass
-2. **RoPE** — 56 次调用，省 ~3s/步
-3. **Attention 入 block 预录制** — 和 AdaLN 同架构，消灭 submit 开销
-4. **GEMM 入 libdit_vk.so** — 单实例，最终 ~15s/步
+### Adreno 730 已知限制 (2026-05-30)
+
+| 限制 | 说明 |
+|------|------|
+| **TDR 250ms** | 单 dispatch GPU 时间 <250ms。大 WG 数 + 大 M_kv + 密集 barrier 的组合可能超时 |
+| **并行 dispatch binding confusion** | 同 cmd buffer 内多 dispatch 可并行，不同 descriptor binding 可能混淆。已用 per-block cmd buffer + per-batch submit 规避 |
+| **barrier 密集** | 3-pass 注意力每行 ~30 barrier，大 WG 数下驱动可能不稳定 |
+| **官方手册** | Adreno 530 手册 74 页 (本地)。7XX 需去 developer.qualcomm.com 按平台代号查 |
+
+### 下步路线 (2026-05-30 更新)
+
+1. **GEMM 入 libdit_vk.so** — 已验证 `dit_run_gemm` 正确性（与 libvk_gemm.so 结果一致）。下一步权重预加载 + block 预录，消 287 submit 和两实例竞争
+2. **Attention 入 block 预录制** — 需 shader 改造（8 行/WG 方向正确但需避 TDR）。预录后 448 attention submit → 0
+3. **RoPE GPU** — 56 次调用省 ~3s/步
+4. **最终目标** — 所有 dispatch 在 28 block cmd buffer 中，28 submit/step，预估 ~15s/步
 
 **参考来源**: 本地 clone 的 ExecuTorch 仓库 `D:\AI\手坤的anima\参考\sdpa找不到了，只能克隆了\executorch\`，重点参考其 Vulkan backend 的 GLSL shader 实现。官方用模板系统（`${}` 宏）生成 shader，我们直接读展开后的逻辑。与自研 shader 的逐模块对比结论：
 
