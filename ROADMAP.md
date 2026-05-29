@@ -882,58 +882,40 @@ Anima model card's recommended sampler. Our implementation produces incorrect re
 
 **当前进度 (2026-05-29)**:
 
-### AdaLN GPU 注入 ✅ (phone_pipeline.py)
+### AdaLN GPU 注入 ✅ (phone_pipeline.py + libdit_vk.so)
 
-**方法**: PrecomputedAdaLN(nn.Module) 子类替换 `block.adaln_modulation_*`，不用 monkey-patch，走标准 nn.Module 替换路线——跟 HybridLinear 替换 nn.Linear 同模式。
+**方法**: PrecomputedAdaLN(nn.Module) 子类替换 `block.adaln_modulation_*`，不用 monkey-patch。
 
-**架构**:
-```
-init: dit_init_adaln_only() → 轻量加载 173 个 AdaLN tensor (390MB, 非全量 3.9GB)
-      → 4 个 shader pipeline (gemm, silu, scale_shift, broadcast)
-      → 预录制 28 个 cmd buffer (每个 36 dispatch = 3 通道 × 12 op)
-      → 描述符池只分配一次，无碎片化
+**架构**: `dit_init_adaln_only()` 轻量加载 173 个 AdaLN tensor (390MB)，预录制 28 cmd buffer。每步上传 t_emb+lora → submit → read back → 注入。
 
-step: t_embedder(PyTorch) → t_emb + lora → dit_write_buf + dit_write_lora
-      → for blk 0..27: submit cmd[blk] + wait + read bcBuf → [9,M,D] fp16
-      → PrecomputedAdaLN 注入 28 个 block 的 3 个 adaln_modulation 模块
-      → use_adaln_lora=False (lora 已 baked in)
-      → dit.forward() (PyTorch, blocks 用预计算 AdaLN)
-      → 恢复 use_adaln_lora=True
+**验证**: 86KB PNG, 与纯 PyTorch 一致。AdaLN 开销 <1s/步。
 
-验证: 管线出图 256×256 PNG 86KB, 无 grid artifact, 与纯 PyTorch 基准一致
-```
+### LayerNorm GPU 注入 ✅ (phone_pipeline.py + libdit_vk.so)
 
-**速度**: 57s/步。AdaLN GPU 开销 **<1s/步** (28 次 submit, 每次 36 dispatch 已预录制)。
+**shader**: FP32 I/O（`layernorm_fp32.comp`），消除 FP16 量化误差。max_err 0.000002。
 
-### 速度分析 — 瓶颈在哪
+**教训**: 先用了 libvk_hybrid.so（独立 Vulkan 实例）→ 出图雪花。排查排除了三实例互抢、shader 精度问题，最终定位到 `vk_hybrid_download` 的 HOST_COHERENT 缓存一致性问题。**每个 op 类型必须归入同一个 Vulkan 实例（libdit_vk.so）**，不引入额外实例。
+
+**架构**: `dit_run_layernorm(in, out, M, D, eps)` — 每次调用现场录制 1 dispatch，用独立 cmd buffer（g_lnCmdBuf），不覆盖 AdaLN 预录缓冲区。
+
+### 速度分析 (2026-05-29)
 
 | 组件 | 每步耗时 | 加速状态 | 可节省 |
 |------|---------|---------|--------|
 | **GEMM** (281 次) | ~25s | ✅ HybridLinear (libvk_gemm.so) | — |
 | **Attention** (self+cross, 28 blocks) | ~15s | ❌ PyTorch CPU | **-15s** |
-| **LayerNorm/RMSNorm** (28×3+1=85 次) | ~5s | ❌ PyTorch CPU | **-5s** |
-| **SiLU/GELU** (28×4=112 次) | ~2s | ❌ PyTorch CPU | **-2s** |
-| **AdaLN** | <1s | ✅ C++ GPU (本次完成) | — |
-| Python/Vulkan 来回 + 管线开销 | ~9s | — | — |
-| **总计** | **~57s** | | **理论可省 ~22s → 35s/步** |
-
-### 已造好但未装的轮子 (libvk_hybrid.so)
-
-`libvk_hybrid.so` 已验证通过（独立测试），只需按 HybridOps 模式注入：
-
-| Shader | 已验证耗时 | 替换方法 | 每步调用次数 | 理论省时 |
-|--------|----------|---------|------------|---------|
-| **SiLU** | 317μs/次 | HybridSiLU(nn.Module) | 112 次 | ~2s |
-| **LayerNorm** | 265μs/次 | HybridLayerNorm(nn.Module) | 85 次 | ~5s |
-| **GELU** | — | HybridGELU(nn.Module) | 28 次 | <1s |
-
-替换模式一致：`HybridSiLU(nn.Module)` 子类，forward 调 ctypes dispatch libvk_hybrid.so，不改 predict2.py 内部逻辑。跟 HybridLinear 和 PrecomputedAdaLN 完全一样的套路。
+| **RMSNorm** (~85 次) | ~3s | ❌ PyTorch CPU | **-3s** |
+| **SiLU/GELU** (112 次) | ~2s | ❌ PyTorch CPU | **-2s** |
+| **AdaLN** (28 blocks) | <1s | ✅ libdit_vk.so | — |
+| **LayerNorm** (85 次) | <1s | ✅ libdit_vk.so (本次完成) | — |
+| Python/Vulkan 来回 | ~15s | 两实例 (gemm + dit) | 合并实例可省 |
+| **总计** | **~63s** | | **理论可省 ~20s → 43s/步** |
 
 ### 下步路线
 
-1. **替换 LayerNorm/RMSNorm** (最稳，省 5s/步) — 已有验证过的 shader，改 HybridOps 加入 `RMSNorm = HybridRMSNorm` 即可。predict2.py 本身就通过 `operations.RMSNorm` 构造，无需改模型代码
-2. **替换 SiLU** (省 2s/步) — 简单逐元素 op，在 predict2.py 的 MLP/adaln 里替换
-3. **Attention** (最重，省 15s/步) — 需 3-shader 拆分 (QK^T / softmax / SV)，先单层验证再逐 block 替换
+1. **RMSNorm** — 最稳最快。shader 已验证，`predict2.py` 用 `operations.RMSNorm(...)` 构造，只需 `HybridRMSNorm` + `HybridOps.RMSNorm = HybridRMSNorm` 一行激活。省 ~3s
+2. **SiLU** — shader 已验证，但 `predict2.py` 直接 `nn.SiLU()` 不走 `operations`，需改 predict2.py 或 post-init 替换。省 ~2s
+3. **Attention** — 最大头（15s），需 3-shader 拆分 + RoPE 重写
 
 **参考来源**: 本地 clone 的 ExecuTorch 仓库 `D:\AI\手坤的anima\参考\sdpa找不到了，只能克隆了\executorch\`，重点参考其 Vulkan backend 的 GLSL shader 实现。官方用模板系统（`${}` 宏）生成 shader，我们直接读展开后的逻辑。与自研 shader 的逐模块对比结论：
 

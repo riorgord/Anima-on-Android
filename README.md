@@ -15,7 +15,7 @@
 python -B /sdcard/anima_on_android/scripts/phone_pipeline.py
 ```
 
-输出：256×256 PNG，约 50s/步（HybridOps Vulkan GEMM），3 步共约 3 分钟。
+输出：256×256 PNG，约 63s/步（HybridOps GEMM + GPU AdaLN + GPU LayerNorm），3 步共约 3.5 分钟。
 
 ## 管线
 
@@ -122,13 +122,15 @@ output/       生成图片输出
 
 ## Vulkan GPU 加速状态
 
-**C++ 引擎 `libdit_vk.so`**：28-block DiT forward **13.06s/步**（vs CPU 120s, 9.2×）。
+**HybridOps 管线**：GEMM + AdaLN + LayerNorm 已 GPU 化，~63s/步，出图干净。
 
-**已验证**：GEMM、LayerNorm、RMSNorm、SiLU、ScaleShift、self+cross+MLP blocks (skip-attention)。
+**C++ 引擎 `libdit_vk.so`**：28-block DiT forward **13.06s/步**（vs CPU 120s, 9.2×）。skip-attention 模式。
 
-**已实现待验证**：GPU AdaLN（benchmark 通过，完整管线验证未完成）。
+**已注入 HybridOps**：GEMM (libvk_gemm.so), AdaLN + LayerNorm (libdit_vk.so)。标准注入模式：nn.Module 子类 → HybridOps 记名。
 
-**已探索暂回退**：Attention / RoPE 集成——遇到 Adreno 多 dispatch 并行执行导致的同步问题（A shader 隔离正确、管线中 binding 错乱）。详见 `STATUS.md`。
+**已验证但未注入**：RMSNorm、SiLU、GELU shader。
+
+**待开发**：Attention / RoPE（3-shader 拆分 + RoPE 重写）。
 
 ## 致谢
 

@@ -1,4 +1,4 @@
-# Anima 项目状态摘要 (2026-05-27 晚间更新)
+# Anima 项目状态摘要 (2026-05-29 更新)
 
 ## 我们在做什么
 在 Snapdragon 8+ Gen1 手机上运行 Anima 动漫风格图像生成模型 (2B DiT)。
@@ -33,19 +33,35 @@
 - Attention 是 skip 模式（V→O），非真正 QK^T+softmax
 - RoPE 未集成到 block recording
 
-## 当前状态 (2026-05-28 晚间): AdaLN lora 修复完成 + C++ CPU lora 计算
+## 当前状态 (2026-05-29): HybridOps + GPU AdaLN + GPU LayerNorm
 
-**管线速度**: 50s/步 (HybridOps Vulkan GEMM, 不绑核 + Scene 调度器)
+**管线速度**: 63s/步 (HybridOps GEMM + libdit_vk.so AdaLN+LN, 不绑核 + Scene 调度器)
 
-**libvk_hybrid.so**: 通用 Vulkan compute dispatch wrapper + GPU 时间戳。独立验证 SiLU(317μs) / LayerNorm(265μs) / GELU 通过。
+### 已注入 HybridOps 的 GPU 模块
 
-**C++ 引擎 AdaLN lora 修复** ✅: `adaln_gpu()` 补上 external lora addition (3次 dispatch_scale_shift)。GPU 直测 vs CPU reference: max_err=0.10(scale)/0.013(shift)/0.060(gate)。lora 布局 [3,M,D] = [3,2,2048] (24KB)。
+| 模块 | 引擎 | 每步调用 | 单次精度 | 注入方式 |
+|------|------|---------|---------|---------|
+| **GEMM** | libvk_gemm.so | 281 | max_err ~0.01 | HybridLinear(nn.Linear) |
+| **AdaLN** | libdit_vk.so | 28 blocks | shader chain verified | PrecomputedAdaLN(nn.Module) |
+| **LayerNorm** | libdit_vk.so | 85 | max_err 0.000002 | HybridLayerNorm(nn.LayerNorm) |
 
-**C++ CPU lora 计算** ✅: `dit_compute_timestep(sigma)` 在 C++ 引擎 CPU 上原地算 lora + t_emb ~0.5ms。vs PC torch: t_emb max_err=0.00006, lora max_err=0.016。不再依赖 PC 预计算。
+全部通过管线级验证：出图 86KB PNG, 干净无雪花。
 
-**HybridOps 管线 lora 注入** ❌: 尝试 monkey-patch `t_embedder[1].forward` 用 numpy lora 替换 torch lora，触发 RoPE 维度不匹配崩溃 (256 vs 512)。monkey-patch 路线已确认不可靠（之前 F.layer_norm 也崩过 BLAS）。正确做法需走 HybridOps 自定义 Module 子类注入。
+### 注入模式确立
 
-**下一步**: Step 3 — RoPE shader 重写并集成到 C++ 引擎 block recording。
+不用 monkey-patch。标准方法：`nn.Module` 子类 → `HybridOps` 记名 → `predict2.py` 的 `operations.X()` 自动拾取。
+
+### 已造好待装的轮子
+
+| 模块 | Shader | 位置 | 替换方式 | 理论省时 |
+|------|--------|------|---------|---------|
+| **RMSNorm** | rms_norm_fp16.comp (已验证) | libdit_vk.so | HybridRMSNorm(nn.RMSNorm) → HybridOps.RMSNorm | ~3s |
+| **SiLU** | silu_fp16.comp (已验证) | libdit_vk.so | HybridSiLU → 改 predict2.py 的 nn.SiLU() | ~2s |
+| **GELU** | gelu_fp16.comp (已验证) | libdit_vk.so | 同上 | <1s |
+
+### libvk_hybrid.so 教训
+
+独立验证 OK，但生产不可靠——buffer 交付路径在逐 op 调用场景下偶发数据不一致（三实例互抢排除了，shader 精度排除了，最终定位到 `vk_hybrid_download` 的缓存一致性问题）。结论：每个 op 类型的 dispatch 都应归入 libdit_vk.so 统一管理，不引入额外 Vulkan 实例。
 
 ### 已验证通过的链路 (PyTorch reference 对比)
 
