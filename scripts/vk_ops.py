@@ -102,6 +102,8 @@ try:
     _lib_dit = _ct.CDLL("/data/local/tmp/libdit_vk.so")
     _lib_dit.dit_run_layernorm.argtypes = [_ct.c_void_p, _ct.c_void_p, _ct.c_int, _ct.c_int, _ct.c_float]
     _lib_dit.dit_run_layernorm.restype = _ct.c_bool
+    _lib_dit.dit_run_rmsnorm.argtypes = [_ct.c_void_p, _ct.c_void_p, _ct.c_int, _ct.c_void_p, _ct.c_int, _ct.c_int, _ct.c_float]
+    _lib_dit.dit_run_rmsnorm.restype = _ct.c_bool
     _VK_LN_AVAILABLE = True
 except Exception:
     _VK_LN_AVAILABLE = False
@@ -142,10 +144,46 @@ class HybridLayerNorm(nn.LayerNorm):
         return result
 
 
+class HybridRMSNorm(nn.RMSNorm):
+    """nn.RMSNorm with Vulkan acceleration via libdit_vk.so (FP16 I/O)."""
+    _count = 0
+
+    def forward(self, x):
+        if not _VK_LN_AVAILABLE:
+            return F.rms_norm(x, self.normalized_shape, self.weight, self.eps)
+
+        *batch, D = x.shape
+        M = int(np.prod(batch)) if batch else 1
+
+        x_f16 = x.reshape(M, D).cpu().contiguous().to(torch.float16).numpy().view(np.uint16)
+        w_f16 = self.weight.detach().cpu().to(torch.float16).numpy().view(np.uint16)
+        out_buf = np.zeros(M * D, dtype=np.uint16)
+
+        ok = _lib_dit.dit_run_rmsnorm(
+            x_f16.ctypes.data_as(_ct.c_void_p),
+            w_f16.ctypes.data_as(_ct.c_void_p), int(w_f16.size),
+            out_buf.ctypes.data_as(_ct.c_void_p),
+            M, D, _ct.c_float(self.eps))
+        if not ok:
+            return F.rms_norm(x, self.normalized_shape, self.weight, self.eps)
+
+        result = torch.tensor(out_buf.view(np.float16), device=x.device, dtype=x.dtype)
+        result = result.reshape(*batch, D) if batch else result.squeeze(0)
+
+        cls = type(self)
+        if cls._count < 5:
+            ref = F.rms_norm(x.float(), self.normalized_shape, self.weight.float(), self.eps)
+            err = (result.float() - ref.float()).abs().max().item()
+            print(f"  VkRMS#{cls._count} M={M} D={D} max_err={err:.6f}")
+            cls._count += 1
+
+        return result
+
+
 class HybridOps:
     """Operations class with Vulkan acceleration for large Linear layers."""
     Linear = HybridLinear
-    RMSNorm = nn.RMSNorm
+    RMSNorm = HybridRMSNorm
     LayerNorm = HybridLayerNorm
     Embedding = nn.Embedding
 

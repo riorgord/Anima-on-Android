@@ -397,8 +397,9 @@ static bool create_adaln_pipelines(VulkanCtx& ctx, const char* spv_dir) {
     CP(scale_shift, 4, sizeof(PC_ScaleShift));
     CP(broadcast, 2, sizeof(PC_Broadcast));
     CP(layer_norm, 2, sizeof(PC_LayerNorm));
+    CP(rms_norm, 3, sizeof(PC_RmsNorm));
     #undef CP
-    LOGI("AdaLN pipelines created (gemm, silu, scale_shift, broadcast, layer_norm)");
+    LOGI("AdaLN pipelines created (gemm, silu, scale_shift, broadcast, layer_norm, rms_norm)");
     return true;
 }
 
@@ -408,6 +409,9 @@ static Buffer g_loraBuf;
 static Buffer g_onesBuf;
 static Buffer g_lnInBuf;   // FP32 LayerNorm input
 static Buffer g_lnOutBuf;  // FP32 LayerNorm output
+static Buffer g_rmsInBuf;   // FP16 RMSNorm input (max M=16384,D=128 → 4.2MB)
+static Buffer g_rmsOutBuf;  // FP16 RMSNorm output
+static Buffer g_rmsWgtBuf;  // FP16 RMSNorm weight (max D=2048)
 
 struct RC {
     VulkanCtx* vk;
@@ -722,6 +726,15 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
     if (!create_buffer(g_vk, MS * D * 4, u, g_lnInBuf)) return false;
     if (!create_buffer(g_vk, MS * D * 4, u, g_lnOutBuf)) return false;
 
+    // FP16 RMSNorm I/O buffers (cross-attn K norm: M=16384, D=128 → 4.2MB)
+    size_t rmsMaxSz = MS * N_HEADS * D * 2;  // 512*16*2048*2 = 32MB, way oversized; double head_dim*Nctx=32768*128*2=8MB
+    size_t rmsSz = 5 * 1024 * 1024;  // 5MB — enough for 16384×128 fp16
+    if (!create_buffer(g_vk, rmsSz, u, g_rmsInBuf)) return false;
+    if (!create_buffer(g_vk, rmsSz, u, g_rmsOutBuf)) return false;
+
+    // FP16 RMSNorm weight buffer (max D=2048 → 4KB)
+    if (!create_buffer(g_vk, D * 2, u, g_rmsWgtBuf)) return false;
+
     if (!create_buffer(g_vk, 4096, u, g_onesBuf)) return false;
     uint16_t* ones = (uint16_t*)g_onesBuf.mapped;
     for (int i = 0; i < 2048; i++) ones[i] = 0x3C00;
@@ -741,7 +754,7 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
         LOGE("LN cmd buffer alloc failed"); return false;
     }
 
-    LOGI("dit_init_adaln_only OK — %u buffers", 14);
+    LOGI("dit_init_adaln_only OK — %u buffers", 15);
 
     // Pre-record all 28 AdaLN blocks (avoids per-step recording / pool exhaustion)
     if (!dit_record_all_adaln_blocks()) {
@@ -1619,6 +1632,67 @@ bool dit_run_layernorm(void* in_fp32, void* out_fp32, int _M, int _D, float eps)
     return true;
 }
 
+bool dit_run_rmsnorm(void* in_fp16, void* weight_fp16, int wlen, void* out_fp16, int _M, int _D, float eps) {
+    // Single RMSNorm dispatch: FP16 I/O + weight. Uses g_lnCmdBuf (shared w/ LN, sequential).
+    if (!g_init) return false;
+
+    uint32_t Mv = (uint32_t)_M;
+    uint32_t Dv = (uint32_t)_D;
+    size_t inBytes = Mv * Dv * 2;       // fp16 = 2 bytes
+
+    // Upload to dedicated RMSNorm buffers
+    memcpy(g_rmsInBuf.mapped, in_fp16, inBytes);
+    memcpy(g_rmsWgtBuf.mapped, weight_fp16, (size_t)wlen * 2);
+    memset(g_rmsOutBuf.mapped, 0, inBytes);
+
+    VkCommandBufferBeginInfo bi = {};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(g_lnCmdBuf, &bi) != VK_SUCCESS) return false;
+
+    VkDescriptorSetAllocateInfo dsInfo = {};
+    dsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsInfo.descriptorPool = g_vk.descPool;
+    dsInfo.descriptorSetCount = 1;
+    dsInfo.pSetLayouts = &g_vk.rms_norm.dsl;
+    VkDescriptorSet ds;
+    if (vkAllocateDescriptorSets(g_vk.device, &dsInfo, &ds) != VK_SUCCESS) return false;
+
+    VkDescriptorBufferInfo bIn  = { g_rmsInBuf.buf, 0, inBytes };
+    VkDescriptorBufferInfo bW   = { g_rmsWgtBuf.buf, 0, (VkDeviceSize)wlen * 2 };
+    VkDescriptorBufferInfo bOut = { g_rmsOutBuf.buf, 0, inBytes };
+
+    VkWriteDescriptorSet w[3] = {};
+    for (int i = 0; i < 3; i++) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = ds; w[i].dstBinding = (uint32_t)i; w[i].descriptorCount = 1; w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; }
+    w[0].pBufferInfo = &bIn; w[1].pBufferInfo = &bW; w[2].pBufferInfo = &bOut;
+    vkUpdateDescriptorSets(g_vk.device, 3, w, 0, nullptr);
+
+    vkCmdBindPipeline(g_lnCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk.rms_norm.pipeline);
+    vkCmdBindDescriptorSets(g_lnCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk.rms_norm.layout, 0, 1, &ds, 0, nullptr);
+    PC_RmsNorm pc = { Mv, Dv, eps };
+    vkCmdPushConstants(g_lnCmdBuf, g_vk.rms_norm.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(g_lnCmdBuf, Mv, 1, 1);
+
+    VkMemoryBarrier mb = {};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(g_lnCmdBuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+
+    if (vkEndCommandBuffer(g_lnCmdBuf) != VK_SUCCESS) return false;
+
+    vkResetFences(g_vk.device, 1, &g_vk.fence);
+    VkSubmitInfo submit = {};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &g_lnCmdBuf;
+    if (vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.fence) != VK_SUCCESS) return false;
+    vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+
+    memcpy(out_fp16, g_rmsOutBuf.mapped, inBytes);
+    vkFreeDescriptorSets(g_vk.device, g_vk.descPool, 1, &ds);
+    return true;
+}
+
 void dit_destroy() {
     auto free_buf = [&](Buffer& b) {
         if (b.mapped) vkUnmapMemory(g_vk.device, b.mem);
@@ -1651,6 +1725,7 @@ void dit_destroy() {
     free_buf(g_nBuf); free_buf(g_gBuf); free_buf(g_bcBuf);
     free_buf(g_onesBuf); free_buf(g_loraBuf);
     free_buf(g_lnInBuf); free_buf(g_lnOutBuf);
+    free_buf(g_rmsInBuf); free_buf(g_rmsOutBuf); free_buf(g_rmsWgtBuf);
 
     if (g_vk.device) vkDestroyDevice(g_vk.device, nullptr);
     if (g_vk.instance) vkDestroyInstance(g_vk.instance, nullptr);
