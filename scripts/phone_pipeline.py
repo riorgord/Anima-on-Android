@@ -36,14 +36,6 @@ _lib_vk.dit_forward_nblocks.restype = ctypes.c_bool
 _lib_vk.dit_destroy.argtypes = []
 _lib_vk.dit_destroy.restype = None
 
-class PrecomputedAdaLN(torch.nn.Module):
-    """Returns a precomputed [M, 3D] tensor, ignoring emb input."""
-    def __init__(self, values_3D):
-        super().__init__()
-        self.register_buffer('v', values_3D.clone())
-    def forward(self, emb):
-        return self.v
-
 # Load contexts (small, fast)
 ctx_cond = torch.load("/sdcard/anima_on_android/models/context_cond.pt", weights_only=True).to(DEV).to(DTYPE)
 ctx_uncond = torch.load("/sdcard/anima_on_android/models/context_uncond.pt", weights_only=True).to(DEV).to(DTYPE)
@@ -57,12 +49,14 @@ config = dict(max_img_h=240, max_img_w=240, max_frames=128, in_channels=16, out_
     min_fps=1, max_fps=30, use_adaln_lora=True, adaln_lora_dim=256,
     rope_h_extrapolation_ratio=4.0, rope_w_extrapolation_ratio=4.0, rope_t_extrapolation_ratio=1.0,
     extra_per_block_abs_pos_emb=False, rope_enable_fps_modulation=False)
-dit_sd = torch.load("/sdcard/anima_on_android/models/diffusion_weights_fp16.pt", weights_only=True)
+# Load only non-block weights (~20MB) to avoid OOM with C++ engine's 3.9GB
+small_path = "/sdcard/anima_on_android/models/diffusion_weights_small.pt"
+dit_sd = torch.load(small_path, weights_only=True)
 dit = predict2.MiniTrainDIT(**config, device=DEV, dtype=DTYPE, operations=vk_ops.HybridOps)
 dit.load_state_dict(dit_sd, strict=False)
 dit.eval()
 del dit_sd; gc.collect()
-print("DiT loaded")
+print(f"DiT loaded (small weights, {len(dit.blocks)} blocks)")
 
 # ── Init C++ AdaLN engine ──
 print("Init C++ AdaLN engine...")
@@ -73,64 +67,7 @@ if not ok:
     print("FATAL: C++ AdaLN init failed")
     sys.exit(1)
 
-M, D = 2, 2048  # batch=2 (cond+uncond), hidden=2048
-
-# Replace MLP GELU + self-attention with Vulkan versions
-for blk in dit.blocks:
-    blk.mlp.activation = vk_ops.HybridGELU()
-    _orig_attn = blk.self_attn
-    _orig_compute = _orig_attn.compute_attention
-    def _make_vk_attn(orig=_orig_attn, orig_comp=_orig_compute):
-        scale = 1.0 / (orig.head_dim ** 0.5)
-        def vk_compute_attention(q, k, v, transformer_options={}):
-            B, S_q, H, D = q.shape
-            _, S_kv, _, _ = k.shape
-            M_q = B * S_q; M_kv = B * S_kv
-            q_f16 = q.reshape(M_q*H, D).cpu().contiguous().to(torch.float16).numpy().view(np.uint16)
-            k_f16 = k.reshape(M_kv*H, D).cpu().contiguous().to(torch.float16).numpy().view(np.uint16)
-            v_f16 = v.reshape(M_kv*H, D).cpu().contiguous().to(torch.float16).numpy().view(np.uint16)
-            o_flat = np.zeros(M_q * H * D, dtype=np.uint16)
-            ok = vk_ops._lib_dit.dit_run_attention(
-                q_f16.ctypes.data_as(ctypes.c_void_p),
-                k_f16.ctypes.data_as(ctypes.c_void_p),
-                v_f16.ctypes.data_as(ctypes.c_void_p),
-                o_flat.ctypes.data_as(ctypes.c_void_p),
-                M_q, M_kv, H, D, ctypes.c_float(scale))
-            if not ok:
-                return orig_comp(q, k, v, transformer_options)
-            o_t = torch.tensor(o_flat.view(np.float16), device=q.device)
-            o_t = o_t.reshape(B, S_q, H, D).reshape(B, S_q, H*D)
-            return orig.output_dropout(orig.output_proj(o_t.to(q.dtype)))
-        return vk_compute_attention
-    blk.self_attn.compute_attention = _make_vk_attn()
-
-    # Cross-attn: same 3-pass Vulkan, now batched (M_q split into ≤64 Q tokens,
-    # ≤1024 WG per dispatch). Safe for Adreno 730 across steps.
-    _orig_cross = blk.cross_attn
-    _orig_cross_comp = _orig_cross.compute_attention
-    def _make_vk_cross_attn(orig=_orig_cross, orig_comp=_orig_cross_comp):
-        scale = 1.0 / (orig.head_dim ** 0.5)
-        def vk_compute_attention(q, k, v, transformer_options={}):
-            B, S_q, H, D = q.shape
-            _, S_kv, _, _ = k.shape
-            M_q = B * S_q; M_kv = B * S_kv
-            q_f16 = q.reshape(M_q*H, D).cpu().contiguous().to(torch.float16).numpy().view(np.uint16)
-            k_f16 = k.reshape(M_kv*H, D).cpu().contiguous().to(torch.float16).numpy().view(np.uint16)
-            v_f16 = v.reshape(M_kv*H, D).cpu().contiguous().to(torch.float16).numpy().view(np.uint16)
-            o_flat = np.zeros(M_q * H * D, dtype=np.uint16)
-            ok = vk_ops._lib_dit.dit_run_attention(
-                q_f16.ctypes.data_as(ctypes.c_void_p),
-                k_f16.ctypes.data_as(ctypes.c_void_p),
-                v_f16.ctypes.data_as(ctypes.c_void_p),
-                o_flat.ctypes.data_as(ctypes.c_void_p),
-                M_q, M_kv, H, D, ctypes.c_float(scale))
-            if not ok:
-                return orig_comp(q, k, v, transformer_options)
-            o_t = torch.tensor(o_flat.view(np.float16), device=q.device)
-            o_t = o_t.reshape(B, S_q, H, D).reshape(B, S_q, H*D)
-            return orig.output_dropout(orig.output_proj(o_t.to(q.dtype)))
-        return vk_compute_attention
-    blk.cross_attn.compute_attention = _make_vk_cross_attn()
+M, D = 2, 2048
 
 # Scheduler
 def time_snr_shift(a, t): return a * t / (1.0 + (a - 1.0) * t)
@@ -151,58 +88,54 @@ for i in range(STEPS):
     # C++ CPU: compute t_emb + lora from sigma directly into GPU buffers
     _lib_vk.dit_compute_timestep(float(sigma))
 
-    # GPU AdaLN for all 28 blocks
-    t0_adaln = time.time()
-    adaln_all = []
-    out_buf = np.zeros(9 * M * D, dtype=np.uint16)
-    for blk_idx in range(28):
-        ok = _lib_vk.dit_adaln_one_block(blk_idx, out_buf.ctypes.data_as(ctypes.c_void_p))
-        if not ok:
-            print(f"  ERROR: dit_adaln_one_block({blk_idx}) failed")
-            break
-        adaln_all.append(out_buf.copy().view(np.float16).reshape(9, M, D))
-    adaln_time = time.time() - t0_adaln
+    # Prepare inputs: x [1,16,32,32] → x_emb [2,1,16,16,2048]
+    x_b = x.unsqueeze(2).repeat(2, 1, 1, 1, 1)  # [2,1,16,32,32]
+    ctx_b = torch.cat([ctx_cond, ctx_uncond], dim=0)  # [2,512,1024]
+    ts_b2 = ts.repeat(2).unsqueeze(1)  # [2,1]
 
-    # Inject precomputed AdaLN into blocks
-    for blk_idx, blk in enumerate(dit.blocks):
-        a = adaln_all[blk_idx]  # [9, M, D]
-        v_self  = torch.from_numpy(np.concatenate([a[0], a[1], a[2]], axis=-1)).reshape(2, 1, 3*D).to(DEV).to(DTYPE)
-        v_cross = torch.from_numpy(np.concatenate([a[3], a[4], a[5]], axis=-1)).reshape(2, 1, 3*D).to(DEV).to(DTYPE)
-        v_mlp   = torch.from_numpy(np.concatenate([a[6], a[7], a[8]], axis=-1)).reshape(2, 1, 3*D).to(DEV).to(DTYPE)
-        blk.adaln_modulation_self_attn = PrecomputedAdaLN(v_self)
-        blk.adaln_modulation_cross_attn = PrecomputedAdaLN(v_cross)
-        blk.adaln_modulation_mlp = PrecomputedAdaLN(v_mlp)
-        blk.use_adaln_lora = False
-
-    x_b = x.unsqueeze(2).repeat(2, 1, 1, 1, 1)
-    ctx_b = torch.cat([ctx_cond, ctx_uncond], dim=0)
-    ts_b2 = ts.repeat(2)
     t0 = time.time()
     with torch.no_grad():
-        v_b = dit(x_b, ts_b2, ctx_b)
+        # ── PyTorch: x_embedder + RoPE + t_embedder ──
+        x_emb, rope_emb, extra_pos = dit.prepare_embedded_sequence(x_b)
+        B, T, H_img, W_img = x_emb.shape[:4]
+        MS_val = B * T * H_img * W_img  # 512
+
+        t_raw = dit.t_embedder[0](ts_b2).to(x_emb.dtype)
+        t_emb_pt, adaln_lora = dit.t_embedder[1](t_raw)
+        t_emb_pt = dit.t_embedding_norm(t_emb_pt)
+
+        # ── C++: 28-block forward (skip-attn) ──
+        x_flat = x_emb.float().reshape(MS_val, D).contiguous().cpu().numpy().view(np.uint16)
+        ctx_flat = ctx_b.reshape(2 * 512, 1024).contiguous().cpu().numpy().view(np.uint16)
+        out_flat = np.zeros(MS_val * D, dtype=np.uint16)
+
+        ok = _lib_vk.dit_forward_nblocks(
+            x_flat.ctypes.data_as(ctypes.c_void_p),
+            None,  # t_emb already in GPU via dit_compute_timestep
+            ctx_flat.ctypes.data_as(ctypes.c_void_p),
+            out_flat.ctypes.data_as(ctypes.c_void_p),
+            MS_val, D, 2, 512, 1024, 28)
+
+        if not ok:
+            print("  ERROR: dit_forward_nblocks failed", flush=True)
+            v_b = torch.zeros(2, 16, 1, int(x.shape[-2]), int(x.shape[-1]),
+                              dtype=DTYPE, device=DEV)
+        else:
+            # ── PyTorch: final_layer + unpatchify ──
+            x_out = torch.from_numpy(out_flat.view(np.float16)).to(DEV).to(DTYPE)
+            x_out = x_out.reshape(B, T, H_img, W_img, D)
+            x_out = dit.final_layer(x_out, t_emb_pt, adaln_lora_B_T_3D=adaln_lora)
+            v_b = dit.unpatchify(x_out)
+            v_b = v_b[:, :, :1, :x.shape[-2], :x.shape[-1]]
+
     dit_time = time.time() - t0
-
-    # C++ diag: run 28 pre-recorded blocks in parallel (skip-attn, values discarded)
-    MS_val = 2 * 256  # M * S = 512
-    x_flat = np.zeros(MS_val * D, dtype=np.uint16)
-    _lib_vk.dit_forward_nblocks(x_flat.ctypes.data_as(ctypes.c_void_p),
-        None, x_flat.ctypes.data_as(ctypes.c_void_p),
-        x_flat.ctypes.data_as(ctypes.c_void_p),
-        MS_val, D, 2, 512, 1024, 28)
-
-    # Restore blocks for next step
-    for blk in dit.blocks:
-        blk.use_adaln_lora = True
-
-    # Reset descriptor pool between steps
     _lib_vk.dit_reset_step_pool()
 
     v_cond = v_b[0:1].float()
     v_uncond = v_b[1:2].float()
     v_cfg = v_uncond + CFG * (v_cond - v_uncond)
     x = (x.float() + v_cfg.squeeze(2) * (sigma_next - sigma)).to(DTYPE)
-    print(f"  step {i+1}/{STEPS}: dit={dit_time:.0f}s adaln={adaln_time:.0f}s "
-          f"VK={vk_ops._VK_TIME:.0f}s CPU={vk_ops._CPU_TIME:.0f}s (total {time.time()-t_start:.0f}s)")
+    print(f"  step {i+1}/{STEPS}: dit={dit_time:.0f}s (total {time.time()-t_start:.0f}s)")
 
 # Diagnostic
 print(f"VkGEMM: {vk_ops._VK_COUNT} Vulkan calls, {vk_ops._CPU_COUNT} CPU calls")
