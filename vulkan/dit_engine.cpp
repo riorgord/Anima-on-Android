@@ -346,6 +346,7 @@ static bool load_adaln_weights(VulkanCtx& ctx, const char* path,
     // First pass: find all adaln-related tensors
     std::vector<size_t> offsets, sizes;
     std::vector<std::string> names;
+    std::vector<uint32_t> sh0, sh1;  // saved dims
     size_t total = 0;
     for (uint32_t i = 0; i < N; i++) {
         uint16_t nl; fread(&nl, sizeof(nl), 1, f);
@@ -363,6 +364,8 @@ static bool load_adaln_weights(VulkanCtx& ctx, const char* path,
             offsets.push_back(ftell(f));  // data starts here
             sizes.push_back(elems * 2);
             names.push_back(name);
+            sh0.push_back(sh[0]);
+            sh1.push_back(sh[1]);
             total += elems * 2;
         }
         fseek(f, (long)(elems * 2), SEEK_CUR);
@@ -381,6 +384,8 @@ static bool load_adaln_weights(VulkanCtx& ctx, const char* path,
         w.name = names[j];
         w.size = sizes[j];
         w.ndim = 2;
+        w.dims[0] = sh0[j];
+        w.dims[1] = sh1[j];
         if (!create_buffer(ctx, sizes[j], usage, w.buf)) {
             LOGE("Failed buffer for %s", names[j].c_str());
             delete[] buf; fclose(f); return false;
@@ -817,6 +822,84 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
     if (!dit_record_all_adaln_blocks()) {
         LOGE("Failed to pre-record AdaLN blocks");
         return false;
+    }
+
+    // ── Step 1: GEMM smoke test ──
+    // Verify gemm_fp16 pipeline (already loaded by create_adaln_pipelines)
+    // can dispatch without breaking subsequent attention calls.
+    {
+        const char* test_w = "blocks.0.adaln_modulation_self_attn.1.weight";
+        auto w_it = g_weights.find(test_w);
+        if (w_it == g_weights.end()) {
+            LOGE("GEMM smoke: weight '%s' not found", test_w);
+            return false;
+        }
+        uint32_t test_N = w_it->second.dims[0];  // 256
+        uint32_t test_K = w_it->second.dims[1];  // 2048
+        uint32_t test_M = 1;
+
+        VkCommandBufferBeginInfo bi = {};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        if (vkBeginCommandBuffer(g_lnCmdBuf, &bi) != VK_SUCCESS) {
+            LOGE("GEMM smoke: begin cmdBuf failed"); return false;
+        }
+
+        VkDescriptorSetAllocateInfo dsInfo = {};
+        dsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dsInfo.descriptorPool = g_vk.descPool;
+        dsInfo.descriptorSetCount = 1;
+        dsInfo.pSetLayouts = &g_vk.gemm.dsl;
+        VkDescriptorSet ds;
+        if (vkAllocateDescriptorSets(g_vk.device, &dsInfo, &ds) != VK_SUCCESS) {
+            LOGE("GEMM smoke: alloc ds failed"); return false;
+        }
+
+        VkDeviceSize aBytes = test_M * test_K * 2;
+        VkDeviceSize cBytes = test_M * test_N * 2;
+        VkDescriptorBufferInfo bA = { g_onesBuf.buf, 0, aBytes };
+        VkDescriptorBufferInfo bW = { w_it->second.buf.buf, 0, w_it->second.buf.size };
+        VkDescriptorBufferInfo bC = { g_gemmDummy.buf, 0, cBytes };
+
+        VkWriteDescriptorSet w[3] = {};
+        for (int i = 0; i < 3; i++) {
+            w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[i].dstSet = ds; w[i].dstBinding = (uint32_t)i;
+            w[i].descriptorCount = 1;
+            w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        }
+        w[0].pBufferInfo = &bA; w[1].pBufferInfo = &bW; w[2].pBufferInfo = &bC;
+        vkUpdateDescriptorSets(g_vk.device, 3, w, 0, nullptr);
+
+        vkCmdBindPipeline(g_lnCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk.gemm.pipeline);
+        vkCmdBindDescriptorSets(g_lnCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk.gemm.layout, 0, 1, &ds, 0, nullptr);
+        PC_Gemm pc = { test_M, test_N, test_K, 1, 1.0f };
+        vkCmdPushConstants(g_lnCmdBuf, g_vk.gemm.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(g_lnCmdBuf, (test_N + 7) / 8, (test_M + 7) / 8, 1);
+
+        VkMemoryBarrier mb = {};
+        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(g_lnCmdBuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+
+        if (vkEndCommandBuffer(g_lnCmdBuf) != VK_SUCCESS) {
+            LOGE("GEMM smoke: end cmdBuf failed"); return false;
+        }
+
+        vkResetFences(g_vk.device, 1, &g_vk.stepFence);
+        VkSubmitInfo submit = {};
+        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &g_lnCmdBuf;
+        if (vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.stepFence) != VK_SUCCESS) {
+            LOGE("GEMM smoke: submit failed"); return false;
+        }
+        vkWaitForFences(g_vk.device, 1, &g_vk.stepFence, VK_TRUE, UINT64_MAX);
+
+        uint16_t r0 = ((uint16_t*)g_gemmDummy.mapped)[0];
+        LOGI("GEMM smoke test PASS — M=%u N=%u K=%u  result[0]=0x%04x",
+             test_M, test_N, test_K, r0);
     }
 
     g_init = true;
