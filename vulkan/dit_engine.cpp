@@ -398,6 +398,68 @@ static bool load_adaln_weights(VulkanCtx& ctx, const char* path,
     return true;
 }
 
+static bool load_block0_weights(VulkanCtx& ctx, const char* path,
+                                 std::unordered_map<std::string, WeightInfo>& weights) {
+    // Load block 0 GEMM/norm weights only (adaln weights already loaded).
+    FILE* f = fopen(path, "rb");
+    if (!f) { LOGE("Cannot open %s", path); return false; }
+
+    uint32_t N;
+    if (fread(&N, sizeof(N), 1, f) != 1) { fclose(f); return false; }
+
+    std::vector<size_t> offsets;
+    std::vector<std::string> names;
+    std::vector<uint32_t> sh0, sh1;
+    size_t total = 0;
+
+    for (uint32_t i = 0; i < N; i++) {
+        uint16_t nl; fread(&nl, sizeof(nl), 1, f);
+        char* tmp = (char*)alloca(nl+1);
+        fread(tmp, 1, nl, f); tmp[nl] = 0;
+        std::string name(tmp, nl);
+        uint8_t nd; fread(&nd, 1, 1, f);
+        uint32_t sh[4] = {1,1,1,1}; size_t elems = 1;
+        for (uint8_t d = 0; d < nd; d++) { fread(&sh[d], 4, 1, f); elems *= sh[d]; }
+
+        // Block 0 non-adaln GEMM/norm weights (adaln already loaded)
+        bool want = (name.find("blocks.0.") == 0)
+                 && (name.find("adaln_modulation") == std::string::npos);
+        if (want) {
+            offsets.push_back(ftell(f));
+            names.push_back(name);
+            sh0.push_back(sh[0]);
+            sh1.push_back(sh[1]);
+            total += elems * 2;
+        }
+        fseek(f, (long)(elems * 2), SEEK_CUR);
+    }
+    LOGI("Block 0 weights: %u tensors (%.1f KB)", (uint32_t)names.size(), total/1e3);
+
+    VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    uint8_t* buf = new (std::nothrow) uint8_t[total];
+    if (!buf) { fclose(f); return false; }
+    size_t off = 0;
+    for (size_t j = 0; j < names.size(); j++) {
+        fseek(f, (long)offsets[j], SEEK_SET);
+        fread(buf + off, 1, (size_t)sh0[j] * sh1[j] * 2, f);
+        auto& w = weights[names[j]];
+        w.name = names[j];
+        w.size = (size_t)sh0[j] * sh1[j] * 2;
+        w.ndim = 2;
+        w.dims[0] = sh0[j];
+        w.dims[1] = sh1[j];
+        if (!create_buffer(ctx, w.size, usage, w.buf)) {
+            LOGE("Failed buffer for %s", names[j].c_str());
+            delete[] buf; fclose(f); return false;
+        }
+        memcpy(w.buf.mapped, buf + off, w.size);
+        off += w.size;
+    }
+    delete[] buf; fclose(f);
+    LOGI("Block 0 weights loaded: %u tensors (%.1f MB)", (uint32_t)names.size(), total/1e6);
+    return true;
+}
+
 static bool create_adaln_pipelines(VulkanCtx& ctx, const char* spv_dir) {
     char p[256];
     #define CP(name, bindings, pushSize) \
@@ -711,6 +773,7 @@ bool dit_init(const char* weight_path, const char* spv_dir) {
 
 // Forward declaration for pre-recording AdaLN blocks
 static bool record_adaln_block(int blockIdx, int cmdIdx);
+static void record_one_block(RC& rc, int b, Buffer& inBuf, Buffer& outBuf);
 bool dit_record_all_adaln_blocks(void);
 
 // Lightweight init: AdaLN weights only (~340KB), no GEMM/attention weights.
@@ -747,6 +810,9 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
     if (weight_path && weight_path[0]) {
         if (!load_adaln_weights(g_vk, weight_path, g_weights)) {
             LOGE("AdaLN weight loading failed"); return false;
+        }
+        if (!load_block0_weights(g_vk, weight_path, g_weights)) {
+            LOGE("Block 0 weight loading failed"); return false;
         }
     }
 
@@ -800,6 +866,13 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
     if (!create_buffer(g_vk, bSz, u, g_outBuf)) return false;
     if (!create_buffer(g_vk, M * Nctx * CtxD * 2, u, g_ctxBuf)) return false;
 
+    // Missing buffers for record_one_block (step 2a)
+    if (!create_buffer(g_vk, bSz, u, g_nBuf)) return false;
+    if (!create_buffer(g_vk, bSz, u, g_gBuf)) return false;
+    if (!create_buffer(g_vk, bSz, u, g_tO)) return false;
+    size_t rSz = M * Nctx * D * 2;  // cross-attn V [1024,2048] fp16 = 4MB
+    if (!create_buffer(g_vk, rSz, u, g_rBuf)) return false;
+
     // Allocate dedicated LN command buffer (avoid overwriting AdaLN cmd[i])
     VkCommandBufferAllocateInfo lnCbInfo = {};
     lnCbInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -816,7 +889,7 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
     }
     memset(g_gemmDummy.mapped, 0, 32 * 1024 * 1024);
 
-    LOGI("dit_init_adaln_only OK — %u buffers", 16);
+    LOGI("dit_init_adaln_only OK — %u buffers", 20);
 
     // Pre-record all 28 AdaLN blocks (avoids per-step recording / pool exhaustion)
     if (!dit_record_all_adaln_blocks()) {
@@ -900,6 +973,30 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
         uint16_t r0 = ((uint16_t*)g_gemmDummy.mapped)[0];
         LOGI("GEMM smoke test PASS — M=%u N=%u K=%u  result[0]=0x%04x",
              test_M, test_N, test_K, r0);
+    }
+
+    // ── Step 2a: re-record block 0 with full GEMM+attention+MLP chain ──
+    // Overwrites cmd[0] (currently AdaLN-only) with 63-dispatch full block.
+    {
+        LOGI("Step 2a: recording full block 0...");
+        VkCommandBufferBeginInfo bi = {};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        if (vkBeginCommandBuffer(g_vk.cmd[0], &bi) != VK_SUCCESS) {
+            LOGE("Step 2a: begin cmd[0] failed"); return false;
+        }
+        RC rc; memset(&rc, 0, sizeof(rc));
+        rc.vk = &g_vk; rc.cmd = g_vk.cmd[0]; rc.weights = &g_weights;
+        rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
+        rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
+        rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf;
+        rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
+
+        record_one_block(rc, 0, *rc.xBuf, *rc.outBuf);
+
+        if (vkEndCommandBuffer(g_vk.cmd[0]) != VK_SUCCESS) {
+            LOGE("Step 2a: end cmd[0] failed"); return false;
+        }
+        LOGI("Step 2a: block 0 full recording OK (63 dispatches)");
     }
 
     g_init = true;
