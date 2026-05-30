@@ -893,6 +893,15 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
     }
     LOGI("All 28 full blocks pre-recorded (28×63 dispatches)");
 
+    // Init empty cmd_attn + cmd_post for all 28 blocks (valid no-op to submit)
+    for (int i = 0; i < 28; i++) {
+        VkCommandBufferBeginInfo bi = {};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        vkBeginCommandBuffer(g_vk.cmd_attn[i], &bi);
+        vkEndCommandBuffer(g_vk.cmd_attn[i]);
+    }
+    LOGI("cmd_attn[0..27] initialized as empty no-ops");
+
     // ── Step 1: GEMM smoke test ──
     // Verify gemm_fp16 pipeline (already loaded by create_adaln_pipelines)
     // can dispatch without breaking subsequent attention calls.
@@ -1834,6 +1843,15 @@ bool dit_forward_nblocks(void* x_data, void* t_emb_data, void* ctx_data, void* o
             LOGE("Submit failed at block %d", i); return false;
         }
         vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+
+        // Submit attention cmd buffer (no-op for now)
+        vkResetFences(g_vk.device, 1, &g_vk.fence);
+        submit.pCommandBuffers = &g_vk.cmd_attn[i];
+        if (vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.fence) != VK_SUCCESS) {
+            LOGE("Submit attn[%d] failed", i); return false;
+        }
+        vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+
         // Diagnostic: scan block output for NaN/Inf
         uint16_t* out = (uint16_t*)g_outBuf.mapped;
         float fmin = 1e30f, fmax = -1e30f;
