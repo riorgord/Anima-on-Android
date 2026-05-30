@@ -426,6 +426,8 @@ static Buffer g_geluInBuf;  // FP16 GELU input (M=512,D=8192 → 8.4MB)
 static Buffer g_geluOutBuf; // FP16 GELU output
 // Attention FP16 buffers — allocated at init, sized for cross-attn worst case
 static Buffer g_attnQ, g_attnK, g_attnV, g_attnA, g_attnO;
+// Dummy GEMM buffer — step 0 of single-instance merge test
+static Buffer g_gemmDummy;
 
 struct RC {
     VulkanCtx* vk;
@@ -803,7 +805,13 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
         LOGE("LN cmd buffer alloc failed"); return false;
     }
 
-    LOGI("dit_init_adaln_only OK — %u buffers", 15);
+    // ── Step 0: allocate 32MB dummy buffer (single-instance merge test) ──
+    if (!create_buffer(g_vk, 32 * 1024 * 1024, u, g_gemmDummy)) {
+        LOGE("gemmDummy alloc failed"); return false;
+    }
+    memset(g_gemmDummy.mapped, 0, 32 * 1024 * 1024);
+
+    LOGI("dit_init_adaln_only OK — %u buffers", 16);
 
     // Pre-record all 28 AdaLN blocks (avoids per-step recording / pool exhaustion)
     if (!dit_record_all_adaln_blocks()) {
@@ -2098,6 +2106,7 @@ void dit_destroy() {
     free_buf(g_lnInBuf); free_buf(g_lnOutBuf);
     free_buf(g_geluInBuf); free_buf(g_geluOutBuf);
     free_buf(g_attnQ); free_buf(g_attnK); free_buf(g_attnV); free_buf(g_attnA); free_buf(g_attnO);
+    free_buf(g_gemmDummy);
     free_buf(g_rmsInBuf); free_buf(g_rmsOutBuf); free_buf(g_rmsWgtBuf);
 
     if (g_vk.device) vkDestroyDevice(g_vk.device, nullptr);
