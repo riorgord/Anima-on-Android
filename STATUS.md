@@ -1,4 +1,4 @@
-# Anima 项目状态摘要 (2026-05-30 更新)
+# Anima 项目状态摘要 (2026-05-31 更新)
 
 ## 我们在做什么
 在 Snapdragon 8+ Gen1 手机上运行 Anima 动漫风格图像生成模型 (2B DiT)。
@@ -246,19 +246,31 @@ Adreno 730 的单次 `vkQueueSubmit` 执行时间有看门狗超时。超时 →
 - VAE decode（暂留 PyTorch）
 - 端到端 phone_pipeline 出正图
 
-### 下步路线 (2026-05-30 晚间)
+### 下步路线 (2026-05-31 凌晨)
 
-**短期（今晚）**：912MHz merge 方案 → phone_pipeline.py 出正图。
-- batch_q=256 的 73 dispatch/cmd，28 submit/步
-- 用 `dit_record_blocks_with_attn` 重录 cmd[i] + `dit_forward_merged` 只 submit cmd
+**per-step recording 架构已落地**（`dit_forward_step`，140 submit/步，5 段/block），管线能跑到出图但图片是雪花。
 
-**中期（正确方向）**：per-step recording in C++ forward。
-- 不做 pre-record——C++ 内部小批量录→submit→wait→循环
-- 单次 submit <500ms，不碰 TDR
-- Python 只调一次 `dit_forward_step()`
-- 所有频率下稳定运行
+cross-attn 的 Q_proj + Q_norm 权重 bug 已修，但 **attention 计算（QK^T/softmax/AV shader）疑似有数值问题**，C++ 输出值域 -47328~+23616（fp16 极限），28 层累积后偏差爆炸。
 
-**validation layer**：arm64-v8a 预编译 .so 已下载但 Android loader 不搜 /data/local/tmp。搁置。
+**🔴 最高优先：PC PyTorch vs C++ 逐 block 精度对比**
+- 手机导出同一组输入 → PC 用同一份 FP16 权重跑 PyTorch forward → 逐 block 对比
+- PC 端用 cos=1/sin=0 零频 RoPE 对齐 C++ 的 no-RoPE 行为
+- 从第一个偏差 block drill down 到具体 shader
+
+**⚠️ TDR 限制：管线在不锁频时不稳定**
+- 515MHz 底频下每段超 2s 触发 DEVICE_LOST，只能锁 912MHz 超频才能跑通 3 步
+- 长期必须靠 per-step recording 的细粒度拆分（降低每段 dispatch 数）在所有频率下稳定
+- 当前 5 段/block 的粒度假定 912MHz，低频下可能要拆到 8-10 段/block
+
+**已修 Bug**:
+1. cross-attn Q_proj 权重（self→cross）✅
+2. cross-attn Q_norm 权重（self→cross）✅
+3. batch_q=128（2048 WG，避免 shared-memory 压力）✅
+
+**代码状态**:
+- `dit_engine.cpp`: per-step + pre-record 双架构共存
+- `phone_pipeline.py`: 改用 `dit_forward_step`（mode=0 full attention）
+- `dit_forward_nblocks` 仍可用（pre-record skip-attn，21s/步，出黑图但可验证管线流程）
 
 ### 关键技术发现 (2026-05-30 晚间更新)
 

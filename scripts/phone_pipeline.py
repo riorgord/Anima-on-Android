@@ -29,10 +29,12 @@ _lib_vk.dit_reset_step_pool.argtypes = []
 _lib_vk.dit_reset_step_pool.restype = ctypes.c_bool
 _lib_vk.dit_adaln_one_block.argtypes = [ctypes.c_int, ctypes.c_void_p]
 _lib_vk.dit_adaln_one_block.restype = ctypes.c_bool
-_lib_vk.dit_forward_nblocks.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-                                         ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                                         ctypes.c_int]
-_lib_vk.dit_forward_nblocks.restype = ctypes.c_bool
+_lib_vk.dit_set_skip_attn_precord.argtypes = []
+_lib_vk.dit_set_skip_attn_precord.restype = None
+_lib_vk.dit_forward_step.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                                       ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                       ctypes.c_int]
+_lib_vk.dit_forward_step.restype = ctypes.c_bool
 _lib_vk.dit_destroy.argtypes = []
 _lib_vk.dit_destroy.restype = None
 
@@ -59,8 +61,9 @@ del dit_sd; gc.collect()
 print(f"DiT loaded (small weights, {len(dit.blocks)} blocks)")
 
 # ── Init C++ AdaLN engine ──
-print("Init C++ AdaLN engine...")
+print("Init C++ engine...")
 t0 = time.time()
+_lib_vk.dit_set_skip_attn_precord()  # skip pre-recorded attn, use per-step
 ok = _lib_vk.dit_init_adaln_only(b"/data/local/tmp/diffusion_weights.bin", b"/data/local/tmp")
 print(f"  C++ AdaLN init: {ok} ({time.time()-t0:.0f}s)")
 if not ok:
@@ -104,20 +107,20 @@ for i in range(STEPS):
         t_emb_pt, adaln_lora = dit.t_embedder[1](t_raw)
         t_emb_pt = dit.t_embedding_norm(t_emb_pt)
 
-        # ── C++: 28-block forward (skip-attn) ──
+        # ── C++: 28-block forward (per-step recording, real self+cross attention) ──
         x_flat = x_emb.float().reshape(MS_val, D).contiguous().cpu().numpy().view(np.uint16)
         ctx_flat = ctx_b.reshape(2 * 512, 1024).contiguous().cpu().numpy().view(np.uint16)
         out_flat = np.zeros(MS_val * D, dtype=np.uint16)
 
-        ok = _lib_vk.dit_forward_nblocks(
+        ok = _lib_vk.dit_forward_step(
             x_flat.ctypes.data_as(ctypes.c_void_p),
             None,  # t_emb already in GPU via dit_compute_timestep
             ctx_flat.ctypes.data_as(ctypes.c_void_p),
             out_flat.ctypes.data_as(ctypes.c_void_p),
-            MS_val, D, 2, 512, 1024, 28)
+            MS_val, D, 2, 512, 1024, 0)  # mode=0 full attention
 
         if not ok:
-            print("  ERROR: dit_forward_nblocks failed", flush=True)
+            print("  ERROR: dit_forward_step failed", flush=True)
             v_b = torch.zeros(2, 16, 1, int(x.shape[-2]), int(x.shape[-1]),
                               dtype=DTYPE, device=DEV)
         else:
@@ -129,7 +132,6 @@ for i in range(STEPS):
             v_b = v_b[:, :, :1, :x.shape[-2], :x.shape[-1]]
 
     dit_time = time.time() - t0
-    _lib_vk.dit_reset_step_pool()
 
     v_cond = v_b[0:1].float()
     v_uncond = v_b[1:2].float()

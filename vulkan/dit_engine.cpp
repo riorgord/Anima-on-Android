@@ -714,9 +714,9 @@ struct RC {
     // Self-attn: M_kv=S, Cross-attn: M_kv=Nctx.
     void record_attn_3pass(Buffer& Q, Buffer& K, Buffer& V, Buffer& A, Buffer& O,
                             uint32_t M_q, uint32_t M_kv, uint32_t H, uint32_t D, float scale) {
-        // Batch Q rows: aim for ~4096 WG per dispatch (batch_q * H WG)
-        // H=16 → batch_q=256 for 4096 WG. Fall back to 128 if M_q < 256.
-        uint32_t batch_q = 256;
+        // Batch Q rows: aim for ~2048 WG per dispatch (batch_q * H WG)
+        // H=16 → batch_q=128 for 2048 WG. Safe for Adreno shared-memory reduction.
+        uint32_t batch_q = 128;
         if (batch_q > M_q) batch_q = M_q;
         uint32_t n_batches = (M_q + batch_q - 1) / batch_q;
         size_t qPerBatch = batch_q * H * D * 2;
@@ -840,6 +840,14 @@ bool dit_init(const char* weight_path, const char* spv_dir) {
 static bool record_adaln_block(int blockIdx, int cmdIdx);
 static void record_one_block(RC& rc, int b, Buffer& inBuf, Buffer& outBuf,
                               bool real_attn = false);
+static bool submit_segment(void);
+static void begin_step_recording(RC& rc);
+static void end_step_recording(void);
+static void record_segment_adaln(RC& rc, int b);
+static void record_segment_self_attn(RC& rc, int b, Buffer& inBuf);
+static void record_segment_cross_pre(RC& rc, int b);
+static void record_segment_cross_attn(RC& rc, int b);
+static void record_segment_mlp(RC& rc, int b);
 bool dit_record_all_adaln_blocks(void);
 
 // Lightweight init: AdaLN weights only (~340KB), no GEMM/attention weights.
@@ -2029,6 +2037,157 @@ static void record_one_block(RC& rc, int b, Buffer& inBuf, Buffer& outBuf,
                             outBuf, MS*D,1,1);
 }
 
+// ============================================================
+// Per-step recording helpers (g_lnCmdBuf + stepPool, no pre-record)
+// ============================================================
+
+// Submit g_lnCmdBuf and wait. Returns true on success.
+static bool submit_segment(void) {
+    vkResetFences(g_vk.device, 1, &g_vk.stepFence);
+    VkSubmitInfo si = {};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &g_lnCmdBuf;
+    VkResult sr = vkQueueSubmit(g_vk.queue, 1, &si, g_vk.stepFence);
+    if (sr != VK_SUCCESS) {
+        LOGE("submit_segment: vkQueueSubmit failed (VkResult=%d)", (int)sr);
+        return false;
+    }
+    vkWaitForFences(g_vk.device, 1, &g_vk.stepFence, VK_TRUE, UINT64_MAX);
+    return true;
+}
+
+static VkDescriptorPool g_savedPool = VK_NULL_HANDLE;
+
+// Begin recording into g_lnCmdBuf using stepPool.
+static void begin_step_recording(RC& rc) {
+    vkResetDescriptorPool(g_vk.device, g_vk.stepPool, 0);
+    g_savedPool = g_vk.descPool;       // save
+    g_vk.descPool = g_vk.stepPool;      // swap → RC::alloc_set uses stepPool
+    VkCommandBufferBeginInfo bi = {};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    vkBeginCommandBuffer(g_lnCmdBuf, &bi);
+    rc.cmd = g_lnCmdBuf;
+}
+
+// End recording and restore descPool.
+static void end_step_recording(void) {
+    vkEndCommandBuffer(g_lnCmdBuf);
+    g_vk.descPool = g_savedPool;       // restore
+}
+
+// ── Segment A: AdaLN for all 3 channels → bcBuf[0..8] (36 dispatch) ──
+static void record_segment_adaln(RC& rc, int b) {
+    char adaln_s0[128],adaln_s2[128],adaln_c0[128],adaln_c2[128],adaln_m0[128],adaln_m2[128];
+    snprintf(adaln_s0,sizeof(adaln_s0),"blocks.%d.adaln_modulation_self_attn.1.weight",b);
+    snprintf(adaln_s2,sizeof(adaln_s2),"blocks.%d.adaln_modulation_self_attn.2.weight",b);
+    snprintf(adaln_c0,sizeof(adaln_c0),"blocks.%d.adaln_modulation_cross_attn.1.weight",b);
+    snprintf(adaln_c2,sizeof(adaln_c2),"blocks.%d.adaln_modulation_cross_attn.2.weight",b);
+    snprintf(adaln_m0,sizeof(adaln_m0),"blocks.%d.adaln_modulation_mlp.1.weight",b);
+    snprintf(adaln_m2,sizeof(adaln_m2),"blocks.%d.adaln_modulation_mlp.2.weight",b);
+
+    begin_step_recording(rc);
+    rc.adaln_gpu(adaln_s0, adaln_s2, 0);  // self  → bcBuf[0,1,2]
+    rc.adaln_gpu(adaln_c0, adaln_c2, 3);  // cross → bcBuf[3,4,5]
+    rc.adaln_gpu(adaln_m0, adaln_m2, 6);  // mlp   → bcBuf[6,7,8]
+    end_step_recording();
+}
+
+// ── Segment B: Self-attn full (LN→AdaLN→QKV→norms→attn→O_proj→gate, ~21 dispatch) ──
+// inBuf: block input (x for block 0, prev output for later blocks)
+// Result: tV = inBuf + gate_self * self_attn_out
+static void record_segment_self_attn(RC& rc, int b, Buffer& inBuf) {
+    auto off=[&](int c)->size_t{return (size_t)c*MS*D*2;};
+    uint32_t ph=MS*N_HEADS;
+    float scl=1.0f/sqrtf((float)HEAD_DIM);
+
+    char qw[128],kw[128],vw[128],ow[128],qnw[128],knw[128];
+    snprintf(qw,sizeof(qw),"blocks.%d.self_attn.q_proj.weight",b);
+    snprintf(kw,sizeof(kw),"blocks.%d.self_attn.k_proj.weight",b);
+    snprintf(vw,sizeof(vw),"blocks.%d.self_attn.v_proj.weight",b);
+    snprintf(ow,sizeof(ow),"blocks.%d.self_attn.output_proj.weight",b);
+    snprintf(qnw,sizeof(qnw),"blocks.%d.self_attn.q_norm.weight",b);
+    snprintf(knw,sizeof(knw),"blocks.%d.self_attn.k_norm.weight",b);
+
+    begin_step_recording(rc);
+    rc.dispatch_layernorm(inBuf, *rc.nBuf, MS, D, 1e-6f);
+    rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,off(0),*rc.bcBuf,off(1),*rc.nBuf,MS*D,1,1);
+    rc.dispatch_gemm(*rc.nBuf,qw,MS,D,D,*rc.tQ);
+    rc.dispatch_gemm(*rc.nBuf,kw,MS,D,D,*rc.tK);
+    rc.dispatch_gemm(*rc.nBuf,vw,MS,D,D,*rc.tV);
+    rc.dispatch_rmsnorm(*rc.tQ,qnw,*rc.tQ,ph,HEAD_DIM,1e-6f);
+    rc.dispatch_rmsnorm(*rc.tK,knw,*rc.tK,ph,HEAD_DIM,1e-6f);
+
+    // Real self-attention: QK^T + softmax + AV
+    rc.record_attn_3pass(*rc.tQ,*rc.tK,*rc.tV,g_attnA,g_attnO,
+                         MS,MS,N_HEADS,HEAD_DIM,scl);
+    rc.dispatch_gemm(g_attnO,ow,MS,D,D,*rc.tO);
+    rc.dispatch_scale_shift(*rc.tO,*rc.bcBuf,off(2),inBuf,0,
+                            *rc.tV,MS*D,1,1);  // tV = inBuf + gate * attn_out
+    end_step_recording();
+}
+
+// ── Segment C1: Cross-attn pre (LN→AdaLN→Q/K/V→norms, 8 dispatch) ──
+static void record_segment_cross_pre(RC& rc, int b) {
+    auto off=[&](int c)->size_t{return (size_t)c*MS*D*2;};
+    uint32_t ph=MS*N_HEADS, ph_cross=M*Nctx*N_HEADS, MS_kv=M*Nctx;
+
+    char cx_qw[128],cx_kw[128],cx_vw[128],cx_knw[128],cx_qnw[128];
+    snprintf(cx_qw,sizeof(cx_qw),"blocks.%d.cross_attn.q_proj.weight",b);
+    snprintf(cx_knw,sizeof(cx_knw),"blocks.%d.cross_attn.k_norm.weight",b);
+    snprintf(cx_qnw,sizeof(cx_qnw),"blocks.%d.cross_attn.q_norm.weight",b);
+    snprintf(cx_kw,sizeof(cx_kw),"blocks.%d.cross_attn.k_proj.weight",b);
+    snprintf(cx_vw,sizeof(cx_vw),"blocks.%d.cross_attn.v_proj.weight",b);
+
+    begin_step_recording(rc);
+    rc.dispatch_layernorm(*rc.tV,*rc.nBuf,MS,D,1e-6f);
+    rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,off(3),*rc.bcBuf,off(4),*rc.nBuf,MS*D,1,1);
+    rc.dispatch_gemm(*rc.nBuf,cx_qw,MS,D,D,*rc.tQ);
+    rc.dispatch_gemm(*rc.ctxBuf,cx_kw,MS_kv,D,CtxD,*rc.t1);
+    rc.dispatch_gemm(*rc.ctxBuf,cx_vw,MS_kv,D,CtxD,*rc.rBuf);
+    rc.dispatch_rmsnorm(*rc.tQ,cx_qnw,*rc.tQ,ph,HEAD_DIM,1e-6f);
+    rc.dispatch_rmsnorm(*rc.t1,cx_knw,*rc.t1,ph_cross,HEAD_DIM,1e-6f);
+    end_step_recording();
+}
+
+// ── Segment C2: Cross-attn attention + O_proj + gate (~14 dispatch) ──
+static void record_segment_cross_attn(RC& rc, int b) {
+    auto off=[&](int c)->size_t{return (size_t)c*MS*D*2;};
+    uint32_t MS_kv=M*Nctx;
+    float scl=1.0f/sqrtf((float)HEAD_DIM);
+
+    char cx_ow[128];
+    snprintf(cx_ow,sizeof(cx_ow),"blocks.%d.cross_attn.output_proj.weight",b);
+
+    begin_step_recording(rc);
+    rc.record_attn_3pass(*rc.tQ,*rc.t1,*rc.rBuf,g_attnA,g_attnO,
+                         MS,MS_kv,N_HEADS,HEAD_DIM,scl);
+    rc.dispatch_gemm(g_attnO,cx_ow,MS,D,D,*rc.tO);
+    rc.dispatch_scale_shift(*rc.tO,*rc.bcBuf,off(5),*rc.tV,0,
+                            *rc.gBuf,MS*D,1,1);  // gBuf = tV + gate * attn_out
+    end_step_recording();
+}
+
+// ── Segment D: MLP (LN→AdaLN→fc1→SiLU→fc2→gate, 6 dispatch) ──
+// gBuf: cross-attn residual (input to MLP LN)
+// Result: outBuf = gBuf + gate_mlp * fc2_out
+static void record_segment_mlp(RC& rc, int b) {
+    auto off=[&](int c)->size_t{return (size_t)c*MS*D*2;};
+    char l1w[128],l2w[128];
+    snprintf(l1w,sizeof(l1w),"blocks.%d.mlp.layer1.weight",b);
+    snprintf(l2w,sizeof(l2w),"blocks.%d.mlp.layer2.weight",b);
+
+    begin_step_recording(rc);
+    rc.dispatch_layernorm(*rc.gBuf,*rc.nBuf,MS,D,1e-6f);
+    rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,off(6),*rc.bcBuf,off(7),*rc.nBuf,MS*D,1,1);
+    rc.dispatch_gemm(*rc.nBuf,l1w,MS,MLP_HIDDEN,D,*rc.t1);
+    rc.dispatch_silu(*rc.t1,*rc.t1,MS*MLP_HIDDEN);
+    rc.dispatch_gemm(*rc.t1,l2w,MS,D,MLP_HIDDEN,*rc.nBuf);
+    rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,off(8),*rc.gBuf,0,
+                            *rc.outBuf,MS*D,1,1);
+    end_step_recording();
+}
+
 bool dit_record_n_blocks(int n) {
     if (!g_init || n < 1 || n > 28) return false;
     VkCommandBufferBeginInfo bi = {};
@@ -2172,6 +2331,77 @@ bool dit_forward_nblocks(void* x_data, void* t_emb_data, void* ctx_data, void* o
     }
 
     memcpy(out_data, g_outBuf.mapped, xBytes);
+    return true;
+}
+
+// ── Per-step recording forward: 28 blocks × 4 segments = 112 submit/step ──
+// Each segment recorded fresh into g_lnCmdBuf using stepPool.
+// TDR-safe at all GPU frequencies (each segment <1s even at 515MHz).
+// mode: 0=full, 1=skip all attn, 2=self only, 3=cross only
+bool dit_forward_step(void* x_data, void* t_emb_data, void* ctx_data, void* out_data,
+                       int _MS, int _D, int _M, int _Nctx, int _CtxD, int mode) {
+    if (!g_init) return false;
+    MS = (uint32_t)_MS; M = (uint32_t)_M; S = MS / M;
+    size_t xBytes = MS * D * 2;
+    size_t tBytes = M * D * 2;
+    size_t ctxBytes = M * (uint32_t)_Nctx * (uint32_t)_CtxD * 2;
+
+    // Upload inputs
+    memcpy(g_xBuf.mapped, x_data, xBytes);
+    if (t_emb_data) memcpy(g_tEmbBuf.mapped, t_emb_data, tBytes);
+    if (ctx_data) memcpy(g_ctxBuf.mapped, ctx_data, ctxBytes);
+
+    LOGI("Forward step start: MS=%u D=%u t_emb=%s ctx=%s",
+         MS, D, t_emb_data?"yes":"no", ctx_data?"yes":"no");
+
+    // Setup RC for per-step recording
+    RC rc; memset(&rc, 0, sizeof(rc));
+    rc.vk = &g_vk; rc.weights = &g_weights;
+    rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
+    rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
+    rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf;
+    rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
+
+    for (int b = 0; b < 28; b++) {
+        Buffer& inBuf = (b == 0) ? g_xBuf : g_xBuf;  // always xBuf (chained from prev block)
+
+        // Segment A: AdaLN (36 dispatch)
+        record_segment_adaln(rc, b);
+        if (!submit_segment()) { LOGE("SegA[%d] submit failed", b); return false; }
+
+        if (mode == 0 || mode == 2) {  // full or self-only
+            record_segment_self_attn(rc, b, inBuf);
+            if (!submit_segment()) { LOGE("SegB[%d] submit failed", b); return false; }
+        }
+        if (mode == 0 || mode == 3) {  // full or cross-only
+            record_segment_cross_pre(rc, b);
+            if (!submit_segment()) { LOGE("SegC1[%d] submit failed", b); return false; }
+            record_segment_cross_attn(rc, b);
+            if (!submit_segment()) { LOGE("SegC2[%d] submit failed", b); return false; }
+        }
+
+        // Segment D: MLP (6 dispatch)
+        record_segment_mlp(rc, b);
+        if (!submit_segment()) { LOGE("SegD[%d] submit failed", b); return false; }
+
+        // Chain: copy output to input buffer for next block
+        memcpy(g_xBuf.mapped, g_outBuf.mapped, xBytes);
+
+        // Diagnostic
+        uint16_t* out = (uint16_t*)g_outBuf.mapped;
+        int nan_cnt = 0;
+        for (uint32_t j = 0; j < MS * D; j++) {
+            uint16_t h = out[j];
+            if ((h & 0x7C00) == 0x7C00 && (h & 0x3FF)) nan_cnt++;
+        }
+        LOGI("Block %d/28 done, nan=%d", b, nan_cnt);
+    }
+
+    // Free all descriptor sets from this step
+    vkResetDescriptorPool(g_vk.device, g_vk.stepPool, 0);
+
+    memcpy(out_data, g_outBuf.mapped, xBytes);
+    LOGI("Forward step complete");
     return true;
 }
 
