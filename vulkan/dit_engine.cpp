@@ -968,16 +968,17 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
              test_M, test_N, test_K, r0);
     }
 
-    // ── Step 3b-ii: full 3-pass attention smoke test (QK^T→softmax→AV) ──
+    // ── Step 3b-iii: 8-batch 3-pass self-attention (real params) ──
     {
-        uint32_t test_Mq = 1, test_Mkv = 1, test_H = 1, test_D = 128;
+        uint32_t test_Mq = 512, test_Mkv = 512, test_H = 16, test_D = 128;
         float test_scale = 1.0f / sqrtf((float)test_D);  // 0.0884
-        size_t qBytes = test_Mq * test_H * test_D * 2;
-        size_t kBytes = test_Mkv * test_H * test_D * 2;
-        size_t aBytes = test_Mq * test_H * test_Mkv * 2;
-        size_t oBytes = test_Mq * test_H * test_D * 2;
+        uint32_t bq = 64;  // batch_q: 64 tokens per batch (64*16=1024 WG)
+        size_t qPerBatchBytes = bq * test_H * test_D * 2;    // 64*16*128*2 = 256KB
+        size_t aPerBatchBytes = bq * test_H * test_Mkv * 2;  // 64*16*512*2 = 1MB
+        size_t kvBytes = test_Mkv * test_H * test_D * 2;     // full K/V = 2MB
+        size_t qTotalBytes = test_Mq * test_H * test_D * 2;  // full Q = 2MB
 
-        // Fill Q, K, V with all 1.0 (fp16 0x3C00)
+        // Fill Q, K, V with all 1.0
         uint16_t* q = (uint16_t*)g_attnQ.mapped;
         uint16_t* k = (uint16_t*)g_attnK.mapped;
         uint16_t* v = (uint16_t*)g_attnV.mapped;
@@ -987,7 +988,7 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
         VkCommandBufferBeginInfo bi = {};
         bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         if (vkBeginCommandBuffer(g_lnCmdBuf, &bi) != VK_SUCCESS) {
-            LOGE("3-pass smoke: begin failed"); return false;
+            LOGE("3b-iii: begin failed"); return false;
         }
 
         VkDescriptorSetAllocateInfo dsInfo = {};
@@ -995,60 +996,68 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
         dsInfo.descriptorPool = g_vk.descPool;
         dsInfo.descriptorSetCount = 1;
 
-        // ── Pass 1: QK^T ──
-        VkDescriptorSet ds1;
-        dsInfo.pSetLayouts = &g_vk.attn_qkt.dsl;
-        vkAllocateDescriptorSets(g_vk.device, &dsInfo, &ds1);
-        {
-            VkDescriptorBufferInfo bQ = { g_attnQ.buf, 0, qBytes };
-            VkDescriptorBufferInfo bK = { g_attnK.buf, 0, kBytes };
-            VkDescriptorBufferInfo bA = { g_attnA.buf, 0, aBytes };
-            VkWriteDescriptorSet w[3] = {};
-            for (int i=0;i<3;i++){w[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;w[i].dstSet=ds1;w[i].dstBinding=(uint32_t)i;w[i].descriptorCount=1;w[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;}
-            w[0].pBufferInfo=&bQ; w[1].pBufferInfo=&bK; w[2].pBufferInfo=&bA;
-            vkUpdateDescriptorSets(g_vk.device,3,w,0,nullptr);
+        for (uint32_t batch = 0; batch < 8; batch++) {
+            uint32_t qOff = batch * bq;
+            VkDeviceSize qByteOff = (VkDeviceSize)batch * qPerBatchBytes;
+            VkDeviceSize aByteOff = (VkDeviceSize)batch * aPerBatchBytes;
+
+            // ── Pass 1: QK^T (this batch's Q × full K) ──
+            VkDescriptorSet ds1;
+            dsInfo.pSetLayouts = &g_vk.attn_qkt.dsl;
+            vkAllocateDescriptorSets(g_vk.device, &dsInfo, &ds1);
+            {
+                VkDescriptorBufferInfo bQ = { g_attnQ.buf, qByteOff, qPerBatchBytes };
+                VkDescriptorBufferInfo bK = { g_attnK.buf, 0, kvBytes };
+                VkDescriptorBufferInfo bA = { g_attnA.buf, aByteOff, aPerBatchBytes };
+                VkWriteDescriptorSet w[3] = {};
+                for (int i=0;i<3;i++){w[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;w[i].dstSet=ds1;w[i].dstBinding=(uint32_t)i;w[i].descriptorCount=1;w[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;}
+                w[0].pBufferInfo=&bQ; w[1].pBufferInfo=&bK; w[2].pBufferInfo=&bA;
+                vkUpdateDescriptorSets(g_vk.device,3,w,0,nullptr);
+            }
+            vkCmdBindPipeline(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_qkt.pipeline);
+            vkCmdBindDescriptorSets(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_qkt.layout,0,1,&ds1,0,nullptr);
+            PC_AttnQKT pc1={bq, test_Mkv, test_H, test_D, test_scale};
+            vkCmdPushConstants(g_lnCmdBuf,g_vk.attn_qkt.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pc1),&pc1);
+            vkCmdDispatch(g_lnCmdBuf, bq * test_H, 1, 1);
+            { VkMemoryBarrier mb={};mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;vkCmdPipelineBarrier(g_lnCmdBuf,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,nullptr,0,nullptr); }
+
+            // ── Pass 2: softmax in-place (this batch's A region) ──
+            VkDescriptorSet ds2;
+            dsInfo.pSetLayouts=&g_vk.attn_softmax.dsl;
+            vkAllocateDescriptorSets(g_vk.device,&dsInfo,&ds2);
+            { VkDescriptorBufferInfo bA={g_attnA.buf,aByteOff,aPerBatchBytes}; VkWriteDescriptorSet w={};w.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;w.dstSet=ds2;w.dstBinding=0;w.descriptorCount=1;w.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;w.pBufferInfo=&bA;vkUpdateDescriptorSets(g_vk.device,1,&w,0,nullptr); }
+            vkCmdBindPipeline(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_softmax.pipeline);
+            vkCmdBindDescriptorSets(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_softmax.layout,0,1,&ds2,0,nullptr);
+            PC_AttnSoftmax pc2={bq, test_Mkv, test_H};
+            vkCmdPushConstants(g_lnCmdBuf,g_vk.attn_softmax.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pc2),&pc2);
+            vkCmdDispatch(g_lnCmdBuf, bq * test_H, 1, 1);
+            { VkMemoryBarrier mb={};mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;vkCmdPipelineBarrier(g_lnCmdBuf,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,nullptr,0,nullptr); }
+
+            // ── Pass 3: AV (this batch's A × full V → this batch's O) ──
+            VkDescriptorSet ds3;
+            dsInfo.pSetLayouts=&g_vk.attn_out.dsl;
+            vkAllocateDescriptorSets(g_vk.device,&dsInfo,&ds3);
+            {
+                VkDescriptorBufferInfo bA={g_attnA.buf,aByteOff,aPerBatchBytes}, bV={g_attnV.buf,0,kvBytes}, bO={g_attnO.buf,qByteOff,qPerBatchBytes};
+                VkWriteDescriptorSet w[3]={};
+                for (int i=0;i<3;i++){w[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;w[i].dstSet=ds3;w[i].dstBinding=(uint32_t)i;w[i].descriptorCount=1;w[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;}
+                w[0].pBufferInfo=&bA;w[1].pBufferInfo=&bV;w[2].pBufferInfo=&bO;
+                vkUpdateDescriptorSets(g_vk.device,3,w,0,nullptr);
+            }
+            vkCmdBindPipeline(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_out.pipeline);
+            vkCmdBindDescriptorSets(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_out.layout,0,1,&ds3,0,nullptr);
+            PC_AttnOut pc3={bq, test_Mkv, test_H, test_D};
+            vkCmdPushConstants(g_lnCmdBuf,g_vk.attn_out.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pc3),&pc3);
+            vkCmdDispatch(g_lnCmdBuf, bq * test_H, 1, 1);
+            if (batch < 7) {
+                VkMemoryBarrier mb={};mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;vkCmdPipelineBarrier(g_lnCmdBuf,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,nullptr,0,nullptr);
+            }
         }
-        vkCmdBindPipeline(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_qkt.pipeline);
-        vkCmdBindDescriptorSets(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_qkt.layout,0,1,&ds1,0,nullptr);
-        PC_AttnQKT pc1={test_Mq,test_Mkv,test_H,test_D,test_scale};
-        vkCmdPushConstants(g_lnCmdBuf,g_vk.attn_qkt.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pc1),&pc1);
-        vkCmdDispatch(g_lnCmdBuf,test_Mq*test_H,1,1);
-        { VkMemoryBarrier mb={};mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;vkCmdPipelineBarrier(g_lnCmdBuf,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,nullptr,0,nullptr); }
-
-        // ── Pass 2: softmax in-place ──
-        VkDescriptorSet ds2;
-        dsInfo.pSetLayouts=&g_vk.attn_softmax.dsl;
-        vkAllocateDescriptorSets(g_vk.device,&dsInfo,&ds2);
-        { VkDescriptorBufferInfo bA={g_attnA.buf,0,aBytes}; VkWriteDescriptorSet w={};w.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;w.dstSet=ds2;w.dstBinding=0;w.descriptorCount=1;w.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;w.pBufferInfo=&bA;vkUpdateDescriptorSets(g_vk.device,1,&w,0,nullptr); }
-        vkCmdBindPipeline(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_softmax.pipeline);
-        vkCmdBindDescriptorSets(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_softmax.layout,0,1,&ds2,0,nullptr);
-        PC_AttnSoftmax pc2={test_Mq,test_Mkv,test_H};
-        vkCmdPushConstants(g_lnCmdBuf,g_vk.attn_softmax.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pc2),&pc2);
-        vkCmdDispatch(g_lnCmdBuf,test_Mq*test_H,1,1);
-        { VkMemoryBarrier mb={};mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;vkCmdPipelineBarrier(g_lnCmdBuf,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,nullptr,0,nullptr); }
-
-        // ── Pass 3: AV ──
-        VkDescriptorSet ds3;
-        dsInfo.pSetLayouts=&g_vk.attn_out.dsl;
-        vkAllocateDescriptorSets(g_vk.device,&dsInfo,&ds3);
-        {
-            VkDescriptorBufferInfo bA={g_attnA.buf,0,aBytes}, bV={g_attnV.buf,0,kBytes}, bO={g_attnO.buf,0,oBytes};
-            VkWriteDescriptorSet w[3]={};
-            for (int i=0;i<3;i++){w[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;w[i].dstSet=ds3;w[i].dstBinding=(uint32_t)i;w[i].descriptorCount=1;w[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;}
-            w[0].pBufferInfo=&bA;w[1].pBufferInfo=&bV;w[2].pBufferInfo=&bO;
-            vkUpdateDescriptorSets(g_vk.device,3,w,0,nullptr);
-        }
-        vkCmdBindPipeline(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_out.pipeline);
-        vkCmdBindDescriptorSets(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_out.layout,0,1,&ds3,0,nullptr);
-        PC_AttnOut pc3={test_Mq,test_Mkv,test_H,test_D};
-        vkCmdPushConstants(g_lnCmdBuf,g_vk.attn_out.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pc3),&pc3);
-        vkCmdDispatch(g_lnCmdBuf,test_Mq*test_H,1,1);
-
-        // Host-read barrier
+        // Final host-read barrier
         { VkMemoryBarrier mb={};mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;mb.dstAccessMask=VK_ACCESS_HOST_READ_BIT;vkCmdPipelineBarrier(g_lnCmdBuf,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&mb,0,nullptr,0,nullptr); }
 
         if (vkEndCommandBuffer(g_lnCmdBuf) != VK_SUCCESS) {
-            LOGE("3-pass smoke: end failed"); return false;
+            LOGE("3b-iii: end failed"); return false;
         }
         vkResetFences(g_vk.device, 1, &g_vk.stepFence);
         VkSubmitInfo submit = {};
@@ -1056,15 +1065,20 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &g_lnCmdBuf;
         if (vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.stepFence) != VK_SUCCESS) {
-            LOGE("3-pass smoke: submit failed"); return false;
+            LOGE("3b-iii: submit failed"); return false;
         }
         vkWaitForFences(g_vk.device, 1, &g_vk.stepFence, VK_TRUE, UINT64_MAX);
 
+        // Check batch 0 and batch 7 output
         uint16_t o0 = ((uint16_t*)g_attnO.mapped)[0];
-        uint16_t a0 = ((uint16_t*)g_attnA.mapped)[0];
-        // Expected: A[0] ~ 11.3, softmax→1.0, O[0]=1.0 = 0x3C00
-        LOGI("3-pass smoke PASS — A[0]=0x%04x O[0]=0x%04x (expected A~0x496C O=0x3C00)",
-             a0, o0);
+        uint16_t o7 = ((uint16_t*)g_attnO.mapped)[7 * bq * test_H * test_D];
+        bool has_nan = false;
+        for (uint32_t i = 0; i < test_Mq * test_H * test_D; i++) {
+            uint16_t h = ((uint16_t*)g_attnO.mapped)[i];
+            if ((h & 0x7C00) == 0x7C00 && (h & 0x3FF)) { has_nan = true; break; }
+        }
+        LOGI("3b-iii 8-batch PASS — O[0]=0x%04x O[448]=0x%04x has_nan=%d (24 dispatches)",
+             o0, o7, (int)has_nan);
     }
 
     g_init = true;
