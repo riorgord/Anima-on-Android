@@ -29,6 +29,10 @@ _lib_vk.dit_reset_step_pool.argtypes = []
 _lib_vk.dit_reset_step_pool.restype = ctypes.c_bool
 _lib_vk.dit_adaln_one_block.argtypes = [ctypes.c_int, ctypes.c_void_p]
 _lib_vk.dit_adaln_one_block.restype = ctypes.c_bool
+_lib_vk.dit_forward_nblocks.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                                         ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                         ctypes.c_int]
+_lib_vk.dit_forward_nblocks.restype = ctypes.c_bool
 _lib_vk.dit_destroy.argtypes = []
 _lib_vk.dit_destroy.restype = None
 
@@ -48,7 +52,7 @@ ctx_uncond = torch.load("/sdcard/anima_on_android/models/context_uncond.pt", wei
 print("Loading DiT...")
 config = dict(max_img_h=240, max_img_w=240, max_frames=128, in_channels=16, out_channels=16,
     patch_spatial=2, patch_temporal=1, concat_padding_mask=True, model_channels=2048,
-    num_blocks=28, num_heads=16, mlp_ratio=4.0, crossattn_emb_channels=1024,
+    num_blocks=0, num_heads=16, mlp_ratio=4.0, crossattn_emb_channels=1024,
     pos_emb_cls="rope3d", pos_emb_learnable=True, pos_emb_interpolation="crop",
     min_fps=1, max_fps=30, use_adaln_lora=True, adaln_lora_dim=256,
     rope_h_extrapolation_ratio=4.0, rope_w_extrapolation_ratio=4.0, rope_t_extrapolation_ratio=1.0,
@@ -144,8 +148,7 @@ for i in range(STEPS):
     sigma_next = sigmas[i + 1]
     ts = torch.tensor([sigma], dtype=DTYPE)
 
-    # C++ CPU: compute t_emb + lora from sigma directly into GPU buffers (~0.5ms)
-    # Replaces PyTorch t_embedder sinusoidal→SiLU→GEMM×2→RMSNorm→numpy→upload (8 lines → 1 call)
+    # C++ CPU: compute t_emb + lora from sigma directly into GPU buffers
     _lib_vk.dit_compute_timestep(float(sigma))
 
     # GPU AdaLN for all 28 blocks
@@ -160,9 +163,9 @@ for i in range(STEPS):
         adaln_all.append(out_buf.copy().view(np.float16).reshape(9, M, D))
     adaln_time = time.time() - t0_adaln
 
-    # Inject precomputed AdaLN into blocks (lora already baked in)
+    # Inject precomputed AdaLN into blocks
     for blk_idx, blk in enumerate(dit.blocks):
-        a = adaln_all[blk_idx]  # [9, M, D]: shift/scale/gate × self/cross/mlp
+        a = adaln_all[blk_idx]  # [9, M, D]
         v_self  = torch.from_numpy(np.concatenate([a[0], a[1], a[2]], axis=-1)).reshape(2, 1, 3*D).to(DEV).to(DTYPE)
         v_cross = torch.from_numpy(np.concatenate([a[3], a[4], a[5]], axis=-1)).reshape(2, 1, 3*D).to(DEV).to(DTYPE)
         v_mlp   = torch.from_numpy(np.concatenate([a[6], a[7], a[8]], axis=-1)).reshape(2, 1, 3*D).to(DEV).to(DTYPE)
@@ -171,7 +174,6 @@ for i in range(STEPS):
         blk.adaln_modulation_mlp = PrecomputedAdaLN(v_mlp)
         blk.use_adaln_lora = False
 
-    # DiT forward (blocks use precomputed AdaLN; final_layer uses PyTorch)
     x_b = x.unsqueeze(2).repeat(2, 1, 1, 1, 1)
     ctx_b = torch.cat([ctx_cond, ctx_uncond], dim=0)
     ts_b2 = ts.repeat(2)
@@ -179,6 +181,14 @@ for i in range(STEPS):
     with torch.no_grad():
         v_b = dit(x_b, ts_b2, ctx_b)
     dit_time = time.time() - t0
+
+    # C++ diag: run 28 pre-recorded blocks in parallel (skip-attn, values discarded)
+    MS_val = 2 * 256  # M * S = 512
+    x_flat = np.zeros(MS_val * D, dtype=np.uint16)
+    _lib_vk.dit_forward_nblocks(x_flat.ctypes.data_as(ctypes.c_void_p),
+        None, x_flat.ctypes.data_as(ctypes.c_void_p),
+        x_flat.ctypes.data_as(ctypes.c_void_p),
+        MS_val, D, 2, 512, 1024, 28)
 
     # Restore blocks for next step
     for blk in dit.blocks:

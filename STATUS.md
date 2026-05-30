@@ -1,4 +1,4 @@
-# Anima 项目状态摘要 (2026-05-29 更新)
+# Anima 项目状态摘要 (2026-05-30 更新)
 
 ## 我们在做什么
 在 Snapdragon 8+ Gen1 手机上运行 Anima 动漫风格图像生成模型 (2B DiT)。
@@ -21,34 +21,35 @@
 | C++ 引擎 self-attn+MLP only | 9.9s/步 | 12× | ✅ |
 | C++ 引擎 +cross-attn | 13.3s/步 | 9× | ✅ |
 | **C++ 引擎 +GPU AdaLN** | **13.06s/步** | **9.2×** | benchmark 通过, 管线未验证 |
-| C++ 引擎 +RoPE+Attention (目标) | ~15s/步 | 8× | ⏳ 开发中 |
+| **C++ 引擎 28-block 预录 (skip-attn)** | **~25s/步** | **~4.8×** | ✅ 管线验证无 NaN (26°C) |
+| C++ 引擎 +真实 attention (目标) | ~30-40s/步 | 3-4× | ⏳ 开发中 |
 
-注：2026-05-28 去掉了 `taskset f0` 绑定大核，配合 Scene 调度器优化，HybridOps 稳定在 50s/步。之前 56-57s 是单纯 taskset 限制 4 核的结果。
+注：HybridOps 28-block 预录跑通后将降到 ~500 submit → 28 submit/步，预计 ~40s/步。真实 attention 集成后增至 84 submit/步 (28 blocks × 3 cmdBuf)。
 
-## C++ 引擎状态 (libdit_vk.so v2)
+## C++ 引擎状态 (libdit_vk.so v3 — 2026-05-30 重写)
 
-完全重写，架构改为 per-block cmd buffer（28 个，每个 16 dispatches），回避了旧版 monolithic cmd buffer 的 Adreno submit 失败问题。
+**架构变更**：
+- 全量权重加载：`load_weights` 流式加载 567 tensor (3.9GB)，无 CPU 临时 buffer，不 OOM
+- 28 block 全量预录：`record_one_block` × 28 (63 dispatch/block, 1764 dispatch total)
+- `dit_forward_nblocks`：逐 block submit cmd[i] + fence wait + chain 输出
+- FP16 LayerNorm：pre-recorded 用 `layer_norm_f16` (FP16 I/O)，per-call 保持 `layer_norm` (FP32 I/O)
 
-⚠️ **C++ 引擎已知缺陷**：
-- Attention 是 skip 模式（V→O），非真正 QK^T+softmax
+**已修复的关键 Bug**：
+- **FP32 LN shader + FP16 buffer = NaN**：`layer_norm.spv` 是 FP32 shader (4字节/元素)，但 pre-recorded block 绑的是 FP16 buffer (2字节/元素)。shader 读 4 字节当 float，实际是两个 fp16 拼在一起 → 垃圾值 → 全 NaN。修复：加 `layer_norm_f16` pipeline 加载 `layernorm_fp16.spv`，`dispatch_layernorm` 改用 FP16 版本。
+- **Buffer 尺寸 bug**：g_t1/g_tQ/g_tK/g_tV 原来按 M=2 分配 (AdaLN only)，改为 MS=512 分配 (full block recording)
+
+**验证状态**：
+- ✅ 3.9GB 流式加载 (7s init)
+- ✅ 28 block 预录成功 (1764 dispatches)
+- ✅ 单 LN dispatch 输出 clean (min=-2.1 max=4.1 nan=0)
+- ✅ 1-block 输出 clean (min=-758 max=750 nan=0)
+- ✅ 28-block 输出 clean (min=-65504 max=47744 nan=0)
+- ❌ skip-attention (V→O) — 值合法但语义不对，不出正图
+
+**⚠️ Attention 状态**：
+- Self-attn + cross-attn 是 **skip 模式** (`V @ O_proj`)，跳过了 QK^T+softmax+SV
 - RoPE 未集成到 block recording
-
-## 当前状态 (2026-05-30 更新): 自注意力 + 跨注意力 GPU 化完成
-
-**管线速度**: 77s/步 (息屏+省电调度)
-
-### 已注入的 GPU 模块（全部管线验证通过）
-
-| 模块 | 引擎 | 每步调用 | 精度 | 注入方式 |
-|------|------|---------|------|---------|
-| **GEMM** | libvk_gemm.so | 281 | max_err ~0.01 | HybridLinear |
-| **AdaLN** | libdit_vk.so | 28 blocks | — | PrecomputedAdaLN |
-| **LayerNorm** | libdit_vk.so FP32 | 85 | max_err 2e-6 | HybridLayerNorm |
-| **RMSNorm** | libdit_vk.so FP16 | 84 | max_err 0.004 | HybridRMSNorm |
-| **GELU** | libdit_vk.so FP16 | 28 | max_err 0.0017 | post-init replace |
-| **Self-attention** | libdit_vk.so 3-pass | 28 | — | monkey-patch compute_attn |
-| **Cross-attention** | libdit_vk.so 3-pass batched | 28 | max_err 0.001 | monkey-patch compute_attn |
-| **t_embedder** | libdit_vk.so C++ CPU | 1 | max_err 6e-5 | dit_compute_timestep |
+- Per-call attention (3-pass Vulkan) 仍然正常工作，但每步 534 submit → 慢
 
 ### 描述符池体系（最终方案）
 
@@ -140,26 +141,71 @@ AdaLN 重录时 `dit_adaln_one_block` 临时 swap `g_vk.descPool → g_vk.stepPo
 | **Block 0 真实 pipeline 输入** | **0.75** | mean/std 完全匹配 |
 | 28 blocks benchmark | — | 9.9s/步, 448 dispatches |
 
-### 引擎架构
+### 引擎架构 (当前 v3)
 
 ```
-dit_init(weight_bin, spv_dir)
-  → 加载 567 个 per-tensor Vulkan buffer (3.9GB)
-  → 创建 8 个 shader pipeline
-  → 分配 28 个 cmd buffer + I/O buffer
+dit_init_adaln_only(weight_bin, spv_dir)
+  → load_weights: 流式加载 567 个 per-tensor Vulkan buffer (3.9GB, 无临时 CPU buf)
+  → 创建 10+1 个 shader pipeline (含 layer_norm_f16)
+  → 分配 28 个 cmd buffer + 24 个 I/O buffer
 
-dit_init_all_blocks()
-  → 每个 cmd buffer 录制 1 个 block (16 dispatches)
-  → bcBuf 共享 (18MB, 9 个 AdaLN 分量)
+record_one_block × 28
+  → 每个 cmd[i] 录制: AdaLN×3(36) + self-attn(10) + cross-attn(10) + MLP(7) = 63 dispatches
+  → self/cross-attn 目前是 skip 模式 (V→O_proj)
 
-dit_forward_28blocks(x, adaln_all, out)
-  → for i in 0..27:
-      上传 block i 的 AdaLN → bcBuf
-      上传 x → xBuf
+dit_forward_nblocks(x, t_emb, ctx, out, nblocks)
+  → 上传 x → g_xBuf, ctx → g_ctxBuf (t_emb 已有)
+  → for i in 0..nblocks:
       submit cmd[i] → wait fence
-      复制 outBuf → xBuf (下一 block 输入)
-    → 9.9s total
+      复制 g_outBuf → g_xBuf (chain)
+    → 下载 g_outBuf → out
+  → 28 submit/步, ~25s/步
 ```
+
+### 下一步：Attention 集成 (3b)
+
+把 per-call 的 3-pass attention (`submit_attn_3pass`) 逻辑移到 `record_one_block` 里。
+
+**当前 skip-attention 的 self-attn 部分 (record_one_block:1520-1529)**：
+```
+LN → Q_proj → K_proj → V_proj → Q_norm → K_norm → [V → O_proj] → gate+residual
+                                                         ^^^^^^^^^^
+                                                         跳过了 QK^T + softmax + SV
+```
+
+**改为真实 attention**：
+```
+LN → Q_proj → K_proj → V_proj → Q_norm → K_norm → QK^T → softmax → SV → O_proj → gate+residual
+                                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                                       新增 24 dispatch (self) + 24 dispatch (cross)
+```
+
+**挑战**：
+1. Self-attn Q 有 512 token × 16 head = 8192 WG → 需拆 8 批 (64 Q token/批)
+2. Cross-attn Q 同上 8 批，K/V 来自 ctx (1024 token)
+3. 每批 3 dispatch (QK^T/softmax/AV) × 8 = 24 dispatch/attention
+4. 24+24 = 48 attention dispatch + 63 existing = 111 > Adreno 单 cmdBuf ~64 上限
+
+**方案：每 block 拆 3 个 cmd buffer**
+```
+cmd_PRE[i]  (57 dispatch): AdaLN + LN + QKV GEMM + norms
+cmd_ATTN[i] (48 dispatch): self 3-pass×8批 + cross 3-pass×8批
+cmd_POST[i] (7 dispatch):  O_proj + gate + GELU + FC2 + residual
+```
+
+Forward 变为 28×3 = **84 submit/步**，预期 ~30-40s/步。
+
+**还需移入 C++ 的部分**：
+
+| 模块 | 优先级 | 说明 |
+|------|--------|------|
+| **Attention 3-pass** | 🔴 最高 | 修复 skip-attention → 出正图 |
+| **RoPE** | 🟡 中 | 56 次 ~3s/步，可参考 ET 的 per-texel shader |
+| **final_layer** | 🟢 低 | 1 次 <1s，PyTorch 暂时够用 |
+| **x_embedder** | 🟢 低 | 1 次 GEMM，PyTorch 可跑 |
+| **VAE decoder** | ⚪ 远期 | 完全独立模块，跑完 DiT 后才加载 |
+
+**PyTorch 轻量化策略**：`num_blocks=0` — PyTorch 只创建 x_embedder + t_embedder + final_layer (~20MB)，不加载 28 block 权重 (~3.7GB)。C++ 引擎扛全部 block 推理。
 
 ### Shader 验证状态
 

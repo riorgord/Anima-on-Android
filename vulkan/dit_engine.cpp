@@ -78,7 +78,7 @@ struct VulkanCtx {
     VkDescriptorPool stepPool = VK_NULL_HANDLE;  // per-step pool, reset between steps
     VkPhysicalDeviceMemoryProperties memProps = {};
 
-    ShaderPipe gemm, rms_norm, layer_norm, silu, scale_shift, rope, attention, broadcast, gelu;
+    ShaderPipe gemm, rms_norm, layer_norm, layer_norm_f16, silu, scale_shift, rope, attention, broadcast, gelu;
     ShaderPipe attn_qkt, attn_softmax, attn_out;
 };
 
@@ -269,66 +269,40 @@ static bool create_descriptor_pool(VulkanCtx& ctx) {
 // ============================================================
 static bool load_weights(VulkanCtx& ctx, const char* path,
                           std::unordered_map<std::string, WeightInfo>& weights) {
+    // Stream directly into per-tensor Vulkan buffers — no CPU temp buffer.
+    // On unified-memory Adreno, a 3.9GB temp buffer + 3.9GB Vulkan copies = 7.8GB peak → OOM.
     FILE* f = fopen(path, "rb");
     if (!f) { LOGE("Cannot open %s", path); return false; }
 
     uint32_t N;
     if (fread(&N, sizeof(N), 1, f) != 1) { fclose(f); return false; }
-    LOGI("Loading %u weight tensors...", N);
+    LOGI("Loading %u weight tensors (streaming)...", N);
 
-    // Read all tensor headers + data
-    struct RawTensor { std::string name; size_t offset; size_t size; uint32_t dims[4]; uint32_t ndim; };
-    std::vector<RawTensor> raw(N);
-    size_t totalData = 0;
+    VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     for (uint32_t i = 0; i < N; i++) {
         uint16_t nl; fread(&nl, sizeof(nl), 1, f);
         char* tmp = (char*)alloca(nl+1);
         fread(tmp, 1, nl, f); tmp[nl] = 0;
-        raw[i].name.assign(tmp, nl);
-        uint8_t nd; fread(&nd, 1, 1, f);
-        raw[i].ndim = nd;
-        uint32_t sh[4] = {1,1,1,1}; size_t elems = 1;
-        for (uint8_t d = 0; d < nd; d++) {
-            fread(&sh[d], 4, 1, f); elems *= sh[d];
-        }
-        memcpy(raw[i].dims, sh, sizeof(sh));
-        raw[i].size = elems * 2;
-        raw[i].offset = totalData;
-        totalData += raw[i].size;
-        fseek(f, (long)(elems * 2), SEEK_CUR);
-    }
+        std::string name(tmp, nl);
 
-    // Read all raw data into one temp buffer, then split into per-tensor Vulkan buffers
-    uint8_t* allData = new (std::nothrow) uint8_t[totalData];
-    if (!allData) { LOGE("OOM for %.1f MB temp buffer", totalData/1e6); fclose(f); return false; }
-    fseek(f, 4, SEEK_SET);
-    for (uint32_t i = 0; i < N; i++) {
-        uint16_t nl; fread(&nl, sizeof(nl), 1, f);
-        fseek(f, nl + 1, SEEK_CUR);
-        uint32_t sh[4]; size_t elems = 1;
-        for (uint8_t d = 0; d < raw[i].ndim; d++) { fread(&sh[d], 4, 1, f); elems *= sh[d]; }
-        fread(allData + raw[i].offset, 2, elems, f);
+        uint8_t nd; fread(&nd, 1, 1, f);
+        uint32_t sh[4] = {1,1,1,1}; size_t elems = 1;
+        for (uint8_t d = 0; d < nd; d++) { fread(&sh[d], 4, 1, f); elems *= sh[d]; }
+
+        auto& w = weights[name];
+        w.name = name;
+        w.size = elems * 2;
+        w.ndim = nd;
+        memcpy(w.dims, sh, sizeof(sh));
+        if (!create_buffer(ctx, w.size, usage, w.buf)) {
+            LOGE("Failed buffer for %s (%.1f MB)", name.c_str(), w.size/1e6);
+            fclose(f); return false;
+        }
+        fread(w.buf.mapped, 2, elems, f);
     }
     fclose(f);
-    LOGI("Read %.1f MB raw data", totalData/1e6);
-
-    // Create per-tensor Vulkan buffers
-    VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    for (uint32_t i = 0; i < N; i++) {
-        auto& w = weights[raw[i].name];
-        w.name = raw[i].name;
-        w.size = raw[i].size;
-        w.ndim = raw[i].ndim;
-        memcpy(w.dims, raw[i].dims, sizeof(w.dims));
-        if (!create_buffer(ctx, raw[i].size, usage, w.buf)) {
-            LOGE("Failed to create buffer for %s (%.1f MB)", raw[i].name.c_str(), raw[i].size/1e6);
-            delete[] allData;
-            return false;
-        }
-        memcpy(w.buf.mapped, allData + raw[i].offset, raw[i].size);
-    }
-    delete[] allData;
-    LOGI("Loaded %u weights into %u Vulkan buffers", N, (uint32_t)weights.size());
+    LOGI("Loaded %u weights into %u Vulkan buffers (streaming, no temp CPU buf)",
+         N, (uint32_t)weights.size());
     return true;
 }
 
@@ -476,7 +450,10 @@ static bool create_adaln_pipelines(VulkanCtx& ctx, const char* spv_dir) {
     CP(attn_softmax, 1, sizeof(PC_AttnSoftmax));
     CP(attn_out, 3, sizeof(PC_AttnOut));
     #undef CP
-    LOGI("AdaLN pipelines created (9 types + 3 attn)");
+    // layer_norm_f16: FP16 I/O for pre-recorded blocks
+    snprintf(p, sizeof(p), "%s/layernorm_fp16.spv", spv_dir);
+    if (!create_shader_pipe(ctx, p, 2, sizeof(PC_LayerNorm), ctx.layer_norm_f16)) return false;
+    LOGI("AdaLN pipelines created (9 types + 3 attn + ln_f16)");
     return true;
 }
 
@@ -568,7 +545,7 @@ struct RC {
     }
 
     void dispatch_layernorm(Buffer& in, Buffer& out, uint32_t rows, uint32_t elems, float eps) {
-        auto& sp = vk->layer_norm;
+        auto& sp = vk->layer_norm_f16;  // fp16 I/O for pre-recorded blocks
         auto ds = alloc_set(sp.dsl);
         bind_buf(ds, 0, in, 0, VK_WHOLE_SIZE);
         bind_buf(ds, 1, out, 0, VK_WHOLE_SIZE);
@@ -808,11 +785,8 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
     }
 
     if (weight_path && weight_path[0]) {
-        if (!load_adaln_weights(g_vk, weight_path, g_weights)) {
-            LOGE("AdaLN weight loading failed"); return false;
-        }
-        if (!load_block0_weights(g_vk, weight_path, g_weights)) {
-            LOGE("Block 0 weight loading failed"); return false;
+        if (!load_weights(g_vk, weight_path, g_weights)) {
+            LOGE("Weight loading failed"); return false;
         }
     }
 
@@ -894,11 +868,27 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
 
     LOGI("dit_init_adaln_only OK — %u buffers", 20);
 
-    // Pre-record all 28 AdaLN blocks (avoids per-step recording / pool exhaustion)
-    if (!dit_record_all_adaln_blocks()) {
-        LOGE("Failed to pre-record AdaLN blocks");
-        return false;
+    // ── Pre-record all 28 full blocks (skip-attn mode, 63 dispatches each) ──
+    for (int i = 0; i < 28; i++) {
+        VkCommandBufferBeginInfo bi = {};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        if (vkBeginCommandBuffer(g_vk.cmd[i], &bi) != VK_SUCCESS) {
+            LOGE("Begin cmd[%d] failed", i); return false;
+        }
+        RC rc; memset(&rc, 0, sizeof(rc));
+        rc.vk = &g_vk; rc.cmd = g_vk.cmd[i]; rc.weights = &g_weights;
+        rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
+        rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
+        rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf;
+        rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
+
+        record_one_block(rc, i, *rc.xBuf, *rc.outBuf);
+
+        if (vkEndCommandBuffer(g_vk.cmd[i]) != VK_SUCCESS) {
+            LOGE("End cmd[%d] failed", i); return false;
+        }
     }
+    LOGI("All 28 full blocks pre-recorded (28×63 dispatches)");
 
     // ── Step 1: GEMM smoke test ──
     // Verify gemm_fp16 pipeline (already loaded by create_adaln_pipelines)
@@ -976,30 +966,6 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
         uint16_t r0 = ((uint16_t*)g_gemmDummy.mapped)[0];
         LOGI("GEMM smoke test PASS — M=%u N=%u K=%u  result[0]=0x%04x",
              test_M, test_N, test_K, r0);
-    }
-
-    // ── Step 2a: re-record block 0 with full GEMM+attention+MLP chain ──
-    // Overwrites cmd[0] (currently AdaLN-only) with 63-dispatch full block.
-    {
-        LOGI("Step 2a: recording full block 0...");
-        VkCommandBufferBeginInfo bi = {};
-        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        if (vkBeginCommandBuffer(g_vk.cmd[0], &bi) != VK_SUCCESS) {
-            LOGE("Step 2a: begin cmd[0] failed"); return false;
-        }
-        RC rc; memset(&rc, 0, sizeof(rc));
-        rc.vk = &g_vk; rc.cmd = g_vk.cmd[0]; rc.weights = &g_weights;
-        rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
-        rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
-        rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf;
-        rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
-
-        record_one_block(rc, 0, *rc.xBuf, *rc.outBuf);
-
-        if (vkEndCommandBuffer(g_vk.cmd[0]) != VK_SUCCESS) {
-            LOGE("Step 2a: end cmd[0] failed"); return false;
-        }
-        LOGI("Step 2a: block 0 full recording OK (63 dispatches)");
     }
 
     g_init = true;
@@ -1647,9 +1613,11 @@ bool dit_init_all_blocks(void) {
     return true;
 }
 
-bool dit_forward_28blocks(void* x_data, void* t_emb_data, void* ctx_data, void* out_data,
-                           int _MS, int _D, int _M, int _Nctx, int _CtxD) {
+bool dit_forward_nblocks(void* x_data, void* t_emb_data, void* ctx_data, void* out_data,
+                          int _MS, int _D, int _M, int _Nctx, int _CtxD, int _nblocks) {
     if (!g_init) return false;
+    int nblocks = _nblocks;
+    if (nblocks <= 0 || nblocks > 28) nblocks = 28;
     MS = (uint32_t)_MS; M = (uint32_t)_M; S = MS / M;
     size_t xBytes = MS * D * 2;
     size_t tBytes = M * D * 2;
@@ -1657,10 +1625,34 @@ bool dit_forward_28blocks(void* x_data, void* t_emb_data, void* ctx_data, void* 
 
     // Upload inputs (t_emb and ctx stay constant across blocks)
     memcpy(g_xBuf.mapped, x_data, xBytes);
-    memcpy(g_tEmbBuf.mapped, t_emb_data, tBytes);
+    if (t_emb_data) memcpy(g_tEmbBuf.mapped, t_emb_data, tBytes);
     if (ctx_data) memcpy(g_ctxBuf.mapped, ctx_data, ctxBytes);
 
-    for (int i = 0; i < 28; i++) {
+    // Diagnostic: scan input before blocks
+    {
+        uint16_t* in = (uint16_t*)g_xBuf.mapped;
+        float fmin = 1e30f, fmax = -1e30f; int nan_cnt = 0;
+        for (uint32_t j = 0; j < MS * D; j++) {
+            uint16_t h = in[j];
+            uint32_t exp = (h >> 10) & 0x1f, mant = h & 0x3ff;
+            if (exp == 31) { if (mant) nan_cnt++; }
+            else { float val; if (exp == 0) val = 0.0f; else { uint32_t bits = ((exp + 112) << 23) | (mant << 13); val = *(float*)&bits; } if (h & 0x8000) val = -val; if (val < fmin) fmin = val; if (val > fmax) fmax = val; }
+        }
+        LOGI("Forward input: min=%.1f max=%.1f nan=%d/%u", fmin, fmax, nan_cnt, MS*D);
+        // Also check t_emb
+        uint16_t* te = (uint16_t*)g_tEmbBuf.mapped;
+        float tmin = 1e30f, tmax = -1e30f;
+        for (uint32_t j = 0; j < M * D; j++) {
+            uint16_t h = te[j]; if (h == 0x7e00) continue; // NaN sentinel
+            uint32_t exp = (h >> 10) & 0x1f;
+            if (exp == 31) continue;
+            float val; if (exp == 0) val = 0.0f; else { uint32_t bits = ((exp + 112) << 23) | ((h & 0x3ff) << 13); val = *(float*)&bits; } if (h & 0x8000) val = -val;
+            if (val < tmin) tmin = val; if (val > tmax) tmax = val;
+        }
+        LOGI("Forward t_emb:  min=%.3f max=%.3f", tmin, tmax);
+    }
+
+    for (int i = 0; i < nblocks; i++) {
         vkResetFences(g_vk.device, 1, &g_vk.fence);
         VkSubmitInfo submit = {};
         submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -1670,6 +1662,26 @@ bool dit_forward_28blocks(void* x_data, void* t_emb_data, void* ctx_data, void* 
             LOGE("Submit failed at block %d", i); return false;
         }
         vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+        // Diagnostic: scan block output for NaN/Inf
+        uint16_t* out = (uint16_t*)g_outBuf.mapped;
+        float fmin = 1e30f, fmax = -1e30f;
+        int nan_cnt = 0, inf_cnt = 0;
+        for (uint32_t j = 0; j < MS * D; j++) {
+            uint16_t h = out[j];
+            // fp16 → fp32
+            uint32_t sign = (h >> 15) & 1;
+            uint32_t exp  = (h >> 10) & 0x1f;
+            uint32_t mant = h & 0x3ff;
+            float val;
+            if (exp == 0) { val = 0.0f; if (mant != 0) val = ldexpf((float)mant, -24); }
+            else if (exp == 31) { if (mant == 0) { inf_cnt++; continue; } else { nan_cnt++; continue; } }
+            else { val = ldexpf((float)(mant | 0x400), (int)exp - 25); }
+            if (sign) val = -val;
+            if (val < fmin) fmin = val;
+            if (val > fmax) fmax = val;
+        }
+        LOGI("Block %d/%d output: min=%.1f max=%.1f nan=%d inf=%d",
+             i, nblocks, fmin, fmax, nan_cnt, inf_cnt);
         memcpy(g_xBuf.mapped, g_outBuf.mapped, xBytes);
     }
 
