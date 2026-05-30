@@ -72,6 +72,7 @@ struct VulkanCtx {
     uint32_t queueFamily = 0;
     VkCommandPool cmdPool = VK_NULL_HANDLE;
     VkCommandBuffer cmd[28] = {};
+    VkCommandBuffer cmd_attn[28] = {}; VkCommandBuffer cmd_post[28] = {};
     VkFence fence = VK_NULL_HANDLE;
     VkFence stepFence = VK_NULL_HANDLE;  // per-step ops fence
     VkDescriptorPool descPool = VK_NULL_HANDLE;
@@ -180,6 +181,8 @@ static bool init_vulkan(VulkanCtx& ctx) {
     cbInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cbInfo.commandPool = ctx.cmdPool; cbInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cbInfo.commandBufferCount = 28;
     if (vkAllocateCommandBuffers(ctx.device, &cbInfo, ctx.cmd) != VK_SUCCESS) return false;
+    if (vkAllocateCommandBuffers(ctx.device, &cbInfo, ctx.cmd_attn) != VK_SUCCESS) return false;
+    if (vkAllocateCommandBuffers(ctx.device, &cbInfo, ctx.cmd_post) != VK_SUCCESS) return false;
 
     VkFenceCreateInfo fenceInfo = {};
     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
@@ -2454,7 +2457,9 @@ void dit_destroy() {
     if (g_vk.stepPool) vkDestroyDescriptorPool(g_vk.device, g_vk.stepPool, nullptr);
     if (g_vk.descPool) vkDestroyDescriptorPool(g_vk.device, g_vk.descPool, nullptr);
     if (g_lnCmdBuf) vkFreeCommandBuffers(g_vk.device, g_vk.cmdPool, 1, &g_lnCmdBuf);
-    if (g_vk.cmd[0]) vkFreeCommandBuffers(g_vk.device, g_vk.cmdPool, 28, g_vk.cmd);
+    if (g_vk.cmd[0])      vkFreeCommandBuffers(g_vk.device, g_vk.cmdPool, 28, g_vk.cmd);
+    if (g_vk.cmd_attn[0]) vkFreeCommandBuffers(g_vk.device, g_vk.cmdPool, 28, g_vk.cmd_attn);
+    if (g_vk.cmd_post[0]) vkFreeCommandBuffers(g_vk.device, g_vk.cmdPool, 28, g_vk.cmd_post);
     if (g_vk.cmdPool) vkDestroyCommandPool(g_vk.device, g_vk.cmdPool, nullptr);
     if (g_vk.fence) vkDestroyFence(g_vk.device, g_vk.fence, nullptr);
 
