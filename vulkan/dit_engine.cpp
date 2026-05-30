@@ -968,7 +968,7 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
              test_M, test_N, test_K, r0);
     }
 
-    // ── Step 3b-iii: 8-batch 3-pass self-attention (real params) ──
+    // ── Step 3b-iv: self+cross 8-batch 3-pass attention (48 dispatches) ──
     {
         uint32_t test_Mq = 512, test_Mkv = 512, test_H = 16, test_D = 128;
         float test_scale = 1.0f / sqrtf((float)test_D);  // 0.0884
@@ -1053,6 +1053,60 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
                 VkMemoryBarrier mb={};mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;vkCmdPipelineBarrier(g_lnCmdBuf,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,nullptr,0,nullptr);
             }
         }
+        // ── Cross-attention: 8 batches, M_kv=1024 ──
+        {
+            uint32_t cx_Mkv = 1024;
+            size_t cxKvBytes = cx_Mkv * test_H * test_D * 2;  // 4MB
+            size_t cxAPerBatch = bq * test_H * cx_Mkv * 2;    // 2MB per batch
+            // Fill cross K/V with all 1.0
+            for (uint32_t i = 0; i < cx_Mkv * test_H * test_D; i++) {
+                k[i] = v[i] = 0x3C00;
+            }
+            for (uint32_t batch = 0; batch < 8; batch++) {
+                VkDeviceSize qByteOff = (VkDeviceSize)batch * qPerBatchBytes;
+                VkDeviceSize aByteOff = (VkDeviceSize)batch * cxAPerBatch;
+
+                // QK^T
+                VkDescriptorSet ds1;
+                dsInfo.pSetLayouts = &g_vk.attn_qkt.dsl;
+                vkAllocateDescriptorSets(g_vk.device, &dsInfo, &ds1);
+                { VkDescriptorBufferInfo bQ={g_attnQ.buf,qByteOff,qPerBatchBytes}, bK={g_attnK.buf,0,cxKvBytes}, bA={g_attnA.buf,aByteOff,cxAPerBatch};
+                  VkWriteDescriptorSet w[3]={};for(int i=0;i<3;i++){w[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;w[i].dstSet=ds1;w[i].dstBinding=(uint32_t)i;w[i].descriptorCount=1;w[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;}
+                  w[0].pBufferInfo=&bQ;w[1].pBufferInfo=&bK;w[2].pBufferInfo=&bA;vkUpdateDescriptorSets(g_vk.device,3,w,0,nullptr); }
+                vkCmdBindPipeline(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_qkt.pipeline);
+                vkCmdBindDescriptorSets(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_qkt.layout,0,1,&ds1,0,nullptr);
+                PC_AttnQKT pc1={bq,cx_Mkv,test_H,test_D,test_scale};
+                vkCmdPushConstants(g_lnCmdBuf,g_vk.attn_qkt.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pc1),&pc1);
+                vkCmdDispatch(g_lnCmdBuf,bq*test_H,1,1);
+                { VkMemoryBarrier mb={};mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;vkCmdPipelineBarrier(g_lnCmdBuf,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,nullptr,0,nullptr); }
+
+                // softmax
+                VkDescriptorSet ds2; dsInfo.pSetLayouts=&g_vk.attn_softmax.dsl;
+                vkAllocateDescriptorSets(g_vk.device,&dsInfo,&ds2);
+                { VkDescriptorBufferInfo bA={g_attnA.buf,aByteOff,cxAPerBatch};VkWriteDescriptorSet w={};w.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;w.dstSet=ds2;w.dstBinding=0;w.descriptorCount=1;w.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;w.pBufferInfo=&bA;vkUpdateDescriptorSets(g_vk.device,1,&w,0,nullptr); }
+                vkCmdBindPipeline(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_softmax.pipeline);
+                vkCmdBindDescriptorSets(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_softmax.layout,0,1,&ds2,0,nullptr);
+                PC_AttnSoftmax pc2={bq,cx_Mkv,test_H};
+                vkCmdPushConstants(g_lnCmdBuf,g_vk.attn_softmax.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pc2),&pc2);
+                vkCmdDispatch(g_lnCmdBuf,bq*test_H,1,1);
+                { VkMemoryBarrier mb={};mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;vkCmdPipelineBarrier(g_lnCmdBuf,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,nullptr,0,nullptr); }
+
+                // AV
+                VkDescriptorSet ds3; dsInfo.pSetLayouts=&g_vk.attn_out.dsl;
+                vkAllocateDescriptorSets(g_vk.device,&dsInfo,&ds3);
+                { VkDescriptorBufferInfo bA={g_attnA.buf,aByteOff,cxAPerBatch},bV={g_attnV.buf,0,cxKvBytes},bO={g_attnO.buf,qByteOff,qPerBatchBytes};
+                  VkWriteDescriptorSet w[3]={};for(int i=0;i<3;i++){w[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;w[i].dstSet=ds3;w[i].dstBinding=(uint32_t)i;w[i].descriptorCount=1;w[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;}
+                  w[0].pBufferInfo=&bA;w[1].pBufferInfo=&bV;w[2].pBufferInfo=&bO;vkUpdateDescriptorSets(g_vk.device,3,w,0,nullptr); }
+                vkCmdBindPipeline(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_out.pipeline);
+                vkCmdBindDescriptorSets(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_out.layout,0,1,&ds3,0,nullptr);
+                PC_AttnOut pc3={bq,cx_Mkv,test_H,test_D};
+                vkCmdPushConstants(g_lnCmdBuf,g_vk.attn_out.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pc3),&pc3);
+                vkCmdDispatch(g_lnCmdBuf,bq*test_H,1,1);
+                if (batch < 7) {
+                    VkMemoryBarrier mb={};mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;vkCmdPipelineBarrier(g_lnCmdBuf,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,nullptr,0,nullptr);
+                }
+            }
+        }
         // Final host-read barrier
         { VkMemoryBarrier mb={};mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;mb.dstAccessMask=VK_ACCESS_HOST_READ_BIT;vkCmdPipelineBarrier(g_lnCmdBuf,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&mb,0,nullptr,0,nullptr); }
 
@@ -1077,7 +1131,7 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
             uint16_t h = ((uint16_t*)g_attnO.mapped)[i];
             if ((h & 0x7C00) == 0x7C00 && (h & 0x3FF)) { has_nan = true; break; }
         }
-        LOGI("3b-iii 8-batch PASS — O[0]=0x%04x O[448]=0x%04x has_nan=%d (24 dispatches)",
+        LOGI("3b-iv self+cross 2×8-batch PASS — O[0]=0x%04x O[448]=0x%04x has_nan=%d (48 dispatches)",
              o0, o7, (int)has_nan);
     }
 
