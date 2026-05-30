@@ -75,8 +75,9 @@ struct VulkanCtx {
     VkCommandBuffer cmd_attn[28] = {}; VkCommandBuffer cmd_post[28] = {};
     VkFence fence = VK_NULL_HANDLE;
     VkFence stepFence = VK_NULL_HANDLE;  // per-step ops fence
-    VkDescriptorPool descPool = VK_NULL_HANDLE;
-    VkDescriptorPool stepPool = VK_NULL_HANDLE;  // per-step pool, reset between steps
+    VkDescriptorPool descPool  = VK_NULL_HANDLE;  // blocks
+    VkDescriptorPool descPool2 = VK_NULL_HANDLE;  // attention
+    VkDescriptorPool stepPool  = VK_NULL_HANDLE;  // per-step ops
     VkPhysicalDeviceMemoryProperties memProps = {};
 
     ShaderPipe gemm, rms_norm, layer_norm, layer_norm_f16, silu, scale_shift, rope, attention, broadcast, gelu;
@@ -175,6 +176,7 @@ static bool init_vulkan(VulkanCtx& ctx) {
 
     VkCommandPoolCreateInfo poolInfo = {};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     poolInfo.queueFamilyIndex = ctx.queueFamily;
     if (vkCreateCommandPool(ctx.device, &poolInfo, nullptr, &ctx.cmdPool) != VK_SUCCESS) return false;
     VkCommandBufferAllocateInfo cbInfo = {};
@@ -256,14 +258,15 @@ static bool create_all_pipelines(VulkanCtx& ctx, const char* spv_dir) {
 static bool create_descriptor_pool(VulkanCtx& ctx) {
     VkDescriptorPoolSize poolSize = {};
     poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSize.descriptorCount = 24000;  // 28 blocks × 53 dispatches × ~4 bindings
+    poolSize.descriptorCount = 24000;
     VkDescriptorPoolCreateInfo poolInfo = {};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.maxSets = 6000;
     poolInfo.poolSizeCount = 1;
     poolInfo.pPoolSizes = &poolSize;
     if (vkCreateDescriptorPool(ctx.device, &poolInfo, nullptr, &ctx.descPool) != VK_SUCCESS) return false;
-    LOGI("Descriptor pool created");
+    if (vkCreateDescriptorPool(ctx.device, &poolInfo, nullptr, &ctx.descPool2) != VK_SUCCESS) return false;
+    LOGI("Descriptor pools created");
     return true;
 }
 
@@ -681,6 +684,55 @@ struct RC {
         if (it == weights->end()) { LOGE("Weight not found: %s", name); return nullptr; }
         return &it->second.buf;
     }
+
+    // Record 8-batch 3-pass attention (QK^T+softmax+AV) into current cmd buffer.
+    // Q/K/V are the full buffers; O receives the attention output.
+    // Self-attn: M_kv=S, Cross-attn: M_kv=Nctx.
+    void record_attn_3pass(Buffer& Q, Buffer& K, Buffer& V, Buffer& A, Buffer& O,
+                            uint32_t M_q, uint32_t M_kv, uint32_t H, uint32_t D, float scale) {
+        uint32_t batch_q = 64;
+        size_t qPerBatch = batch_q * H * D * 2;
+        size_t aPerBatch = batch_q * H * M_kv * 2;
+
+        for (uint32_t batch = 0; batch < 8; batch++) {
+            VkDeviceSize qOff = (VkDeviceSize)batch * qPerBatch;
+            VkDeviceSize aOff = (VkDeviceSize)batch * aPerBatch;
+
+            // Pass 1: QK^T
+            auto ds1 = alloc_set(vk->attn_qkt.dsl);
+            bind_buf(ds1, 0, Q, qOff, qPerBatch);
+            bind_buf(ds1, 1, K, 0, M_kv * H * D * 2);
+            bind_buf(ds1, 2, A, aOff, aPerBatch);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->attn_qkt.pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->attn_qkt.layout, 0, 1, &ds1, 0, nullptr);
+            PC_AttnQKT pc1 = { batch_q, M_kv, H, D, scale };
+            vkCmdPushConstants(cmd, vk->attn_qkt.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc1), &pc1);
+            vkCmdDispatch(cmd, batch_q * H, 1, 1);
+            barrier();
+
+            // Pass 2: softmax in-place
+            auto ds2 = alloc_set(vk->attn_softmax.dsl);
+            bind_buf(ds2, 0, A, aOff, aPerBatch);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->attn_softmax.pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->attn_softmax.layout, 0, 1, &ds2, 0, nullptr);
+            PC_AttnSoftmax pc2 = { batch_q, M_kv, H };
+            vkCmdPushConstants(cmd, vk->attn_softmax.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc2), &pc2);
+            vkCmdDispatch(cmd, batch_q * H, 1, 1);
+            barrier();
+
+            // Pass 3: AV
+            auto ds3 = alloc_set(vk->attn_out.dsl);
+            bind_buf(ds3, 0, A, aOff, aPerBatch);
+            bind_buf(ds3, 1, V, 0, M_kv * H * D * 2);
+            bind_buf(ds3, 2, O, qOff, qPerBatch);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->attn_out.pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->attn_out.layout, 0, 1, &ds3, 0, nullptr);
+            PC_AttnOut pc3 = { batch_q, M_kv, H, D };
+            vkCmdPushConstants(cmd, vk->attn_out.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc3), &pc3);
+            vkCmdDispatch(cmd, batch_q * H, 1, 1);
+            if (batch < 7) barrier();
+        }
+    }
 };
 
 // ============================================================
@@ -893,14 +945,31 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
     }
     LOGI("All 28 full blocks pre-recorded (28×63 dispatches)");
 
-    // Init empty cmd_attn + cmd_post for all 28 blocks (valid no-op to submit)
+    // Pre-record attention using descPool2 (separate from block descPool)
+    float attn_scale = 1.0f / sqrtf(128.0f);
+    auto savedPool = g_vk.descPool;
+    g_vk.descPool = g_vk.descPool2;
     for (int i = 0; i < 28; i++) {
         VkCommandBufferBeginInfo bi = {};
         bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         vkBeginCommandBuffer(g_vk.cmd_attn[i], &bi);
+
+        RC rc; memset(&rc, 0, sizeof(rc));
+        rc.vk = &g_vk; rc.cmd = g_vk.cmd_attn[i]; rc.weights = &g_weights;
+        rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
+        rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
+        rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf;
+        rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
+
+        // Cross-attn: Q from g_tQ, K from g_t1 (ctx K proj), V from g_rBuf (ctx V proj)
+        // Data written by cmd[i] at submit time, read by cmd_attn[i] at its submit time
+        rc.record_attn_3pass(g_tQ, g_t1, g_rBuf, g_attnA, g_attnO,
+                             512, 1024, 16, 128, attn_scale);
+
         vkEndCommandBuffer(g_vk.cmd_attn[i]);
     }
-    LOGI("cmd_attn[0..27] initialized as empty no-ops");
+    g_vk.descPool = savedPool;
+    LOGI("All 28 cmd_attn pre-recorded with cross-attention (28×24 dispatches, descPool2)");
 
     // ── Step 1: GEMM smoke test ──
     // Verify gemm_fp16 pipeline (already loaded by create_adaln_pipelines)
@@ -1844,7 +1913,7 @@ bool dit_forward_nblocks(void* x_data, void* t_emb_data, void* ctx_data, void* o
         }
         vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
 
-        // Submit attention cmd buffer (no-op for now)
+        // Submit pre-recorded attention (descPool, permanent)
         vkResetFences(g_vk.device, 1, &g_vk.fence);
         submit.pCommandBuffers = &g_vk.cmd_attn[i];
         if (vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.fence) != VK_SUCCESS) {
@@ -2473,7 +2542,8 @@ void dit_destroy() {
     free_sp(g_vk.attn_qkt); free_sp(g_vk.attn_softmax); free_sp(g_vk.attn_out);
 
     if (g_vk.stepPool) vkDestroyDescriptorPool(g_vk.device, g_vk.stepPool, nullptr);
-    if (g_vk.descPool) vkDestroyDescriptorPool(g_vk.device, g_vk.descPool, nullptr);
+    if (g_vk.descPool)  vkDestroyDescriptorPool(g_vk.device, g_vk.descPool, nullptr);
+    if (g_vk.descPool2) vkDestroyDescriptorPool(g_vk.device, g_vk.descPool2, nullptr);
     if (g_lnCmdBuf) vkFreeCommandBuffers(g_vk.device, g_vk.cmdPool, 1, &g_lnCmdBuf);
     if (g_vk.cmd[0])      vkFreeCommandBuffers(g_vk.device, g_vk.cmdPool, 28, g_vk.cmd);
     if (g_vk.cmd_attn[0]) vkFreeCommandBuffers(g_vk.device, g_vk.cmdPool, 28, g_vk.cmd_attn);
