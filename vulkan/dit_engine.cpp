@@ -142,10 +142,34 @@ static bool init_vulkan(VulkanCtx& ctx) {
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "DiT_VK"; appInfo.apiVersion = VK_API_VERSION_1_0;
 
+    // Enumerate available instance layers
+    uint32_t layerCount = 0;
+    vkEnumerateInstanceLayerProperties(&layerCount, nullptr);
+    std::vector<VkLayerProperties> layers(layerCount);
+    vkEnumerateInstanceLayerProperties(&layerCount, layers.data());
+    LOGI("Available Vulkan layers (%u):", layerCount);
+    for (auto& l : layers) LOGI("  %s", l.layerName);
+
+    // Try to enable validation layer
+    const char* wantedLayer = nullptr;
+    for (auto& l : layers) {
+        if (strstr(l.layerName, "validation") || strstr(l.layerName, "VK_LAYER_KHRONOS")) {
+            wantedLayer = l.layerName; break;
+        }
+    }
+    if (wantedLayer) LOGI("Enabling validation layer: %s", wantedLayer);
+
     VkInstanceCreateInfo instInfo = {};
     instInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     instInfo.pApplicationInfo = &appInfo;
-    if (vkCreateInstance(&instInfo, nullptr, &ctx.instance) != VK_SUCCESS) return false;
+    if (wantedLayer) {
+        instInfo.enabledLayerCount = 1;
+        instInfo.ppEnabledLayerNames = &wantedLayer;
+    }
+    if (vkCreateInstance(&instInfo, nullptr, &ctx.instance) != VK_SUCCESS) {
+        LOGE("vkCreateInstance failed");
+        return false;
+    }
 
     uint32_t devCount = 0;
     vkEnumeratePhysicalDevices(ctx.instance, &devCount, nullptr);
@@ -690,47 +714,55 @@ struct RC {
     // Self-attn: M_kv=S, Cross-attn: M_kv=Nctx.
     void record_attn_3pass(Buffer& Q, Buffer& K, Buffer& V, Buffer& A, Buffer& O,
                             uint32_t M_q, uint32_t M_kv, uint32_t H, uint32_t D, float scale) {
-        uint32_t batch_q = 64;
+        // Batch Q rows: aim for ~4096 WG per dispatch (batch_q * H WG)
+        // H=16 → batch_q=256 for 4096 WG. Fall back to 128 if M_q < 256.
+        uint32_t batch_q = 256;
+        if (batch_q > M_q) batch_q = M_q;
+        uint32_t n_batches = (M_q + batch_q - 1) / batch_q;
         size_t qPerBatch = batch_q * H * D * 2;
         size_t aPerBatch = batch_q * H * M_kv * 2;
 
-        for (uint32_t batch = 0; batch < 8; batch++) {
-            VkDeviceSize qOff = (VkDeviceSize)batch * qPerBatch;
-            VkDeviceSize aOff = (VkDeviceSize)batch * aPerBatch;
+        for (uint32_t batch = 0; batch < n_batches; batch++) {
+            uint32_t q_start = batch * batch_q;
+            uint32_t this_q = (q_start + batch_q <= M_q) ? batch_q : (M_q - q_start);
+            VkDeviceSize qOff = (VkDeviceSize)q_start * H * D * 2;
+            VkDeviceSize aOff = (VkDeviceSize)q_start * H * M_kv * 2;
+            size_t qBytes = this_q * H * D * 2;
+            size_t aBytes = this_q * H * M_kv * 2;
 
             // Pass 1: QK^T
             auto ds1 = alloc_set(vk->attn_qkt.dsl);
-            bind_buf(ds1, 0, Q, qOff, qPerBatch);
+            bind_buf(ds1, 0, Q, qOff, qBytes);
             bind_buf(ds1, 1, K, 0, M_kv * H * D * 2);
-            bind_buf(ds1, 2, A, aOff, aPerBatch);
+            bind_buf(ds1, 2, A, aOff, aBytes);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->attn_qkt.pipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->attn_qkt.layout, 0, 1, &ds1, 0, nullptr);
-            PC_AttnQKT pc1 = { batch_q, M_kv, H, D, scale };
+            PC_AttnQKT pc1 = { this_q, M_kv, H, D, scale };
             vkCmdPushConstants(cmd, vk->attn_qkt.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc1), &pc1);
-            vkCmdDispatch(cmd, batch_q * H, 1, 1);
+            vkCmdDispatch(cmd, this_q * H, 1, 1);
             barrier();
 
             // Pass 2: softmax in-place
             auto ds2 = alloc_set(vk->attn_softmax.dsl);
-            bind_buf(ds2, 0, A, aOff, aPerBatch);
+            bind_buf(ds2, 0, A, aOff, aBytes);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->attn_softmax.pipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->attn_softmax.layout, 0, 1, &ds2, 0, nullptr);
-            PC_AttnSoftmax pc2 = { batch_q, M_kv, H };
+            PC_AttnSoftmax pc2 = { this_q, M_kv, H };
             vkCmdPushConstants(cmd, vk->attn_softmax.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc2), &pc2);
-            vkCmdDispatch(cmd, batch_q * H, 1, 1);
+            vkCmdDispatch(cmd, this_q * H, 1, 1);
             barrier();
 
             // Pass 3: AV
             auto ds3 = alloc_set(vk->attn_out.dsl);
-            bind_buf(ds3, 0, A, aOff, aPerBatch);
+            bind_buf(ds3, 0, A, aOff, aBytes);
             bind_buf(ds3, 1, V, 0, M_kv * H * D * 2);
-            bind_buf(ds3, 2, O, qOff, qPerBatch);
+            bind_buf(ds3, 2, O, qOff, qBytes);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->attn_out.pipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->attn_out.layout, 0, 1, &ds3, 0, nullptr);
-            PC_AttnOut pc3 = { batch_q, M_kv, H, D };
+            PC_AttnOut pc3 = { this_q, M_kv, H, D };
             vkCmdPushConstants(cmd, vk->attn_out.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc3), &pc3);
-            vkCmdDispatch(cmd, batch_q * H, 1, 1);
-            if (batch < 7) barrier();
+            vkCmdDispatch(cmd, this_q * H, 1, 1);
+            if (batch < n_batches - 1) barrier();
         }
     }
 };
@@ -744,6 +776,7 @@ static Buffer g_xBuf, g_tEmbBuf, g_ctxBuf, g_outBuf;
 static Buffer g_t1, g_tQ, g_tK, g_tV, g_tO, g_rBuf, g_aBuf, g_nBuf, g_gBuf, g_bcBuf;
 static std::unordered_map<std::string, WeightInfo> g_weights;
 static bool g_init = false;
+static bool g_skip_attn_precord = false;
 
 // ============================================================
 // Public C API
@@ -805,7 +838,8 @@ bool dit_init(const char* weight_path, const char* spv_dir) {
 
 // Forward declaration for pre-recording AdaLN blocks
 static bool record_adaln_block(int blockIdx, int cmdIdx);
-static void record_one_block(RC& rc, int b, Buffer& inBuf, Buffer& outBuf);
+static void record_one_block(RC& rc, int b, Buffer& inBuf, Buffer& outBuf,
+                              bool real_attn = false);
 bool dit_record_all_adaln_blocks(void);
 
 // Lightweight init: AdaLN weights only (~340KB), no GEMM/attention weights.
@@ -945,31 +979,33 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
     }
     LOGI("All 28 full blocks pre-recorded (28×63 dispatches)");
 
-    // Pre-record attention using descPool2 (separate from block descPool)
-    float attn_scale = 1.0f / sqrtf(128.0f);
-    auto savedPool = g_vk.descPool;
-    g_vk.descPool = g_vk.descPool2;
-    for (int i = 0; i < 28; i++) {
-        VkCommandBufferBeginInfo bi = {};
-        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        vkBeginCommandBuffer(g_vk.cmd_attn[i], &bi);
+    if (!g_skip_attn_precord) {
+        // Pre-record attention using descPool2 (separate from block descPool)
+        float attn_scale = 1.0f / sqrtf(128.0f);
+        auto savedPool = g_vk.descPool;
+        g_vk.descPool = g_vk.descPool2;
+        for (int i = 0; i < 28; i++) {
+            VkCommandBufferBeginInfo bi = {};
+            bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            vkBeginCommandBuffer(g_vk.cmd_attn[i], &bi);
 
-        RC rc; memset(&rc, 0, sizeof(rc));
-        rc.vk = &g_vk; rc.cmd = g_vk.cmd_attn[i]; rc.weights = &g_weights;
-        rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
-        rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
-        rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf;
-        rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
+            RC rc; memset(&rc, 0, sizeof(rc));
+            rc.vk = &g_vk; rc.cmd = g_vk.cmd_attn[i]; rc.weights = &g_weights;
+            rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
+            rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
+            rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf;
+            rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
 
-        // Cross-attn: Q from g_tQ, K from g_t1 (ctx K proj), V from g_rBuf (ctx V proj)
-        // Data written by cmd[i] at submit time, read by cmd_attn[i] at its submit time
-        rc.record_attn_3pass(g_tQ, g_t1, g_rBuf, g_attnA, g_attnO,
-                             512, 1024, 16, 128, attn_scale);
+            // Cross-attn: Q from g_tQ, K from g_t1 (ctx K proj), V from g_rBuf (ctx V proj)
+            // Data written by cmd[i] at submit time, read by cmd_attn[i] at its submit time
+            rc.record_attn_3pass(g_tQ, g_t1, g_rBuf, g_attnA, g_attnO,
+                                 512, 1024, 16, 128, attn_scale);
 
-        vkEndCommandBuffer(g_vk.cmd_attn[i]);
+            vkEndCommandBuffer(g_vk.cmd_attn[i]);
+        }
+        g_vk.descPool = savedPool;
+        LOGI("All 28 cmd_attn pre-recorded with cross-attention (28×24 dispatches, descPool2)");
     }
-    g_vk.descPool = savedPool;
-    LOGI("All 28 cmd_attn pre-recorded with cross-attention (28×24 dispatches, descPool2)");
 
     // ── Step 1: GEMM smoke test ──
     // Verify gemm_fp16 pipeline (already loaded by create_adaln_pipelines)
@@ -1219,6 +1255,178 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
     }
 #endif
     g_init = true;
+    return true;
+}
+
+// Set flag to skip attention pre-recording during init (for bisect testing).
+void dit_set_skip_attn_precord(void) { g_skip_attn_precord = true; }
+
+// Bisect helper: pre-record N attention blocks into cmd_attn[0..N-1] via descPool2,
+// then submit cmd[0] to check if GPU descriptor binding state is still valid.
+// Returns true if cmd[0] submit succeeds, false if it fails.
+bool dit_test_attn_precord(int n_blocks) {
+    if (!g_init || n_blocks < 1 || n_blocks > 28) {
+        LOGE("bisect: bad args (init=%d n=%d)", (int)g_init, n_blocks);
+        return false;
+    }
+
+    // Free any previously allocated descPool2 sets from prior bisect iteration
+    vkResetDescriptorPool(g_vk.device, g_vk.descPool2, 0);
+    LOGI("bisect: descPool2 reset, pre-recording %d attention blocks...", n_blocks);
+
+    float attn_scale = 1.0f / sqrtf(128.0f);
+    auto savedPool = g_vk.descPool;
+    g_vk.descPool = g_vk.descPool2;
+
+    for (int i = 0; i < n_blocks; i++) {
+        VkCommandBufferBeginInfo bi = {};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        if (vkBeginCommandBuffer(g_vk.cmd_attn[i], &bi) != VK_SUCCESS) {
+            LOGE("bisect: Begin cmd_attn[%d] failed", i);
+            g_vk.descPool = savedPool;
+            return false;
+        }
+
+        RC rc; memset(&rc, 0, sizeof(rc));
+        rc.vk = &g_vk; rc.cmd = g_vk.cmd_attn[i]; rc.weights = &g_weights;
+        rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
+        rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
+        rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf;
+        rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
+
+        rc.record_attn_3pass(g_tQ, g_t1, g_rBuf, g_attnA, g_attnO,
+                             512, 1024, 16, 128, attn_scale);
+
+        if (vkEndCommandBuffer(g_vk.cmd_attn[i]) != VK_SUCCESS) {
+            LOGE("bisect: End cmd_attn[%d] failed", i);
+            g_vk.descPool = savedPool;
+            return false;
+        }
+    }
+    g_vk.descPool = savedPool;
+    LOGI("bisect: %d attention blocks pre-recorded (%d descriptor sets from descPool2)",
+         n_blocks, n_blocks * 24);
+
+    // ── Test: submit cmd[0] with dummy input, check if GPU accepts it ──
+    // Fill xBuf with fp16(1.0) as safe test input
+    uint16_t* x = (uint16_t*)g_xBuf.mapped;
+    for (uint32_t j = 0; j < MS * D; j++) x[j] = 0x3C00;
+
+    vkResetFences(g_vk.device, 1, &g_vk.stepFence);
+    VkSubmitInfo submit = {};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &g_vk.cmd[0];
+
+    VkResult sr = vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.stepFence);
+    if (sr != VK_SUCCESS) {
+        LOGE("bisect: cmd[0] submit FAILED with %d attention blocks (VkResult=%d)",
+             n_blocks, (int)sr);
+        return false;
+    }
+
+    vkWaitForFences(g_vk.device, 1, &g_vk.stepFence, VK_TRUE, UINT64_MAX);
+
+    // Quick scan for NaN in output
+    uint16_t* out = (uint16_t*)g_outBuf.mapped;
+    int nan_cnt = 0;
+    for (uint32_t j = 0; j < MS * D; j++) {
+        uint16_t h = out[j];
+        if ((h & 0x7C00) == 0x7C00 && (h & 0x3FF)) nan_cnt++;
+    }
+    LOGI("bisect: cmd[0] submit OK with %d attention blocks, output nan=%d",
+         n_blocks, nan_cnt);
+    return true;
+}
+
+// ── Merged attention test: re-record n_blocks with real attention in cmd[i] ──
+// Overwrites the skip-attn pre-recorded cmd buffers.
+// Returns true if all n_blocks recorded successfully.
+bool dit_record_blocks_with_attn(int n_blocks) {
+    if (!g_init || n_blocks < 1 || n_blocks > 28) {
+        LOGE("record_blocks_attn: bad arg n=%d init=%d", n_blocks, (int)g_init);
+        return false;
+    }
+    LOGI("Re-recording %d blocks with real attention (merged into cmd[i])...", n_blocks);
+
+    for (int i = 0; i < n_blocks; i++) {
+        VkCommandBufferBeginInfo bi = {};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        if (vkBeginCommandBuffer(g_vk.cmd[i], &bi) != VK_SUCCESS) {
+            LOGE("Begin cmd[%d] failed", i); return false;
+        }
+
+        RC rc; memset(&rc, 0, sizeof(rc));
+        rc.vk = &g_vk; rc.cmd = g_vk.cmd[i]; rc.weights = &g_weights;
+        rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
+        rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
+        rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf;
+        rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
+
+        record_one_block(rc, i, *rc.xBuf, *rc.outBuf, true);
+
+        if (vkEndCommandBuffer(g_vk.cmd[i]) != VK_SUCCESS) {
+            LOGE("End cmd[%d] failed", i); return false;
+        }
+    }
+    LOGI("All %d blocks re-recorded with merged attention", n_blocks);
+    return true;
+}
+
+// Forward: submit only cmd[i] (attention already merged in, no separate cmd_attn).
+// Otherwise identical to dit_forward_nblocks.
+bool dit_forward_merged(void* x_data, void* t_emb_data, void* ctx_data, void* out_data,
+                         int _MS, int _D, int _M, int _Nctx, int _CtxD, int _nblocks) {
+    if (!g_init) return false;
+    int nblocks = _nblocks;
+    if (nblocks <= 0 || nblocks > 28) nblocks = 28;
+    MS = (uint32_t)_MS; M = (uint32_t)_M; S = MS / M;
+    size_t xBytes = MS * D * 2;
+    size_t tBytes = M * D * 2;
+    size_t ctxBytes = M * (uint32_t)_Nctx * (uint32_t)_CtxD * 2;
+
+    memcpy(g_xBuf.mapped, x_data, xBytes);
+    if (t_emb_data) memcpy(g_tEmbBuf.mapped, t_emb_data, tBytes);
+    if (ctx_data) memcpy(g_ctxBuf.mapped, ctx_data, ctxBytes);
+
+    LOGI("Forward merged: min=%.1f max=%.1f",
+         ((float*)((uint16_t*)g_xBuf.mapped))[0],  // approximate first value
+         ((float*)((uint16_t*)g_xBuf.mapped))[MS*D-1]);
+
+    for (int i = 0; i < nblocks; i++) {
+        vkResetFences(g_vk.device, 1, &g_vk.fence);
+        VkSubmitInfo submit = {};
+        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &g_vk.cmd[i];
+        VkResult sr = vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.fence);
+        if (sr != VK_SUCCESS) {
+            LOGE("Submit cmd[%d] failed (VkResult=%d)", i, (int)sr);
+            return false;
+        }
+        vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+
+        // Diagnostic: scan block output
+        uint16_t* out = (uint16_t*)g_outBuf.mapped;
+        float fmin = 1e30f, fmax = -1e30f;
+        int nan_cnt = 0;
+        for (uint32_t j = 0; j < MS * D; j++) {
+            uint16_t h = out[j];
+            uint32_t exp  = (h >> 10) & 0x1f;
+            uint32_t mant = h & 0x3ff;
+            float val;
+            if (exp == 0) { val = 0.0f; if (mant != 0) val = ldexpf((float)mant, -24); }
+            else if (exp == 31) { if (mant != 0) { nan_cnt++; continue; } else continue; }
+            else { val = ldexpf((float)(mant | 0x400), (int)exp - 25); }
+            if (h & 0x8000) val = -val;
+            if (val < fmin) fmin = val;
+            if (val > fmax) fmax = val;
+        }
+        LOGI("Block %d/%d: min=%.1f max=%.1f nan=%d", i, nblocks, fmin, fmax, nan_cnt);
+        memcpy(g_xBuf.mapped, g_outBuf.mapped, xBytes);
+    }
+
+    memcpy(out_data, g_outBuf.mapped, xBytes);
     return true;
 }
 
@@ -1726,7 +1934,8 @@ bool dit_record_block_full(int blockIdx) {
     return true;
 }
 
-static void record_one_block(RC& rc, int b, Buffer& inBuf, Buffer& outBuf) {
+static void record_one_block(RC& rc, int b, Buffer& inBuf, Buffer& outBuf,
+                              bool real_attn) {
     // Shared bcBuf layout: 9 components at comp * MS*D*2 (no per-block offset)
     //   [0]=scale_self [1]=shift_self [2]=gate_self
     //   [3]=scale_cross [4]=shift_cross [5]=gate_cross
@@ -1774,7 +1983,15 @@ static void record_one_block(RC& rc, int b, Buffer& inBuf, Buffer& outBuf) {
     rc.dispatch_gemm(*rc.nBuf,vw,MS,D,D,*rc.tV);
     rc.dispatch_rmsnorm(*rc.tQ,qnw,*rc.tQ,ph,HEAD_DIM,1e-6f);
     rc.dispatch_rmsnorm(*rc.tK,knw,*rc.tK,ph,HEAD_DIM,1e-6f);
-    rc.dispatch_gemm(*rc.tV,ow,MS,D,D,*rc.tO);
+    if (real_attn) {
+        // Real self-attention: QK^T + softmax + A@V (3-pass)
+        float scl = 1.0f / sqrtf((float)HEAD_DIM);
+        rc.record_attn_3pass(*rc.tQ, *rc.tK, *rc.tV, g_attnA, g_attnO,
+                             MS, MS, N_HEADS, HEAD_DIM, scl);
+        rc.dispatch_gemm(g_attnO, ow, MS, D, D, *rc.tO);
+    } else {
+        rc.dispatch_gemm(*rc.tV, ow, MS, D, D, *rc.tO);  // V→O skip
+    }
     rc.dispatch_scale_shift(*rc.tO,*rc.bcBuf,off(2),inBuf,0,
                             *rc.tV, MS*D,1,1);                    // tV = x + gate*self_attn
 
@@ -1788,7 +2005,15 @@ static void record_one_block(RC& rc, int b, Buffer& inBuf, Buffer& outBuf) {
     rc.dispatch_gemm(*rc.ctxBuf,cx_vw,MS_kv,D,CtxD,*rc.rBuf);
     rc.dispatch_rmsnorm(*rc.tQ,qnw,*rc.tQ,ph,HEAD_DIM,1e-6f);
     rc.dispatch_rmsnorm(*rc.t1,cx_knw,*rc.t1,ph_cross,HEAD_DIM,1e-6f);
-    rc.dispatch_gemm(*rc.rBuf,cx_ow,MS,D,D,*rc.tO);
+    if (real_attn) {
+        // Real cross-attention: QK^T + softmax + A@V (3-pass)
+        float scl = 1.0f / sqrtf((float)HEAD_DIM);
+        rc.record_attn_3pass(*rc.tQ, *rc.t1, *rc.rBuf, g_attnA, g_attnO,
+                             MS, MS_kv, N_HEADS, HEAD_DIM, scl);
+        rc.dispatch_gemm(g_attnO, cx_ow, MS, D, D, *rc.tO);
+    } else {
+        rc.dispatch_gemm(*rc.rBuf, cx_ow, MS, D, D, *rc.tO);  // V→O skip
+    }
     rc.dispatch_scale_shift(*rc.tO,*rc.bcBuf,off(5),*rc.tV,0,
                             *rc.gBuf, MS*D,1,1);
 
@@ -1908,16 +2133,18 @@ bool dit_forward_nblocks(void* x_data, void* t_emb_data, void* ctx_data, void* o
         submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &g_vk.cmd[i];
-        if (vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.fence) != VK_SUCCESS) {
-            LOGE("Submit failed at block %d", i); return false;
+        VkResult sr = vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.fence);
+        if (sr != VK_SUCCESS) {
+            LOGE("Submit cmd[%d] FAILED (VkResult=%d)", i, (int)sr); return false;
         }
         vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
 
-        // Submit pre-recorded attention (descPool, permanent)
+        // Submit pre-recorded attention (descPool2, permanent)
         vkResetFences(g_vk.device, 1, &g_vk.fence);
         submit.pCommandBuffers = &g_vk.cmd_attn[i];
-        if (vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.fence) != VK_SUCCESS) {
-            LOGE("Submit attn[%d] failed", i); return false;
+        sr = vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.fence);
+        if (sr != VK_SUCCESS) {
+            LOGE("Submit cmd_attn[%d] FAILED (VkResult=%d)", i, (int)sr); return false;
         }
         vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
 

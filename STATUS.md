@@ -163,51 +163,62 @@ dit_forward_nblocks(x, t_emb, ctx, out, nblocks)
   → 28 submit/步, ~25s/步
 ```
 
-### 下一步：Attention 集成 (3b) — 2026-05-30 进展
+### Attention 集成 (3b) — 2026-05-30 晚间结论
 
-**目标**：把 per-call 3-pass attention 集成到 C++ 引擎。
+**旧假设全部推翻。阻塞不是 descPool 阈值，是 Adreno TDR 看门狗。**
 
-**当前架构**（8a17806）：
-```
-cmd[i]     (28 个, descPool):  28-block skip-attn (63 dispatch each)
-cmd_attn[i](28 个, descPool2): cross-attn 3-pass (24 dispatch each, pre-recorded)
-cmd_post[i](28 个, 空):       预留给 O_proj+gate+MLP
-Forward: submit cmd[i] → submit cmd_attn[i] → chain (56 submit/step)
-```
+#### 二分定位 descPool 阈值 → 结论：不存在
 
-**已验证的**：
-- QK^T single dispatch: ✅
-- 1-batch 3-pass (QK^T+softmax+AV): ✅  
-- 8-batch self-attn (24 dispatch in one cmdBuf): ✅
-- self+cross 2×8-batch (48 dispatch, g_lnCmdBuf): ✅ (但会破坏 descPool 状态)
-- empty cmd_attn submit (56/step, 3 steps): ✅ (VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT 修复)
-- per-step stepPool recording: ❌ (step 2 submit fails)
-- pre-recorded descPool attention (28 cmd_attn × 24 dispatch): ❌ (cmd[0] submit fails)
+| 测试 | descPool2 sets | cmd[0] submit | 结论 |
+|------|---------------|---------------|------|
+| 14 blocks attention | 336 | ✅ | |
+| 21 blocks | 504 | ✅ | |
+| 25 blocks | 600 | ✅ | |
+| **28 blocks (全量)** | **672** | ✅ | 之前失败是其他 bug，不是阈值 |
 
-**阻塞问题**：
-- 48 attention dispatch 不破坏状态，672 dispatch (28×24) 破坏 → 阈值在 48..672 之间
-- descPool 分离无效 — 不是池耗尽，是 GPU 内部 descriptor binding 资源限制
-- 下一步：二分定位精确阈值，然后按阈值分批预录 attention
+总 descriptor sets: 1764 (descPool) + 672 (descPool2) = 2436，cmd[0] submit 正常。
+之前 commit `8a17806` 报告的 "672 sets 导致 cmd[0] submit 失败" 实际是被 3b-iv smoke test
+(48 dispatch on g_lnCmdBuf) 污染了 GPU 状态。已用 `#if 0` 禁用该测试。
 
-**还需移入 C++ 的部分**：
+#### 真正瓶颈：TDR 看门狗
+
+Adreno 730 的单次 `vkQueueSubmit` 执行时间有看门狗超时。超时 → `VK_ERROR_DEVICE_LOST`(-4)。
+关键证据：
+
+| GPU 频率 | 单 block 执行时间(63 dispatch) | 能跑几个 block | 
+|----------|------------------------------|---------------|
+| 510 MHz (底频) | ~2.9s | 0-2 |
+| 645 MHz | ~2.3s | ~10 |
+| **912 MHz (锁定超频)** | ~1.6s | **28 (全过)** |
+
+规律：频率越低→执行越慢→越早触发 TDR。频率完全决定了崩溃的早晚。
+
+**这意味着 pre-record 大块 dispatch 的架构对 Adreno 这类移动 GPU 是反模式**——正确的做法是每次 submit
+只包含少量 dispatch（控制在几百 ms 以内），避免触发看门狗。详见"下步路线"。
+
+#### 三种架构对比
+
+| 方案 | submit/步 | dispatch/cmd | TDR 风险 | 状态 |
+|------|-----------|-------------|---------|------|
+| separate cmd_attn | 56 | cmd=63, attn=24 | ⚠️ 看频率 | 912MHz 过 |
+| **merge 进 cmd[i]** | **28** | 73 (batch_q=256) | ⚠️ 看频率 | 912MHz **待测** |
+| per-call (HybridOps) | 534 | 3 | ✅ 安全 | 太慢 |
+
+#### Shader 优化：batch_q 动态化
+
+`record_attn_3pass` 的 `batch_q` 从硬编码 64 → 自适应（按 target WG=2048~4096 计算）:
+- batch_q=256: 2 批 × 3 pass = 6 dispatch/attention（vs 原来 8 批 × 3 = 24）
+- block dispatch 从 109 降到 73 (61 block + 6 self + 6 cross)
+- 73 dispatch 在 510MHz 下仍超 TDR，912MHz 待测
+
+**待补模块**（短期 912MHz merge / 中期 per-step recording）:
 
 | 模块 | 优先级 | 说明 |
 |------|--------|------|
-| **Attention 3-pass** | 🔴 最高 | descPool 阈值阻塞，需二分定位 |
-| **RoPE** | 🟡 中 | 56 次 ~3s/步，可参考 ET 的 per-texel shader |
+| **Self-attn + Cross-attn 真实计算** | 🔴 最高 | 替换 skip-attn (V→O_proj) → 出正图 |
+| **RoPE GPU** | 🟡 中 | 56 次 ~3s/步，可参考 ET 的 per-texel shader |
 | **final_layer** | 🟢 低 | 1 次 <1s，PyTorch 暂时够用 |
-| **x_embedder** | 🟢 低 | 1 次 GEMM，PyTorch 可跑 |
-| **VAE decoder** | ⚪ 远期 | 完全独立模块，跑完 DiT 后才加载 |
-
-**还需移入 C++ 的部分**：
-
-| 模块 | 优先级 | 说明 |
-|------|--------|------|
-| **Attention 3-pass** | 🔴 最高 | 修复 skip-attention → 出正图 |
-| **RoPE** | 🟡 中 | 56 次 ~3s/步，可参考 ET 的 per-texel shader |
-| **final_layer** | 🟢 低 | 1 次 <1s，PyTorch 暂时够用 |
-| **x_embedder** | 🟢 低 | 1 次 GEMM，PyTorch 可跑 |
-| **VAE decoder** | ⚪ 远期 | 完全独立模块，跑完 DiT 后才加载 |
+| **VAE decoder** | ⚪ 远期 | 完全独立模块 |
 
 **PyTorch 轻量化策略**：`num_blocks=0` — PyTorch 只创建 x_embedder + t_embedder + final_layer (~20MB)，不加载 28 block 权重 (~3.7GB)。C++ 引擎扛全部 block 推理。
 
@@ -228,25 +239,35 @@ Forward: submit cmd[i] → submit cmd_attn[i] → chain (56 submit/step)
 
 ### 未完成
 
-- **RoPE + Attention** ⚠️ 已尝试（commit b729aca），发现两个问题：
-  1. Attention shader 的 K/V layout 假设错误（原为 batch-head-token，实际 batch-token-head），导致格子 artifact。已定位修复但 SPIR-V 加载了旧文件
-  2. Cross-attn Q_proj/Q_norm 用错权重（用了 self 的），已定位修复
-  3. Workgroup 粒度过细（8192+16384/block），53s/步 → 需优化 attention shader
-  4. 已回退到 92ee6b2，保留 skip-attention
+- **Cross-attn Q_proj 用错权重**：`record_one_block` 的 cross-attn 段用了 `self_attn.q_proj.weight` 而非 `cross_attn.q_proj.weight`（skip-attn 路径也存在此 bug，但不影响 skip 正确性，真 attention 需修复）
+- **Self-attn + Cross-attn 真实计算**：已用 `record_attn_3pass` + `batch_q=256` 实现 merge 版（73 dispatch/cmd），912MHz 待管线验证
+- RoPE GPU（per-texel shader，参考 ET `apply_rotary_emb_interleaved.glsl`）
 - x_embedder, t_embedder, final_layer C++ 移植
 - VAE decode（暂留 PyTorch）
-- 端到端 phone_pipeline 出图（pipeline_cpp.py 已可用但出图有格子）
+- 端到端 phone_pipeline 出正图
 
-### 关键技术发现 (2026-05-30 更新)
+### 下步路线 (2026-05-30 晚间)
 
-- **FP32 LN shader + FP16 buffer = NaN**：`layer_norm.spv` (FP32) 读 FP16 buffer → 两半拼一 float → 全 NaN。修复：FP16 LN pipeline
-- **descPool descriptor set 阈值**：超出 ~2000 个 descriptor sets 后 cmd[0] submit 失败。不是池容量问题（maxSets=6000 没超），是 GPU 内部 binding 资源限制。分离 descriptor pool 无效
-- **g_lnCmdBuf 上录 attention dispatch 破坏状态**：48 个 attention dispatch 在 g_lnCmdBuf 上 submit 后，后续 cmd[0] submit 失败。需要用专用 cmd buffer
-- **VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT**：不加此 flag 时 vkBeginCommandBuffer 在 executable 状态 cmd buffer 上是 UB
-- **Adreno 单 cmd buffer 上限 ~64 dispatches**：超过后 vkQueueSubmit 失败
-- **单 buffer 上限 < 3.9GB**：weight buffer 分配失败，改 per-tensor buffer 解决
-- **Attention Q/K/V layout**：(batch, token, head) 而非 (batch, head, token)
-- **Attention workgroup batch**：8192 WG → 拆 8 批 × 64 Q token (1024 WG/批)
+**短期（今晚）**：912MHz merge 方案 → phone_pipeline.py 出正图。
+- batch_q=256 的 73 dispatch/cmd，28 submit/步
+- 用 `dit_record_blocks_with_attn` 重录 cmd[i] + `dit_forward_merged` 只 submit cmd
+
+**中期（正确方向）**：per-step recording in C++ forward。
+- 不做 pre-record——C++ 内部小批量录→submit→wait→循环
+- 单次 submit <500ms，不碰 TDR
+- Python 只调一次 `dit_forward_step()`
+- 所有频率下稳定运行
+
+**validation layer**：arm64-v8a 预编译 .so 已下载但 Android loader 不搜 /data/local/tmp。搁置。
+
+### 关键技术发现 (2026-05-30 晚间更新)
+
+- **TDR 看门狗是真正瓶颈**：submission 执行时间 >~2s 触发 VK_ERROR_DEVICE_LOST。频率越低越早触发。~~descPool 阈值~~、~~64 dispatch 上限~~ 均为误判。
+- **descPool 阈值不存在**：2436 total descriptor sets (1764+672) 正常提交，之前失败是 g_lnCmdBuf 48 dispatch smoke test 污染状态
+- **TDR 使 pre-record 大 cmd buffer 对 Adreno 是反模式**：正确做法是每次 submit 只含少量 dispatch
+- **batch_q 可动态化**：record_attn_3pass 从硬编码 8 批→自适应 2-4 批，减少 3× dispatch
+- **FP32 LN shader + FP16 buffer = NaN**：已修复 (FP16 LN pipeline)
+- 旧版发现（仍有效）：`VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT`、per-tensor buffer 替代大 buffer、Q/K/V layout (batch, token, head)
 
 ---
 

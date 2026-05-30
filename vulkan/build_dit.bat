@@ -9,7 +9,7 @@ echo.
 :: Step 1: compile GLSL → SPIR-V
 echo === Compiling shaders ===
 set GLSLC=%VK%\Bin\glslangValidator.exe
-for %%s in (gemm_fp16 rms_norm_fp16 layernorm_fp16 silu_fp16 softmax_fp16 add_fp16 scale_shift_fp16 rope_fp16 attention_fp16 broadcast_fp16) do (
+for %%s in (gemm_fp16 rms_norm_fp16 layernorm_fp16 silu_fp16 softmax_fp16 add_fp16 scale_shift_fp16 rope_fp16 attention_fp16 broadcast_fp16 gelu_fp16 layernorm_fp32 attn_qkt attn_softmax attn_out) do (
     if exist %%s.comp (
         echo   %%s.comp
         "%GLSLC%" -V %%s.comp -o %%s.spv >nul 2>&1
