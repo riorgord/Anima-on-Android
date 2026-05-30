@@ -823,10 +823,13 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
 
     if (!create_buffer(g_vk, M * D * 2, u, g_tEmbBuf)) return false;
     if (!create_buffer(g_vk, adalnSz, u, g_aBuf)) return false;
-    if (!create_buffer(g_vk, M * ADALN_LORA_DIM * 2, u, g_t1)) return false;
-    if (!create_buffer(g_vk, M * D * 2, u, g_tQ)) return false;
-    if (!create_buffer(g_vk, M * D * 2, u, g_tK)) return false;
-    if (!create_buffer(g_vk, M * D * 2, u, g_tV)) return false;
+    // Sized for full block recording (MS rows), not just AdaLN (M rows)
+    size_t bigSz = MS * MLP_HIDDEN * 2;  // 8MB — MLP fc1 output
+    size_t attSz = MS * N_HEADS * HEAD_DIM * 2;  // 2MB — Q/K/V output
+    if (!create_buffer(g_vk, bigSz, u, g_t1)) return false;
+    if (!create_buffer(g_vk, attSz, u, g_tQ)) return false;
+    if (!create_buffer(g_vk, attSz, u, g_tK)) return false;
+    if (!create_buffer(g_vk, attSz, u, g_tV)) return false;
     if (!create_buffer(g_vk, bcastSz, u, g_bcBuf)) return false;
 
     if (!create_buffer(g_vk, 3 * M * D * 2, u, g_loraBuf)) return false;
