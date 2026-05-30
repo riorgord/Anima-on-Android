@@ -22,9 +22,10 @@
 | C++ 引擎 +cross-attn | 13.3s/步 | 9× | ✅ |
 | **C++ 引擎 +GPU AdaLN** | **13.06s/步** | **9.2×** | benchmark 通过, 管线未验证 |
 | **C++ 引擎 28-block 预录 (skip-attn)** | **~25s/步** | **~4.8×** | ✅ 管线验证无 NaN (26°C) |
-| C++ 引擎 +真实 attention (目标) | ~30-40s/步 | 3-4× | ⏳ 开发中 |
+| **C++ 引擎 +空 cmd_attn (56 submit/步)** | **~25s/步** | **~4.8×** | ✅ RESET flag 修复 |
+| C++ 引擎 +真实 attention (目标) | ~30-40s/步 | 3-4× | ⏳ 开发中 (descPool 阈值问题) |
 
-注：HybridOps 28-block 预录跑通后将降到 ~500 submit → 28 submit/步，预计 ~40s/步。真实 attention 集成后增至 84 submit/步 (28 blocks × 3 cmdBuf)。
+注：HybridOps 管线已被 C++ 引擎替代。当前管线：PyTorch 轻量壳 (~306MB) + C++ 引擎 (3.9GB Vulkan)。56 submit/步 (28 cmd[i] + 28 cmd_attn[i])。
 
 ## C++ 引擎状态 (libdit_vk.so v3 — 2026-05-30 重写)
 
@@ -162,38 +163,41 @@ dit_forward_nblocks(x, t_emb, ctx, out, nblocks)
   → 28 submit/步, ~25s/步
 ```
 
-### 下一步：Attention 集成 (3b)
+### 下一步：Attention 集成 (3b) — 2026-05-30 进展
 
-把 per-call 的 3-pass attention (`submit_attn_3pass`) 逻辑移到 `record_one_block` 里。
+**目标**：把 per-call 3-pass attention 集成到 C++ 引擎。
 
-**当前 skip-attention 的 self-attn 部分 (record_one_block:1520-1529)**：
+**当前架构**（8a17806）：
 ```
-LN → Q_proj → K_proj → V_proj → Q_norm → K_norm → [V → O_proj] → gate+residual
-                                                         ^^^^^^^^^^
-                                                         跳过了 QK^T + softmax + SV
-```
-
-**改为真实 attention**：
-```
-LN → Q_proj → K_proj → V_proj → Q_norm → K_norm → QK^T → softmax → SV → O_proj → gate+residual
-                                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-                                                       新增 24 dispatch (self) + 24 dispatch (cross)
+cmd[i]     (28 个, descPool):  28-block skip-attn (63 dispatch each)
+cmd_attn[i](28 个, descPool2): cross-attn 3-pass (24 dispatch each, pre-recorded)
+cmd_post[i](28 个, 空):       预留给 O_proj+gate+MLP
+Forward: submit cmd[i] → submit cmd_attn[i] → chain (56 submit/step)
 ```
 
-**挑战**：
-1. Self-attn Q 有 512 token × 16 head = 8192 WG → 需拆 8 批 (64 Q token/批)
-2. Cross-attn Q 同上 8 批，K/V 来自 ctx (1024 token)
-3. 每批 3 dispatch (QK^T/softmax/AV) × 8 = 24 dispatch/attention
-4. 24+24 = 48 attention dispatch + 63 existing = 111 > Adreno 单 cmdBuf ~64 上限
+**已验证的**：
+- QK^T single dispatch: ✅
+- 1-batch 3-pass (QK^T+softmax+AV): ✅  
+- 8-batch self-attn (24 dispatch in one cmdBuf): ✅
+- self+cross 2×8-batch (48 dispatch, g_lnCmdBuf): ✅ (但会破坏 descPool 状态)
+- empty cmd_attn submit (56/step, 3 steps): ✅ (VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT 修复)
+- per-step stepPool recording: ❌ (step 2 submit fails)
+- pre-recorded descPool attention (28 cmd_attn × 24 dispatch): ❌ (cmd[0] submit fails)
 
-**方案：每 block 拆 3 个 cmd buffer**
-```
-cmd_PRE[i]  (57 dispatch): AdaLN + LN + QKV GEMM + norms
-cmd_ATTN[i] (48 dispatch): self 3-pass×8批 + cross 3-pass×8批
-cmd_POST[i] (7 dispatch):  O_proj + gate + GELU + FC2 + residual
-```
+**阻塞问题**：
+- 48 attention dispatch 不破坏状态，672 dispatch (28×24) 破坏 → 阈值在 48..672 之间
+- descPool 分离无效 — 不是池耗尽，是 GPU 内部 descriptor binding 资源限制
+- 下一步：二分定位精确阈值，然后按阈值分批预录 attention
 
-Forward 变为 28×3 = **84 submit/步**，预期 ~30-40s/步。
+**还需移入 C++ 的部分**：
+
+| 模块 | 优先级 | 说明 |
+|------|--------|------|
+| **Attention 3-pass** | 🔴 最高 | descPool 阈值阻塞，需二分定位 |
+| **RoPE** | 🟡 中 | 56 次 ~3s/步，可参考 ET 的 per-texel shader |
+| **final_layer** | 🟢 低 | 1 次 <1s，PyTorch 暂时够用 |
+| **x_embedder** | 🟢 低 | 1 次 GEMM，PyTorch 可跑 |
+| **VAE decoder** | ⚪ 远期 | 完全独立模块，跑完 DiT 后才加载 |
 
 **还需移入 C++ 的部分**：
 
@@ -212,13 +216,15 @@ Forward 变为 28×3 = **84 submit/步**，预期 ~30-40s/步。
 | Shader | 独立验证 | Block 内集成 |
 |--------|---------|-------------|
 | GEMM (gemm_fp16) | ✅ | ✅ |
-| LayerNorm | ✅ | ✅ |
+| LayerNorm (FP16) | ✅ | ✅ (FP16 fix) |
 | RMSNorm | ✅ | ✅ |
 | SiLU | ✅ | ✅ |
 | ScaleShift | ✅ | ✅ |
-| Broadcast | ❌ 未测 | — |
-| Attention | ❌ 未测 | — |
-| RoPE | ❌ 未测 | — |
+| Attn QK^T | ✅ | 🚧 cmd_attn |
+| Attn Softmax | ✅ | 🚧 cmd_attn |
+| Attn AV | ✅ | 🚧 cmd_attn |
+| Broadcast | — | ✅ |
+| RoPE | — | ❌ |
 
 ### 未完成
 
@@ -231,14 +237,16 @@ Forward 变为 28×3 = **84 submit/步**，预期 ~30-40s/步。
 - VAE decode（暂留 PyTorch）
 - 端到端 phone_pipeline 出图（pipeline_cpp.py 已可用但出图有格子）
 
-### 关键技术发现
+### 关键技术发现 (2026-05-30 更新)
 
+- **FP32 LN shader + FP16 buffer = NaN**：`layer_norm.spv` (FP32) 读 FP16 buffer → 两半拼一 float → 全 NaN。修复：FP16 LN pipeline
+- **descPool descriptor set 阈值**：超出 ~2000 个 descriptor sets 后 cmd[0] submit 失败。不是池容量问题（maxSets=6000 没超），是 GPU 内部 binding 资源限制。分离 descriptor pool 无效
+- **g_lnCmdBuf 上录 attention dispatch 破坏状态**：48 个 attention dispatch 在 g_lnCmdBuf 上 submit 后，后续 cmd[0] submit 失败。需要用专用 cmd buffer
+- **VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT**：不加此 flag 时 vkBeginCommandBuffer 在 executable 状态 cmd buffer 上是 UB
 - **Adreno 单 cmd buffer 上限 ~64 dispatches**：超过后 vkQueueSubmit 失败
 - **单 buffer 上限 < 3.9GB**：weight buffer 分配失败，改 per-tensor buffer 解决
-- **fp16 溢出于 block 23**：随机输入下残差累积突破 65504
-- **验证策略**：PyTorch dump → 卸载 → C++ 对比
-- **Attention Q/K/V layout**：(batch, token, head) 而非 (batch, head, token)，shader KV 访问需 stride by n_heads
-- **Attention workgroup 过细**：8192 wg/self-attn → 53s/步，需合并 query rows 到一个 wg
+- **Attention Q/K/V layout**：(batch, token, head) 而非 (batch, head, token)
+- **Attention workgroup batch**：8192 WG → 拆 8 批 × 64 Q token (1024 WG/批)
 
 ---
 
