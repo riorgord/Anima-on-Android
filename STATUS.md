@@ -1,10 +1,10 @@
-# Anima 项目状态摘要 (2026-05-31 晚间)
+# Anima 项目状态摘要 (2026-06-01)
 
 ## 我们在做什么
 在 Snapdragon 8+ Gen1 手机上运行 Anima 动漫风格图像生成模型 (2B DiT)。
 
 ## 当前状态（一句话）
-C++ 66s/步出图 **105KB**（PC 基准 74KB）。GEMM/LN/RMSNorm/SiLU/AdaLN 全部验证正确。FP16 gate residual 动态范围导致后层溢出，MLP+SA+CX 缩放 -11%。bit-exact=0 放弃——Vulkan/CUDA FMA 硬件舍入不同。**
+C++ 66s/步出图 **105KB**（PC 基准 74KB，原始 HybridOps 81KB）。GEMM/LN/RMSNorm/SiLU/AdaLN 全部验证正确。FP16 gate residual 动态范围导致后层溢出，MLP+SA+CX 缩放 -11%。bit-exact=0 放弃。**下步：合并 HybridOps (81KB) + 当前 C++ 引擎为一份管线，PyTorch 不放权重。**
 
 ## 出图演进
 
@@ -21,8 +21,10 @@ C++ 66s/步出图 **105KB**（PC 基准 74KB）。GEMM/LN/RMSNorm/SiLU/AdaLN 全
 ~~bit-exact=0~~ → **出图大小匹配 PC 基准 74KB**。bit-exact 已放弃：Vulkan/CUDA FMA 硬件指令舍入方向不同，无法消除。实际走混合精度路线（缩放 gate residual 压低 FP16 溢出）。
 
 ## ⚠️ 快速提醒（每次会话重启后先看这个）
+- **ADB 连接**：WiFi: `adb connect 192.168.0.104:5555`。设备 ID: `87cca7ec`。文件推送需 `MSYS_NO_PATHCONV=1` 防止 Git Bash 路径转换。
 - **VK_ERROR_DEVICE_LOST → 拉满 GPU 频率 912MHz**。低频下 dispatch 超 TDR 250ms→驱动杀进程。`adb shell "su -c 'echo 912000000 > /sys/class/kgsl/kgsl-3d0/max_gpuclk'"`。
-- **PC 参考图基准**：`output/whitebox/pc_ref_whitebox.png`，**73,840 字节** = 干净。手机出图 >110KB = 有雪花/bug。当前手机图 118,681 字节。
+- **PC 参考图基准**：`output/whitebox/pc_ref_whitebox.png`，**73,840 字节** = 干净。HybridOps 出图 81KB。当前 C++ 出图 105KB（SA×1/4 + CX×1/4 + MLP×1/8 缩放后）。
+- **HybridOps 管线**：`hybridops/` 目录保存了原始 57s/步 HybridOps 管线（2026-05-25），用于对比和合并参考。
 - **核心对比框架**：`scripts/pc_whitebox_ref.py`（WSL2 运行，`source /home/riorg/miniconda3/etc/profile.d/conda.sh && conda activate /home/riorg/anima-work/.conda`）。白盒逐 op 复现 C++ 引擎。`--compare output/cmp` 对比手机 dump。
 - **手机 dump 脚本**：`scripts/phone_dump_blocks.py`。用法：先 `adb push` + `adb shell` 运行，再 `adb pull` 结果，再 PC `--compare`。
 - **C++ 引擎关键知识**：
@@ -30,7 +32,8 @@ C++ 66s/步出图 **105KB**（PC 基准 74KB）。GEMM/LN/RMSNorm/SiLU/AdaLN 全
   - t_emb 用 C++ 自己的 `dit_compute_timestep`（sin→RMSNorm→SiLU@w1→@w2），不是 PyTorch 的 t_embedder。PC 白盒已复现，验证一致。
   - `dit_init_adaln_only` 用 `load_weights`（全部 685 个 tensor，4.18GB），不是 `load_adaln_weights`。
 - **权重必须一致**：手机 `diffusion_weights.bin` 和 PC `diffusion_weights_fp16.pt` 必须来自同一源。用 `scripts/export_weights.py`（会 strip `net.` 前缀）从 .pt 生成 .bin。
-- **真实管线对比**：PC `gen_real_inputs.py` 生成 x_emb/t_emb/ctx → 手机 `run_realpipe_phone.py` 用同输入跑 → 拉回对比。当前结果：Block 0 max_err=5.29，Q_norm max_err=0.039（根因：并行 reduction 求和顺序 ≠ PyTorch sequential 顺序）。**终极目标：bit-exact = 0**。
+- **真实管线对比**：PC `gen_real_inputs.py` 生成 x_emb/t_emb/ctx → 手机 `run_realpipe_phone.py` 用同输入跑 → 拉回对比。Block 0 max_err=5.29（fp16 精度天花板）。
+- **合并目标**：去掉 PyTorch 权重加载（small.pt），C++ 全包 x_embedder + blocks + final_layer。可参考 `hybridops/` 的管线结构。
 
 ---
 
