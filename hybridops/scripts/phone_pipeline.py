@@ -1,0 +1,86 @@
+import sys, time, gc
+sys.path.insert(0, "/sdcard/anima_on_android/src")
+import torch, numpy as np
+from PIL import Image
+import predict2, llm_adapter
+import wan_vae  # our fixed WanVAE (latent norm added)
+sys.path.insert(0, "/sdcard/anima_on_android/scripts")
+import vk_ops  # Vulkan-accelerated ops
+
+DEV = "cpu"
+DTYPE = torch.float16
+STEPS = 3
+CFG = 5.0
+SEED = 6666
+H = 32  # 256x256
+
+# Load contexts (small, fast)
+ctx_cond = torch.load("/sdcard/anima_on_android/models/context_cond.pt", weights_only=True).to(DEV).to(DTYPE)
+ctx_uncond = torch.load("/sdcard/anima_on_android/models/context_uncond.pt", weights_only=True).to(DEV).to(DTYPE)
+
+# Load DiT
+print("Loading DiT...")
+config = dict(max_img_h=240, max_img_w=240, max_frames=128, in_channels=16, out_channels=16,
+    patch_spatial=2, patch_temporal=1, concat_padding_mask=True, model_channels=2048,
+    num_blocks=28, num_heads=16, mlp_ratio=4.0, crossattn_emb_channels=1024,
+    pos_emb_cls="rope3d", pos_emb_learnable=True, pos_emb_interpolation="crop",
+    min_fps=1, max_fps=30, use_adaln_lora=True, adaln_lora_dim=256,
+    rope_h_extrapolation_ratio=4.0, rope_w_extrapolation_ratio=4.0, rope_t_extrapolation_ratio=1.0,
+    extra_per_block_abs_pos_emb=False, rope_enable_fps_modulation=False)
+dit_sd = torch.load("/sdcard/anima_on_android/models/diffusion_weights_fp16.pt", weights_only=True)
+dit = predict2.MiniTrainDIT(**config, device=DEV, dtype=DTYPE, operations=vk_ops.HybridOps)
+dit.load_state_dict(dit_sd, strict=False)
+dit.eval()
+del dit_sd; gc.collect()
+print("DiT loaded")
+
+# Scheduler
+def time_snr_shift(a, t): return a * t / (1.0 + (a - 1.0) * t)
+linear = torch.linspace(1.0, 0.0, STEPS + 1)[:-1]
+sigmas = (3.0 * linear / (1.0 + 2.0 * linear)).tolist() + [0.0]
+
+# Denoising
+print(f"Denoising {STEPS} steps, H={H}...")
+gen = torch.Generator(device=DEV).manual_seed(SEED)
+x = torch.randn(1, 16, H, H, generator=gen, dtype=DTYPE)
+t_start = time.time()
+
+for i in range(STEPS):
+    sigma = sigmas[i]
+    sigma_next = sigmas[i + 1]
+    ts = torch.tensor([sigma], dtype=DTYPE)
+    x_b = x.unsqueeze(2).repeat(2, 1, 1, 1, 1)
+    ctx_b = torch.cat([ctx_cond, ctx_uncond], dim=0)
+    ts_b = ts.repeat(2)
+    t0 = time.time()
+    with torch.no_grad():
+        v_b = dit(x_b, ts_b, ctx_b)
+    dit_time = time.time() - t0
+    v_cond = v_b[0:1].float()
+    v_uncond = v_b[1:2].float()
+    v_cfg = v_uncond + CFG * (v_cond - v_uncond)
+    x = (x.float() + v_cfg.squeeze(2) * (sigma_next - sigma)).to(DTYPE)
+    print(f"  step {i+1}/{STEPS}: {dit_time:.0f}s (total {time.time()-t_start:.0f}s)")
+
+# Diagnostic
+print(f"VkGEMM: {vk_ops._VK_COUNT} Vulkan, {vk_ops._CPU_COUNT} CPU calls")
+
+# VAE — our fixed WanVAE (latent normalization added)
+print("Loading VAE...")
+vae_sd = torch.load("/sdcard/anima_on_android/models/vae_weights_fp16.pt", weights_only=True)
+vae = wan_vae.WanVAE(dim=96, z_dim=16, dim_mult=[1,2,4,4], num_res_blocks=2, attn_scales=[],
+    temperal_downsample=[False,True,True], image_channels=3, conv_out_channels=3, dropout=0.0)
+vae.load_state_dict({k: v.float() for k, v in vae_sd.items()}, strict=False)  # strict=False for new buffers
+vae.eval(); del vae_sd
+
+print("Decoding...")
+with torch.no_grad():
+    image = vae.decode(x.float().unsqueeze(2))
+img = image[0,:,0].clamp(-1,1)
+img = ((img+1)/2*255).permute(1,2,0).cpu().numpy().astype(np.uint8)
+out = "/sdcard/anima_on_android/output/phone_first.png"
+Image.fromarray(img).save(out)
+total_t = time.time() - t_start
+print(f"Saved: {out}")
+print(f"TOTAL: {STEPS} steps, {total_t:.0f}s ({total_t/STEPS:.0f}s/step), {H*8}x{H*8}")
+del dit, vae, x, img; gc.collect()
