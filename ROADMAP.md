@@ -655,6 +655,14 @@ Do not install large or mobile-specific toolchains yet. Do not start QNN/Android
 
 ## 12. Current status (updated 2026-05-27 evening)
 
+### HybridOps safetensors 直读 ✅ (2026-06-01 凌晨)
+
+`hybridops/` 已实现：
+- 手机直读 `.safetensors`（BF16），加载时一次性 BF16→FP16 存入 Vulkan
+- 新 Vulkan 引擎 `libhybrid_engine.so` (~500KB): GEMM/LN/RMSNorm/GELU per-call dispatch
+- PyTorch 不再持有 block 权重 (~200MB shell), 稳态内存 ~3.9GB
+- 详见 `STATUS.md` 和 `hybridops/scripts/phone_pipeline.py`
+
 ### C++ Vulkan Engine v2 — REWRITTEN & WORKING
 
 - **libdit_vk.so**: ~1000 lines, 8 shader pipelines, 28 per-block cmd buffers

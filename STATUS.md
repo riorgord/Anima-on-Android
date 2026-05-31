@@ -4,7 +4,7 @@
 在 Snapdragon 8+ Gen1 手机上运行 Anima 动漫风格图像生成模型 (2B DiT)。
 
 ## 当前状态（一句话）
-C++ 66s/步出图 **105KB**（PC 基准 74KB，原始 HybridOps 81KB）。GEMM/LN/RMSNorm/SiLU/AdaLN 全部验证正确。FP16 gate residual 动态范围导致后层溢出，MLP+SA+CX 缩放 -11%。bit-exact=0 放弃。**下步：合并 HybridOps (81KB) + 当前 C++ 引擎为一份管线，PyTorch 不放权重。**
+**HybridOps 管线已重写**：手机直读 BF16 safetensors，权重只存 Vulkan（libhybrid_engine.so ~500KB）。PyTorch shell ~200MB，稳态内存 ~3.9GB，峰值 ~5.6GB。出图干净，3步 142s (47s/步)，840/840 GEMM 走 Vulkan。**下一步：优化峰值内存 → APK 打包 → QNN NPU 探索。**
 
 ## 出图演进
 
@@ -19,6 +19,49 @@ C++ 66s/步出图 **105KB**（PC 基准 74KB，原始 HybridOps 81KB）。GEMM/L
 
 ## 终极目标（已调整）
 ~~bit-exact=0~~ → **出图大小匹配 PC 基准 74KB**。bit-exact 已放弃：Vulkan/CUDA FMA 硬件指令舍入方向不同，无法消除。实际走混合精度路线（缩放 gate residual 压低 FP16 溢出）。
+
+## 2026-06-01 凌晨：hybridops 管线 BF16 直读 safetensors ✅
+
+### 成果
+- **手机直接读 `.safetensors`**（BF16, 3.9GB），无需桌面端预处理
+- **新 C++ Vulkan 引擎**：`hybridops/vulkan/libhybrid_engine.so`（~500KB）
+  - 加载时一次性 BF16→FP16 转换存入 Vulkan buffer
+  - 按名 GEMM: `vk_run_gemm(weight_name, x, out, M, N, K)`
+  - 内置 LN (FP32)、RMSNorm (FP16)、GELU (FP16)
+- **PyTorch 不持有 block GEMM 权重**：DummyOps 创建模型（零 weight 内存）→ patch_shell_linear → load_state_dict → patch_block_layers → VulkanGemmLinear
+- **内存**：稳态 ~3.9GB VmRSS，峰值 ~5.6GB（加载阶段 mmap + Vulkan buffer 共存）
+- **速度**：3 步 142s (47s/步)，840 GEMM 全部 Vulkan（0 CPU fallback）
+- **正确性**：LN max_err 0.000002，RMS max_err 0.004，v_cond 无 NaN
+
+### 关键文件
+| 文件 | 说明 |
+|------|------|
+| `hybridops/vulkan/hybrid_engine.cpp` | ~360 行，Vulkan 引擎 |
+| `hybridops/vulkan/build_engine.bat` | NDK 编译脚本 |
+| `hybridops/scripts/vk_ops.py` | VulkanGemmLinear (无 weight Parameter)、DummyLinear、patch 函数 |
+| `hybridops/scripts/phone_pipeline.py` | SafetensorsReader、DummyOps 加载流程 |
+
+### 编译 & 推送
+```bash
+# 编译
+cd D:\AI\anima_phone\hybridops\vulkan && build_engine.bat
+
+# 推送
+MSYS_NO_PATHCONV=1 adb push hybridops/vulkan/libhybrid_engine.so /data/local/tmp/
+MSYS_NO_PATHCONV=1 adb push hybridops/vulkan/*.spv /data/local/tmp/
+MSYS_NO_PATHCONV=1 adb push hybridops/scripts/vk_ops.py /sdcard/anima_on_android/scripts/
+MSYS_NO_PATHCONV=1 adb push hybridops/scripts/phone_pipeline.py /sdcard/anima_on_android/scripts/
+
+# 运行
+adb shell "su -c 'taskset f0 /data/data/com.termux/files/usr/bin/python -u -B /sdcard/anima_on_android/scripts/phone_pipeline.py'"
+```
+
+### 已知问题
+- 加载阶段峰值 ~5.6GB（safetensors mmap 页缓存 + Vulkan buffer 共存），可能触发 OOM
+- BLAS bad memory unallocation 警告（VAE decode 时，不影响出图）
+- GPU 底频 515MHz 下 dispatch 可能超 TDR（锁 912MHz 可解但 max_gpuclk 只读）
+
+---
 
 ## ⚠️ 快速提醒（每次会话重启后先看这个）
 - **ADB 连接**：WiFi: `adb connect 192.168.0.104:5555`。设备 ID: `87cca7ec`。文件推送需 `MSYS_NO_PATHCONV=1` 防止 Git Bash 路径转换。

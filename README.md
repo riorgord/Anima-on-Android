@@ -122,26 +122,26 @@ output/       生成图片输出
 
 ## Vulkan GPU 加速状态
 
-**HybridOps 管线**：全部 DiT 模块已 GPU 化（GEMM + AdaLN + LN + RMSNorm + GELU + Self-attn + Cross-attn）。~77s/步（息屏省电），出图干净。
+**HybridOps 管线**：手机直读 BF16 `.safetensors`（3.9GB），加载时一次性 BF16→FP16 存入 Vulkan。PyTorch 只做路由壳（~200MB）。~47s/步，出图干净。
 
-**GPU 模块注入一览**：
+**GPU 模块注入一览**（`hybridops/scripts/`）：
 
 | 模块 | 引擎 | 注入方式 |
 |------|------|---------|
-| GEMM | libvk_gemm.so | HybridLinear |
-| AdaLN | libdit_vk.so | PrecomputedAdaLN |
-| LayerNorm | libdit_vk.so FP32 | HybridLayerNorm |
-| RMSNorm | libdit_vk.so FP16 | HybridRMSNorm |
-| GELU | libdit_vk.so FP16 | post-init replace |
-| Self-attention | libdit_vk.so 3-pass | monkey-patch |
-| Cross-attention | libdit_vk.so 3-pass batched | monkey-patch |
-| t_embedder | libdit_vk.so C++ CPU | dit_compute_timestep |
+| GEMM | **libhybrid_engine.so** | VulkanGemmLinear（按名取 Vulkan 权重） |
+| LayerNorm | libhybrid_engine.so FP32 | HybridLayerNorm |
+| RMSNorm | libhybrid_engine.so FP16 | HybridRMSNorm |
+| GELU | libhybrid_engine.so FP16 | HybridGELU |
+| Attention | PyTorch (SDPA) | 暂为 PyTorch, Vulkan shader 已有 |
 
-**C++ 引擎 `libdit_vk.so`**：28-block DiT forward **13.06s/步**（skip-attention 模式，vs CPU 120s, 9.2×）。含 GEMM + AdaLN + norms 预录，注意力暂走 Python monkey-patch。
+**C++ 引擎 `libhybrid_engine.so`**（~500KB, `hybridops/vulkan/hybrid_engine.cpp` ~360行）：
+- 所有权重以 per-tensor Vulkan buffer 存储，按名索引
+- BF16→FP16 加载时一次性转换
+- 每调用 per-call dispatch（录制→提交→等待→下载），用 `vkResetDescriptorPool` 管理步间资源
 
-**已知 Adreno 730 限制**：疑似 TDR 250ms 看门狗（单 dispatch 不宜过大）；同一 cmd buffer 多 dispatch 可并行导致 binding confusion（已用 per-block cmd buffer 规避）；大 WG+大 buffer+密集 barrier 组合可触发尚未完全定位的内部 rivalry。
+**已知 Adreno 730 限制**：加载阶段峰值 ~5.6GB（mmap 页缓存 + Vulkan buffer），可能触发 OOM；GPU 底频 515MHz 下 dispatch 可能超 TDR；BLAS bad memory unallocation 警告不阻碍出图。
 
-**待开发**：GEMM 预录（libvk_gemm.so 内部）→ RoPE GPU → Attention 入 block → ~40s/步
+**待开发**：优化加载峰值、Attention/RoPE GPU 化 → APK 打包 → QNN NPU 探索
 
 ## 致谢
 
