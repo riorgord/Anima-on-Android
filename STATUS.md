@@ -1,7 +1,248 @@
-# Anima 项目状态摘要 (2026-05-31 更新)
+# Anima 项目状态摘要 (2026-05-31 晚间)
 
 ## 我们在做什么
 在 Snapdragon 8+ Gen1 手机上运行 Anima 动漫风格图像生成模型 (2B DiT)。
+
+## 当前状态（一句话）
+C++ 66s/步出图 **105KB**（PC 基准 74KB）。GEMM/LN/RMSNorm/SiLU/AdaLN 全部验证正确。FP16 gate residual 动态范围导致后层溢出，MLP+SA+CX 缩放 -11%。bit-exact=0 放弃——Vulkan/CUDA FMA 硬件舍入不同。**
+
+## 出图演进
+
+| 版本 | 大小 | 改动 |
+|------|------|------|
+| 原始 | 118,681 | — |
+| GEMM FMA + Welford LN | 118,614 | 同前 |
+| +MLP fc2×1/4 | 114,056 | -4% |
+| +MLP fc2×1/8 | 109,109 | -8% |
+| +SA×1/4 + CX×1/4 + MLP×1/8 | **105,537** | **-11%** |
+| PC 基准 (RTX 3060) | **73,840** | 干净 |
+
+## 终极目标（已调整）
+~~bit-exact=0~~ → **出图大小匹配 PC 基准 74KB**。bit-exact 已放弃：Vulkan/CUDA FMA 硬件指令舍入方向不同，无法消除。实际走混合精度路线（缩放 gate residual 压低 FP16 溢出）。
+
+## ⚠️ 快速提醒（每次会话重启后先看这个）
+- **VK_ERROR_DEVICE_LOST → 拉满 GPU 频率 912MHz**。低频下 dispatch 超 TDR 250ms→驱动杀进程。`adb shell "su -c 'echo 912000000 > /sys/class/kgsl/kgsl-3d0/max_gpuclk'"`。
+- **PC 参考图基准**：`output/whitebox/pc_ref_whitebox.png`，**73,840 字节** = 干净。手机出图 >110KB = 有雪花/bug。当前手机图 118,681 字节。
+- **核心对比框架**：`scripts/pc_whitebox_ref.py`（WSL2 运行，`source /home/riorg/miniconda3/etc/profile.d/conda.sh && conda activate /home/riorg/anima-work/.conda`）。白盒逐 op 复现 C++ 引擎。`--compare output/cmp` 对比手机 dump。
+- **手机 dump 脚本**：`scripts/phone_dump_blocks.py`。用法：先 `adb push` + `adb shell` 运行，再 `adb pull` 结果，再 PC `--compare`。
+- **C++ 引擎关键知识**：
+  - lora 以 `[3, M, D]`（component-major）存储在 `g_loraBuf`，AdaLN shader 按 shift@0/scale@M*D*2/gate@2*M*D*2 读。dump 脚本已做 `reshape(3,M,D).transpose(1,0,2)` 转为 `[M,3D]` 再保存 .npy。
+  - t_emb 用 C++ 自己的 `dit_compute_timestep`（sin→RMSNorm→SiLU@w1→@w2），不是 PyTorch 的 t_embedder。PC 白盒已复现，验证一致。
+  - `dit_init_adaln_only` 用 `load_weights`（全部 685 个 tensor，4.18GB），不是 `load_adaln_weights`。
+- **权重必须一致**：手机 `diffusion_weights.bin` 和 PC `diffusion_weights_fp16.pt` 必须来自同一源。用 `scripts/export_weights.py`（会 strip `net.` 前缀）从 .pt 生成 .bin。
+- **真实管线对比**：PC `gen_real_inputs.py` 生成 x_emb/t_emb/ctx → 手机 `run_realpipe_phone.py` 用同输入跑 → 拉回对比。当前结果：Block 0 max_err=5.29，Q_norm max_err=0.039（根因：并行 reduction 求和顺序 ≠ PyTorch sequential 顺序）。**终极目标：bit-exact = 0**。
+
+---
+
+## 2026-05-31 晚间会话：白盒对比 + lora 布局 + AdaLN 修复
+
+### 成果概览
+
+| 发现 | 根因 | 修复 | 效果 |
+|------|------|------|------|
+| **lora 不一致 (max_err=70.7)** | C++ 存 `[3,M,D]`（component-major），phone dump 按 `[M,3D]` 误读 | dump 脚本 `reshape(3,M,D).transpose(1,0,2)` | lora max_err→**0.016** ✓ |
+| **Q/K RMSNorm 偏差 (max_err=3.59)** | PC 白盒 AdaLN 的 SiLU 写成了 `SiLU(emb @ w1)` 应为 `SiLU(emb) @ w1` | 修正 `compute_adaln_block` | Q_norm max_err→**0.027** ✓ |
+| **C++ `load_adaln_weights` 丢失 GEMM 权重** | 只加载 AdaLN+t_embedder（~471MB），Block 计算需 GEMM 权重 | 还原为 `load_weights`（全部 685 tensor） | Block 输出正常 |
+| **`.bin` 与 `.pt` 权重不同源** | 手机 .bin (May 26) 和 PC .pt (May 31) 来自不同时间转换 | 重新 `export_weights.py` (.pt→.bin) + 推送 | 权重一致 ✓ |
+
+### 当前精度状态（vs PC 白盒，synthetic input seed=12345 sigma=1.0）
+
+| 对比 | max_err | 结论 |
+|------|---------|------|
+| x, ctx 输入 | **0.0000** | ✅ 完全相同 |
+| t_emb | **0.00006** | ✅ FP16 精度极限 |
+| lora | **0.016** | ✅ FP16 精度极限 |
+| Q after RMSNorm | **0.027** | ✅ 8192 行中仅 2 行 >0.02 |
+| K after RMSNorm | **0.027** | ✅ |
+| Attn output | **0.41** | ⚠️ attention shader 数值差异 |
+| SA residual | **1.12** | ⚠️ O_proj+gate 累积 |
+| MLP residual (Block 0 输出) | **4.02** | ⚠️ GELU+fc2+gate 累积 |
+| Phone 3-step 出图 | **118,681 字节** | ❌ PC 基准 73,840 = 干净 |
+
+### Block 0 全链路精度链（最终状态 2026-05-31）
+
+```
+输入 x, ctx         max_err=0.0000  ✓
+  → t_emb, lora     max_err=0.00006/0.016  ✓
+  → AdaLN modulate  max_err<0.02  ✓
+  → LN + ScaleShift max_err<0.02  ✓
+  → QKV GEMM        max_err<0.02  ✓
+  → RMSNorm Q/K     max_err=0.027  ✓
+  → RoPE Q/K        max_err=0.027  ✓  ← 新验证！
+  → V (raw)         max_err=0.039  ✓  ← 修复捕获时机
+  → QK^T scores     — (captured post-softmax, 不可比)
+  → Softmax         max_err=0.008  ✓
+  → AV (attn_out shader)  max_err=0.001  ✓✓✓ ← 三 shader 只引入 0.001！
+  → O_proj GEMM     max_err<0.02  ✓
+  → gate+residual   → SA residual max_err=1.12  ⚠️
+  → cross-attn      → CX residual max_err=1.14  ⚠️
+  → MLP (fc1→GELU→fc2→gate) → Block 0 输出 max_err=4.02  ⚠️
+```
+
+**结论**：attention 的三个 shader (attn_qkt, attn_softmax, attn_out) 合计只引入 max_err=0.001——不是 bug！Block 0 的 4.02 误差是 20+ 个 op 串行 FP16 累积+gate 乘法的结果。O_proj+gate、cross-attn、MLP 路径各贡献 1-2 误差，逐 block 放大。
+
+**下步方向**：
+1. 在真实管线输入（非 synthetic）下重跑对比——真实 latent 有空间结构，attention softmax 更平滑，FP16 精度损失更小
+2. 或者直接跑管线出图看效果——当前 118KB 可能需要调采样参数而非修 shader
+
+### 工具链
+
+```bash
+# PC 白盒（WSL2）
+cd /mnt/d/AI/anima_phone
+python scripts/pc_whitebox_ref.py [--image-only] [--compare output/cmp]
+
+# 手机 dump
+# 1. 推送
+MSYS_NO_PATHCONV=1 adb push scripts/phone_dump_blocks.py /sdcard/anima_on_android/scripts/
+# 2. 运行（先锁 GPU 频率！）
+adb shell "su -c 'taskset f0 /data/data/com.termux/files/usr/bin/python /sdcard/anima_on_android/scripts/phone_dump_blocks.py'"
+# 3. 拉取
+MSYS_NO_PATHCONV=1 adb pull /sdcard/anima_on_android/output/cmp/ output/cmp/
+# 4. 对比
+python scripts/pc_whitebox_ref.py --compare output/cmp
+
+# 权重更新
+python scripts/export_weights.py models/diffusion_weights_fp16.pt models/diffusion_weights.bin
+MSYS_NO_PATHCONV=1 adb push models/diffusion_weights.bin /data/local/tmp/
+
+# 编译 C++ 引擎
+"D:/android-ndk-r27d-windows/android-ndk-r27d/toolchains/llvm/prebuilt/windows-x86_64/bin/clang++.exe" --target=aarch64-none-linux-android28 --sysroot="D:/android-ndk-r27d-windows/android-ndk-r27d/toolchains/llvm/prebuilt/windows-x86_64/sysroot" -O2 -std=c++17 -fPIC -shared -I"D:/Vulkan_SDK/Include" -o "D:/AI/anima_phone/vulkan/libdit_vk.so" "D:/AI/anima_phone/vulkan/dit_engine.cpp" -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384 -Wl,--no-rosegment -llog -landroid -lvulkan -L"D:/android-ndk-r27d-windows/android-ndk-r27d/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/lib/aarch64-linux-android/28" -static-libstdc++
+MSYS_NO_PATHCONV=1 adb push vulkan/libdit_vk.so /data/local/tmp/
+```
+
+### 3-step 出图
+
+```bash
+adb shell "su -c 'taskset f0 /data/data/com.termux/files/usr/bin/python -u -B /sdcard/anima_on_android/scripts/phone_pipeline.py'"
+# 输出：/sdcard/anima_on_android/output/phone_first.png
+```
+
+### Shader 精度分析 (2026-05-31 深夜) & 真实管线最终结果
+
+PC 同条件（real latent seed=6666, C++ 风格 t_emb/lora, C++ 风格 RoPE）白盒 vs 手机 C++ 引擎（lora bug 已修）：
+
+| Block | C++ | PyTorch白盒 | max_err |
+|-------|-----|------------|---------|
+| 0 | [-22.6, 23.1] | [-22.6, 23.4] | **5.29** |
+| 1 | [-3202, 3204] | [-3212, 3198] | 147 |
+
+逐 shader 内部精度检查：
+
+| Shader | I/O | 内部累加 | 与 PyTorch 一致？ |
+|--------|-----|----------|-------------------|
+| gemm_fp16 | fp16 | 改为 **fp32 fma()** | ✅ 数学一致 |
+| layernorm_fp16 | fp16 | **fp32** | ✅ 数学一致 |
+| rms_norm_fp16 | fp16 | **fp32** | ✅ 数学一致 |
+| silu_fp16 | fp16 | **fp32** | ✅ 数学一致 |
+| scale_shift_fp16 | fp16 | fp16 逐元素 | ✅ 无累加 |
+
+**权重验证**：`.bin` 与 `.pt` 中权重 bit-exact 一致（0/4,194,304 差异）。
+
+**Block 0 逐 op 精度链（真实输入）**：
+```
+Q after RMSNorm   max_err=0.039  (53% elements differ)  ← 第一个 bit 不同的 op
+K after RMSNorm   max_err=0.031
+V raw             max_err=0.063
+Attn output       max_err=1.07   (误差放大 30×)
+O_proj GEMM       max_err=0.59
+SA residual       max_err=3.65
+→ Block 0 输出     max_err=5.29
+```
+
+**根因确认**：PyTorch FP16 两次 run 完全 deterministic（max_err=0.0000），C++ 误差 = 0.039 不是 FP16 宿命。所有 shader 都已经是 fp32 内部计算、FMA 累加、权重 bit-exact——残余来自**并行 reduction 的求和顺序**与 PyTorch CUDA kernel 的舍入差异。即使都是 fp32，`(a+b)+c ≠ a+(b+c)`。
+
+### 真实管线 + 缩放实验 (2026-06-01 凌晨)
+
+用真实 latent 输入，C++ 风格 t_emb/lora/RoPE，白盒对比 Block 0 max_err=5.29（纯 fp16 累积）。
+
+AdaLN 误判：shift/scale/gate 一度认为"全错"——根原是测试脚本用 sin_emb 而非 t_emb 做 SiLU。修正后 AdaLN max_err=0.03，确认正确。
+
+Gate 缩放实验（防止后层 fp16 溢出）：
+
+| SA | CX | MLP | 图大小 | vs 原始 |
+|----|----|------|--------|------|
+| 1 | 1 | 1 | 118,681 | — |
+| 1 | 1 | 1/4 | 114,056 | -4% |
+| 1 | 1 | 1/8 | 109,109 | -8% |
+| 1/4 | 1/4 | 1/8 | **105,537** | **-11%** |
+| 1/2 | 1/2 | 1/8 | 106,755 | 倒退 |
+
+**结论**：SA×1/4 + CX×1/4 + MLP×1/8 最优。边际递减已触 fp16 天花板（FP16 最大 65504，后层值域频繁触及）。下步方向：BF16 权重→fp32 计算，用 BF16 的动态范围（同 fp32）替代 FP16 精度。
+- GEMM: fp32 fma() ✅
+- LN: Welford 算法 ✅
+- RMSNorm: fp32 内部 ✅
+- SiLU: fp32 内部 ✅
+- AdaLN: shift/scale/gate max_err=0.03 ✅
+- t_emb/lora: max_err=0.00006/0.016 ✅
+- 权重: bit-exact ✅
+
+残余 max_err 链（纯 fp16 精度，非 bug）:
+```
+Modulated(LN*scale+shift) max_err=0.19
+Q_raw(GEMM) max_err=0.08
+RMSNorm(Q_raw) max_err=0.004
+→ Block 0 max_err=5.29
+```
+
+bit-exact=0 的剩余障碍：GLSL 编译器生成的 fp32 指令序列与 CUDA nvcc 不完全相同（fma 融合、寄存器分配、指令调度层面）。逐个对比已到瓶颈。
+
+---
+
+## FP16 精度知识库（来自调研）
+
+### Vulkan vs CUDA 核心差异
+- **Vulkan FMA 不可控**：CUDA 有 `-fmad=false` 关闭快速数学优化，Vulkan/GLSL 没有等价选项。同样写 `fma()`，CUDA 和 Vulkan 硬件实现舍入方向可能不同（每个 op 差 0.5 ULP）。
+- **跨后端不一致是常态**：GGML 实测 CUDA FP16 vs CPU FP32 结果差 721.5 vs 720.0。不是 bug——是 fp16 物理特性。
+- **FP16 极限**：超过 ~1000 次加法，FP16 吞没新的贡献值（10-bit 尾数不足）。2048 元素点积 = 2048 次 add，必然有舍入。
+
+### DiT 推理的混合精度策略（Draw Things 团队经验）
+- **LN → FP32**：LayerNorm 允许激活值自由缩放，值域常超 FP16 范围。
+- **Block 内部 FP16**：大多数 op 在 fp16 下行得通。
+- **MLP down-projection 加缩放**：1/4 或 1/8 保守缩放因子防止溢出。
+- **gate 回来时→FP32**：MLP GEMM 后上采样回 fp32 做 gate + residual。
+- 注：此策略在 M1/M2（Metal）上验证，Adreno 适配需实测。
+
+### 硬件事实
+- Adreno 730: FP16 ~5.5 TFLOPS, FP32 ~2.8 TFLOPS（2× 差）。但实际 fp16 vs fp32 执行行为高度依赖驱动和运算类型。
+- SPIR-V 优化器（spirv-opt）激进 FMA 折叠在 Adreno 上可能导致性能倒退。
+
+---
+
+## 2026-05-31 晚间：per-step recording 正确性修复（旧记录，保留参考）
+
+### Bug 修复
+
+| Bug | 根因 | 修复 | 效果 |
+|-----|------|------|------|
+| MLP 激活函数错误 | `predict2.GPT2FeedForward` 用 `nn.GELU()`，C++ engine 错用 SiLU | `record_segment_mlp` 改用 `dispatch_gelu` | Block 0 MLP [-8.3,17.3]→[-6.4,16.9] |
+| Self/cross-attn 跨 batch 混合 | flat attention 不分 batch，batch 0 query attend 到 batch 1 key | `record_attn_3pass` 加 `q_base_off/kv_base_off`，attention 按 M 分片 | dispatch 数减半，91s→46s |
+| RoPE pipeline 未加载 | `create_adaln_pipelines` 缺少 `CP(rope,...)`，`dispatch_rope` 绑定 VK_NULL_HANDLE → GPU hang（第一次侥幸通过，killall 后永久损坏） | 加 `CP(rope, 3, sizeof(PC_Rope))` 到 adaln pipelines；rope freqs 改 per-step buffer（避免 killall 残留） | RoPE 正确执行，killall -9 后恢复正常 |
+
+### 精度状态（vs PyTorch FP16 with RoPE）
+
+| 对比 | max_err | 结论 |
+|------|---------|------|
+| PyTorch FP16 自身两次 run | **0.0000** | GPU FP16 完全 deterministic |
+| C++ vs PyTorch Block 0 | **5.5** | ⚠️ 不是 FP16 精度问题，存在系统偏差 |
+| C++ vs PyTorch Block 1 | **192.5** | 逐层放大约 35× |
+
+**已验证正确的模块**（独立验证 max_err < 0.02）：GEMM, LN, RMSNorm, SiLU, GELU, ScaleShift, attn_qkt, attn_softmax, attn_out, RoPE
+
+**2026-05-31 晚间修复**: PC 白盒 AdaLN SiLU 顺序修正（`SiLU(emb) @ w1` 而非 `SiLU(emb @ w1)`）后，Q/K RMSNorm max_err 从 3.59 → 0.027。Block 0 误差从 7.34 → 4.02。Block 1 从 800 → 51.88。剩余误差来自 attention shader 的 FP16 数值精度（非结构性 bug）。
+
+**lora 布局发现**: C++ 引擎以 `[3, M, D]` 存储 lora（component-major），PyTorch 以 `[M, 3D]`（batch-major）。phone dump 已修正解读。t_emb/lora 确认与 PC 完全一致（max_err=0.016/0.00006）。
+
+**管线**：54s/步，出图 119KB 有噪声（正常应该 70-80KB）
+
+### 下步（清空上下文后）
+
+1. **全面逐层对比**：Block 0 SA→CX→MLP 三段 vs PyTorch（带 RoPE）
+2. **MLP drill-down**：如果 MLP 段偏差最大，进一步对比 fc1 GEMM → GELU → fc2 GEMM
+3. **GEMM 单步对齐**：对偏差最大的 GEMM，同输入下逐元素对比 C++ vs `F.linear`
+4. **定位到具体 shader/权重**，修复后跑集成管线验证出图
+
+---
 
 ## 工作区
 - **主仓库**: `D:\AI\anima_phone\` — vulkan/ (GLSL+SPIR-V+C++引擎), src/ (DiT/VAE), scripts/ (管线+测试)
@@ -257,30 +498,13 @@ cross-attn 的 Q_proj + Q_norm 权重 bug 已修，但 **attention 计算（QK^T
 - PC 端用 cos=1/sin=0 零频 RoPE 对齐 C++ 的 no-RoPE 行为
 - 从第一个偏差 block drill down 到具体 shader
 
-**⚠️ TDR 限制：管线在不锁频时不稳定**
-- 515MHz 底频下每段超 2s 触发 DEVICE_LOST，只能锁 912MHz 超频才能跑通 3 步
-- 长期必须靠 per-step recording 的细粒度拆分（降低每段 dispatch 数）在所有频率下稳定
-- 当前 5 段/block 的粒度假定 912MHz，低频下可能要拆到 8-10 段/block
+---
 
-**已修 Bug**:
-1. cross-attn Q_proj 权重（self→cross）✅
-2. cross-attn Q_norm 权重（self→cross）✅
-3. batch_q=128（2048 WG，避免 shared-memory 压力）✅
+## 2026-05-31 晚间：白盒对比框架
 
-**代码状态**:
-- `dit_engine.cpp`: per-step + pre-record 双架构共存
-- `phone_pipeline.py`: 改用 `dit_forward_step`（mode=0 full attention）
-- `dit_forward_nblocks` 仍可用（pre-record skip-attn，21s/步，出黑图但可验证管线流程）
+核心工具 `scripts/pc_whitebox_ref.py` — 逐 op 复现 C++ 引擎（非 block.forward 黑盒），用法见上方"快速提醒"。输出目录 `output/whitebox/`：block_*_pt.npy（28 block 输出）、b0/intermediates/（Block 0 每步中间量）、pc_ref_whitebox.png（3-step 参考图 73,840 字节）。
 
-### 关键技术发现 (2026-05-30 晚间更新)
-
-- **TDR 看门狗是真正瓶颈**：submission 执行时间 >~2s 触发 VK_ERROR_DEVICE_LOST。频率越低越早触发。~~descPool 阈值~~、~~64 dispatch 上限~~ 均为误判。
-- **descPool 阈值不存在**：2436 total descriptor sets (1764+672) 正常提交，之前失败是 g_lnCmdBuf 48 dispatch smoke test 污染状态
-- **TDR 使 pre-record 大 cmd buffer 对 Adreno 是反模式**：正确做法是每次 submit 只含少量 dispatch
-- **batch_q 可动态化**：record_attn_3pass 从硬编码 8 批→自适应 2-4 批，减少 3× dispatch
-- **FP32 LN shader + FP16 buffer = NaN**：已修复 (FP16 LN pipeline)
-- 旧版发现（仍有效）：`VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT`、per-tensor buffer 替代大 buffer、Q/K/V layout (batch, token, head)
-
+> 详细架构、对比流程、使用示例已整合到上方"2026-05-31 晚间会话：白盒对比 + lora 布局 + AdaLN 修复"章节，此处不再重复。
 ---
 
 ## 2026-05-27 Attention 集成教训

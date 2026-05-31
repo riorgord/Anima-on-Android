@@ -1,0 +1,37 @@
+#version 450
+// RMSNorm fp16: sequential reduction (matches PyTorch accumulation order)
+#extension GL_EXT_shader_16bit_storage: require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16: require
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer In  { float16_t in_data[];  };
+layout(binding = 1) readonly  buffer W   { float16_t weight[];   };
+layout(binding = 2) writeonly buffer Out { float16_t out_data[]; };
+
+layout(push_constant) uniform PC {
+    uint n_rows;
+    uint n_elems;
+    float eps;
+} pc;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.n_rows) return;
+
+    uint off = row * pc.n_elems;
+
+    // Sequential sum of squares
+    double sq_sum = 0.0;
+    for (uint i = 0u; i < pc.n_elems; i++) {
+        float v = float(in_data[off + i]);
+        sq_sum += double(v) * double(v);
+    }
+
+    float rms = 1.0f / sqrt(float(sq_sum / double(pc.n_elems)) + pc.eps);
+
+    for (uint i = 0u; i < pc.n_elems; i++) {
+        float v = float(in_data[off + i]) * rms;
+        out_data[off + i] = float16_t(v * float(weight[i]));
+    }
+}

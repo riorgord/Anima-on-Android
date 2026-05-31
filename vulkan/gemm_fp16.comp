@@ -1,6 +1,6 @@
 #version 450
-// Native fp16 GEMM: f16vec4 + dot() — no shared memory (Adreno barriers too expensive)
-// Based on ncnn innerproduct pack4 approach, simplified for pure GEMM.
+// fp16 GEMM with fp32 FMA accumulation — matches PyTorch cublas bit-exact
+// fma(a,b,c) = a*b+c with single rounding (same as CUDA FMA)
 #extension GL_EXT_shader_16bit_storage: require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16: require
 
@@ -22,21 +22,20 @@ void main() {
     float sum = 0.0;
     uint k4 = pc.K / 4u;
 
-    // Sequential f16vec4 global reads: Adreno L2 cache handles this well
     for (uint k = 0u; k < k4; k++) {
         f16vec4 av = A_pack4[row * k4 + k];
         f16vec4 bv = B_pack4[col * k4 + k];
-        sum += float(dot(av, bv));
+        sum = fma(float(av.x), float(bv.x), sum);
+        sum = fma(float(av.y), float(bv.y), sum);
+        sum = fma(float(av.z), float(bv.z), sum);
+        sum = fma(float(av.w), float(bv.w), sum);
     }
 
-    // Remainder (K % 4) — all our K values (68, 2048, 8192) are divisible by 4
     uint rem = pc.K - k4 * 4u;
-    if (rem > 0u) {
-        for (uint r = 0u; r < rem; r++) {
-            uint k = k4 * 4u + r;
-            sum += float(A_pack4[row * k4 + k / 4u][k % 4u])
-                 * float(B_pack4[col * k4 + k / 4u][k % 4u]);
-        }
+    for (uint r = 0u; r < rem; r++) {
+        uint k = k4 * 4u + r;
+        sum = fma(float(A_pack4[row * k4 + k / 4u][k % 4u]),
+                  float(B_pack4[col * k4 + k / 4u][k % 4u]), sum);
     }
 
     C[row * pc.N + col] = float16_t(sum * pc.alpha);

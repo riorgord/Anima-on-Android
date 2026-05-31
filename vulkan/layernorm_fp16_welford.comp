@@ -1,0 +1,70 @@
+#version 450
+// LayerNorm fp16: Welford's algorithm — matches PyTorch cuWelfordOnlineSum
+// Welford: mean updated online, sigma2 += delta * (val - new_mean)
+// NOT: var = mean((x - final_mean)^2)
+#extension GL_EXT_shader_16bit_storage: require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16: require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer In  { float16_t in_data[];  };
+layout(binding = 1) writeonly buffer Out { float16_t out_data[]; };
+
+layout(push_constant) uniform PC {
+    uint n_rows;
+    uint n_elems;
+    float eps;
+} pc;
+
+shared float shm_mean[256];
+shared float shm_m2[256];
+shared float shm_count[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.n_rows) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint off = row * pc.n_elems;
+
+    // Welford single-pass per thread (matching PyTorch cuWelfordOnlineSum)
+    float mean = 0.0;
+    float m2 = 0.0;
+    float count = 0.0;
+
+    for (uint i = tid; i < pc.n_elems; i += 256u) {
+        float val = float(in_data[off + i]);
+        count += 1.0;
+        float delta = val - mean;
+        mean += delta / count;
+        m2 += delta * (val - mean);  // Welford: delta * (val - new_mean)
+    }
+
+    shm_mean[tid] = mean;
+    shm_m2[tid] = m2;
+    shm_count[tid] = count;
+    barrier();
+
+    // Tree-reduce Welford states (matching PyTorch cuWelfordCombine)
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            float delta = shm_mean[tid + s] - shm_mean[tid];
+            float total = shm_count[tid] + shm_count[tid + s];
+            if (total > 0.0) {
+                shm_m2[tid] += shm_m2[tid + s] + delta * delta * (shm_count[tid] * shm_count[tid + s]) / total;
+                shm_mean[tid] = (shm_count[tid] * shm_mean[tid] + shm_count[tid + s] * shm_mean[tid + s]) / total;
+                shm_count[tid] = total;
+            }
+        }
+        barrier();
+    }
+
+    float final_var = shm_m2[0] / float(pc.n_elems);
+    float inv_std = inversesqrt(final_var + pc.eps);
+    float final_mean = shm_mean[0];
+
+    // Normalize
+    for (uint i = tid; i < pc.n_elems; i += 256u) {
+        out_data[off + i] = float16_t((float(in_data[off + i]) - final_mean) * inv_std);
+    }
+}

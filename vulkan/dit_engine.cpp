@@ -152,19 +152,21 @@ static bool init_vulkan(VulkanCtx& ctx) {
 
     // Try to enable validation layer
     const char* wantedLayer = nullptr;
+    const char* enabledLayers[1] = {nullptr};
     for (auto& l : layers) {
         if (strstr(l.layerName, "validation") || strstr(l.layerName, "VK_LAYER_KHRONOS")) {
-            wantedLayer = l.layerName; break;
+            enabledLayers[0] = l.layerName;
+            LOGI("Found validation layer: %s, enabling...", l.layerName);
+            break;
         }
     }
-    if (wantedLayer) LOGI("Enabling validation layer: %s", wantedLayer);
 
     VkInstanceCreateInfo instInfo = {};
     instInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     instInfo.pApplicationInfo = &appInfo;
-    if (wantedLayer) {
+    if (enabledLayers[0]) {
         instInfo.enabledLayerCount = 1;
-        instInfo.ppEnabledLayerNames = &wantedLayer;
+        instInfo.ppEnabledLayerNames = enabledLayers;
     }
     if (vkCreateInstance(&instInfo, nullptr, &ctx.instance) != VK_SUCCESS) {
         LOGE("vkCreateInstance failed");
@@ -479,6 +481,7 @@ static bool create_adaln_pipelines(VulkanCtx& ctx, const char* spv_dir) {
     CP(attn_qkt, 3, sizeof(PC_AttnQKT));
     CP(attn_softmax, 1, sizeof(PC_AttnSoftmax));
     CP(attn_out, 3, sizeof(PC_AttnOut));
+    CP(rope, 3, sizeof(PC_Rope));
     #undef CP
     // layer_norm_f16: FP16 I/O for pre-recorded blocks
     snprintf(p, sizeof(p), "%s/layernorm_fp16.spv", spv_dir);
@@ -502,6 +505,7 @@ static Buffer g_geluOutBuf; // FP16 GELU output
 static Buffer g_attnQ, g_attnK, g_attnV, g_attnA, g_attnO;
 // Dummy GEMM buffer — step 0 of single-instance merge test
 static Buffer g_gemmDummy;
+static Buffer g_gateScales; // [MLP=1/8, zero, SA=1/4, CX=1/4] — gate anti-overflow scaling
 
 struct RC {
     VulkanCtx* vk;
@@ -517,6 +521,17 @@ struct RC {
         b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &b, 0, nullptr, 0, nullptr);
+    }
+    // Buffer-specific barrier — Adreno needs this for same-cmd-buffer compute sync
+    void barrier_buf(VkBuffer buf) {
+        VkBufferMemoryBarrier b = {};
+        b.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        b.buffer = buf;
+        b.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &b, 0, nullptr);
     }
 
     VkDescriptorSet alloc_set(VkDescriptorSetLayout dsl) {
@@ -563,6 +578,19 @@ struct RC {
 
     void dispatch_silu(Buffer& in, Buffer& out, uint32_t n) {
         auto& sp = vk->silu;
+        auto ds = alloc_set(sp.dsl);
+        bind_buf(ds, 0, in, 0, VK_WHOLE_SIZE);
+        bind_buf(ds, 1, out, 0, VK_WHOLE_SIZE);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.layout, 0, 1, &ds, 0, nullptr);
+        PC_Silu pc = { n };
+        vkCmdPushConstants(cmd, sp.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(cmd, (n + 255) / 256, 1, 1);
+        barrier();
+    }
+
+    void dispatch_gelu(Buffer& in, Buffer& out, uint32_t n) {
+        auto& sp = vk->gelu;
         auto ds = alloc_set(sp.dsl);
         bind_buf(ds, 0, in, 0, VK_WHOLE_SIZE);
         bind_buf(ds, 1, out, 0, VK_WHOLE_SIZE);
@@ -681,8 +709,10 @@ struct RC {
 
         // 1. SiLU(t_emb) → aBuf [M*D]
         dispatch_silu(*tEmbBuf, *aBuf, M * D);
+        barrier_buf(aBuf->buf);  // Adreno: ensure SiLU output visible before GEMM reads it
         // 2. LoRA down: aBuf @ W0^T → t1 [M, 256]
         dispatch_gemm(*aBuf, w0_name, M, ADALN_LORA_DIM, D, *t1);
+        barrier_buf(t1->buf);  // ensure GEMM1 output visible before GEMM2 reads it
         // 3-5. LoRA up × 3: t1 @ W2 components → tQ(shift), tK(scale), tV(gate)
         dispatch_gemm(*t1, w2_name, M, D, ADALN_LORA_DIM, *tQ, 0);
         dispatch_gemm(*t1, w2_name, M, D, ADALN_LORA_DIM, *tK, comp_sz);
@@ -693,9 +723,10 @@ struct RC {
         dispatch_scale_shift(*tQ, *onesBuf, 0, g_loraBuf, 0,          *tQ, M*D, 0, 1);
         dispatch_scale_shift(*tK, *onesBuf, 0, g_loraBuf, loraComp,   *tK, M*D, 0, 1);
         dispatch_scale_shift(*tV, *onesBuf, 0, g_loraBuf, loraComp*2, *tV, M*D, 0, 1);
-
+        barrier_buf(tQ->buf); barrier_buf(tK->buf); barrier_buf(tV->buf);
         // 6. scale+1: tK + 1.0 → aBuf (temporary)
         dispatch_scale_shift(*tK, *onesBuf, *onesBuf, *aBuf, M * D, 0, 0);
+        barrier_buf(aBuf->buf);
         // 7-9. Broadcast [M,D] → [MS,D] to bcBuf slots
         dispatch_broadcast(*tQ, *bcBuf, shiftSlot, M, D, S);
         dispatch_broadcast(*aBuf, *bcBuf, scaleSlot, M, D, S);  // scale+1
@@ -712,28 +743,32 @@ struct RC {
     // Record 8-batch 3-pass attention (QK^T+softmax+AV) into current cmd buffer.
     // Q/K/V are the full buffers; O receives the attention output.
     // Self-attn: M_kv=S, Cross-attn: M_kv=Nctx.
+    // q_base_off, kv_base_off: byte offsets for per-batch slicing (0 for full-batch)
     void record_attn_3pass(Buffer& Q, Buffer& K, Buffer& V, Buffer& A, Buffer& O,
-                            uint32_t M_q, uint32_t M_kv, uint32_t H, uint32_t D, float scale) {
+                            uint32_t M_q, uint32_t M_kv, uint32_t H, uint32_t D, float scale,
+                            size_t q_base_off = 0, size_t kv_base_off = 0,
+                            size_t a_base_off = 0, size_t o_base_off = 0) {
         // Batch Q rows: aim for ~2048 WG per dispatch (batch_q * H WG)
         // H=16 → batch_q=128 for 2048 WG. Safe for Adreno shared-memory reduction.
         uint32_t batch_q = 128;
         if (batch_q > M_q) batch_q = M_q;
         uint32_t n_batches = (M_q + batch_q - 1) / batch_q;
-        size_t qPerBatch = batch_q * H * D * 2;
-        size_t aPerBatch = batch_q * H * M_kv * 2;
+        size_t full_kv_bytes = M_kv * H * D * 2;
 
         for (uint32_t batch = 0; batch < n_batches; batch++) {
             uint32_t q_start = batch * batch_q;
             uint32_t this_q = (q_start + batch_q <= M_q) ? batch_q : (M_q - q_start);
-            VkDeviceSize qOff = (VkDeviceSize)q_start * H * D * 2;
-            VkDeviceSize aOff = (VkDeviceSize)q_start * H * M_kv * 2;
+            VkDeviceSize qOff = q_base_off + (VkDeviceSize)q_start * H * D * 2;
+            VkDeviceSize aOff = a_base_off + (VkDeviceSize)q_start * H * M_kv * 2;
+            VkDeviceSize oOff = o_base_off + (VkDeviceSize)q_start * H * D * 2;
             size_t qBytes = this_q * H * D * 2;
             size_t aBytes = this_q * H * M_kv * 2;
+            size_t oBytes = this_q * H * D * 2;
 
             // Pass 1: QK^T
             auto ds1 = alloc_set(vk->attn_qkt.dsl);
             bind_buf(ds1, 0, Q, qOff, qBytes);
-            bind_buf(ds1, 1, K, 0, M_kv * H * D * 2);
+            bind_buf(ds1, 1, K, kv_base_off, full_kv_bytes);
             bind_buf(ds1, 2, A, aOff, aBytes);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->attn_qkt.pipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->attn_qkt.layout, 0, 1, &ds1, 0, nullptr);
@@ -755,8 +790,8 @@ struct RC {
             // Pass 3: AV
             auto ds3 = alloc_set(vk->attn_out.dsl);
             bind_buf(ds3, 0, A, aOff, aBytes);
-            bind_buf(ds3, 1, V, 0, M_kv * H * D * 2);
-            bind_buf(ds3, 2, O, qOff, qBytes);
+            bind_buf(ds3, 1, V, kv_base_off, full_kv_bytes);
+            bind_buf(ds3, 2, O, oOff, oBytes);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->attn_out.pipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->attn_out.layout, 0, 1, &ds3, 0, nullptr);
             PC_AttnOut pc3 = { this_q, M_kv, H, D };
@@ -778,9 +813,148 @@ static std::unordered_map<std::string, WeightInfo> g_weights;
 static bool g_init = false;
 static bool g_skip_attn_precord = false;
 
+// Per-block output capture (for debugging: host-visible copies)
+static uint16_t* g_block_out[28] = {};
+static size_t g_block_out_size = 0;
+
+// Block 0 sub-module capture: after self-attn, cross-attn, MLP
+static uint16_t* g_b0_sa = nullptr;  // after self-attn residual
+static uint16_t* g_b0_cx = nullptr;  // after cross-attn residual
+static uint16_t* g_b0_mlp = nullptr; // after MLP (final output)
+
+// Block 0 attention internals (captured during self-attn segment)
+static uint16_t* g_b0_q = nullptr;  // Q after RMSNorm [MS*H, head_dim]
+static uint16_t* g_b0_k = nullptr;  // K after RMSNorm
+static uint16_t* g_b0_v = nullptr;  // V [MS*H, head_dim]  (raw V, before attention)
+static uint16_t* g_b0_scores = nullptr;  // attention scores [per-batch max]
+static uint16_t* g_b0_attn_o = nullptr;  // attention output [MS*H, head_dim]
+static uint16_t* g_b0_q_roped = nullptr; // Q after RMSNorm + RoPE [MS*H, head_dim]
+static uint16_t* g_b0_k_roped = nullptr; // K after RMSNorm + RoPE [MS*H, head_dim]
+static uint16_t* g_b0_o_proj = nullptr;  // O_proj GEMM output [MS, D] (after attn, before gate)
+static uint16_t* g_b0_ln = nullptr;      // LN output [MS, D] (before AdaLN modulate)
+static uint16_t* g_b0_mod = nullptr;     // AdaLN modulated [MS, D] (after scale_shift)
+static uint16_t* g_b0_q_raw = nullptr;   // Q before RMSNorm [MS, D] (raw GEMM output)
+static uint16_t* g_b0_shifts = nullptr;  // AdaLN shift/scale/gate [M*3, D] (pre-bcast)
+
+// RoPE frequency buffer (pre-computed once per spatial position, replicated per head)
+static std::vector<uint16_t> g_ropeFreqsHost;  // host-side freqs (survives killall)
+static size_t g_ropeFreqsSize = 0;
+static Buffer g_ropeFreqs;  // temp GPU buffer, allocated per-step
+
+// Debug: h1 (after SiLU, before w2 matmul) for lora comparison
+static std::vector<float> g_debug_h1;  // [M*D] fp32
+
 // ============================================================
 // Public C API
 // ============================================================
+// ============================================================
+// RoPE frequency computation (replicates VideoRopePosition3DEmb)
+// ============================================================
+static bool compute_rope_freqs(uint32_t S, uint32_t H, uint32_t W, uint32_t head_dim) {
+    // Anima RoPE: 3D position embedding (T=1, H=16, W=16 by default)
+    // Splits head_dim=128 into: dim_h=42, dim_w=42, dim_t=44
+    uint32_t T = 1;
+    uint32_t dim_h = head_dim / 6 * 2;  // 42
+    uint32_t dim_w = dim_h;              // 42
+    uint32_t dim_t = head_dim - 2 * dim_h; // 44
+
+    float h_ntk_factor = powf(4.0f, (float)dim_h / (float)(dim_h - 2));  // h_extrapolation_ratio^(dim_h/(dim_h-2))
+    float w_ntk_factor = powf(4.0f, (float)dim_w / (float)(dim_w - 2));
+    float t_ntk_factor = powf(1.0f, (float)dim_t / (float)(dim_t - 2));
+
+    float h_theta = 10000.0f * h_ntk_factor;
+    float w_theta = 10000.0f * w_ntk_factor;
+    float t_theta = 10000.0f * t_ntk_factor;
+
+    // Per-position freqs: [S, half_dim, 4] fp16 for one M-batch
+    // For each of M batches, replicate to [S*H, half_dim, 4]
+    uint32_t half_dim = head_dim / 2;  // 64
+
+    // Allocate temp host buffer for [S, half_dim, 4]
+    size_t per_pos_bytes = (size_t)S * half_dim * 4 * 2;  // fp16
+    std::vector<uint16_t> pos_freqs(S * half_dim * 4);
+
+    for (uint32_t p = 0; p < S; p++) {
+        uint32_t h_idx = p / W;  // row in spatial grid
+        uint32_t w_idx = p % W;  // col
+        uint32_t t_idx = 0;      // T=1 for image
+
+        for (uint32_t j = 0; j < half_dim; j++) {
+            float cos_val, sin_val;
+
+            if (j < dim_t / 2) {
+                // Temporal component: pos 0 always (T=1)
+                float freq = 1.0f / powf(t_theta, (float)(2 * j) / (float)dim_t);
+                float angle = (float)t_idx * freq;
+                cos_val = cosf(angle);
+                sin_val = sinf(angle);
+            } else if (j < dim_t / 2 + dim_h / 2) {
+                // Height component
+                uint32_t jh = j - dim_t / 2;
+                float freq = 1.0f / powf(h_theta, (float)(2 * jh) / (float)dim_h);
+                float angle = (float)h_idx * freq;
+                cos_val = cosf(angle);
+                sin_val = sinf(angle);
+            } else {
+                // Width component
+                uint32_t jw = j - dim_t / 2 - dim_h / 2;
+                float freq = 1.0f / powf(w_theta, (float)(2 * jw) / (float)dim_w);
+                float angle = (float)w_idx * freq;
+                cos_val = cosf(angle);
+                sin_val = sinf(angle);
+            }
+
+            // Store [cos, -sin, sin, cos] per pair
+            uint32_t base = (p * half_dim + j) * 4;
+            auto f2h = [](float v) -> uint16_t {
+                uint32_t bits = *(uint32_t*)&v;
+                return (uint16_t)((bits >> 16) & 0x8000) | (((bits >> 23) & 0xff) > 112 ?
+                       ((bits >> 13) & 0x3ff) | ((((bits >> 23) & 0xff) - 112) << 10) : 0);
+                // Approximate fp32→fp16; correct for most values
+            };
+            // Simpler: use the standard conversion
+            auto fp32_to_fp16 = [](float v) -> uint16_t {
+                uint32_t x = *(uint32_t*)&v;
+                uint32_t sign = (x >> 16) & 0x8000;
+                int32_t exp = ((x >> 23) & 0xff) - 127;
+                uint32_t mant = (x >> 13) & 0x3ff;
+                if (exp > 15) return sign | 0x7c00;  // inf
+                if (exp < -14) return sign;  // zero/subnormal
+                return (uint16_t)(sign | ((exp + 15) << 10) | mant);
+            };
+
+            pos_freqs[base + 0] = fp32_to_fp16(cos_val);
+            pos_freqs[base + 1] = fp32_to_fp16(-sin_val);
+            pos_freqs[base + 2] = fp32_to_fp16(sin_val);
+            pos_freqs[base + 3] = fp32_to_fp16(cos_val);
+        }
+    }
+
+    // Replicate per-head: [S, half_dim, 4] → [S*H, half_dim, 4]
+    // Then replicate per-batch: → [M*S*H, half_dim, 4]
+    uint32_t n_rows = M * S * H;  // total rows in [MS*H, head_dim] layout
+    g_ropeFreqsSize = (size_t)n_rows * half_dim * 4 * 2;  // fp16 bytes
+    std::vector<uint16_t> all_freqs(n_rows * half_dim * 4);
+
+    for (uint32_t mb = 0; mb < M; mb++) {
+        for (uint32_t p = 0; p < S; p++) {
+            for (uint32_t h = 0; h < H; h++) {
+                uint32_t dst_row = mb * S * H + p * H + h;
+                uint32_t src_row = p;  // same freqs for all heads at this position
+                // Copy freqs for this position
+                memcpy(&all_freqs[dst_row * half_dim * 4],
+                       &pos_freqs[src_row * half_dim * 4],
+                       half_dim * 4 * 2);
+            }
+        }
+    }
+
+    // Store in host memory (GPU buffer created per-step to avoid killall leaks)
+    g_ropeFreqsHost = std::move(all_freqs);
+    LOGI("RoPE freqs computed (host): %u rows × %u pairs, %zu bytes", n_rows, half_dim, g_ropeFreqsSize);
+    return true;
+}
+
 extern "C" {
 
 bool dit_init(const char* weight_path, const char* spv_dir) {
@@ -957,11 +1131,50 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
         LOGE("LN cmd buffer alloc failed"); return false;
     }
 
+    // Per-block output capture buffers (host memory, read via dit_get_block_output)
+    g_block_out_size = MS * D * 2;
+    for (int i = 0; i < 28; i++) {
+        g_block_out[i] = (uint16_t*)malloc(g_block_out_size);
+        if (!g_block_out[i]) { LOGE("block_out[%d] alloc failed", i); return false; }
+        memset(g_block_out[i], 0, g_block_out_size);
+    }
+    // Block 0 sub-module capture
+    g_b0_sa  = (uint16_t*)malloc(g_block_out_size);
+    g_b0_cx  = (uint16_t*)malloc(g_block_out_size);
+    g_b0_mlp = (uint16_t*)malloc(g_block_out_size);
+    size_t qkv_sz = MS * N_HEADS * HEAD_DIM * 2;
+    size_t score_sz = (MS/M) * N_HEADS * (MS/M) * 2;  // S*H*S*2 for first batch
+    g_b0_q = (uint16_t*)malloc(qkv_sz);
+    g_b0_k = (uint16_t*)malloc(qkv_sz);
+    g_b0_v = (uint16_t*)malloc(qkv_sz);
+    g_b0_scores = (uint16_t*)malloc(score_sz);
+    g_b0_attn_o = (uint16_t*)malloc(qkv_sz);
+    g_b0_q_roped = (uint16_t*)malloc(qkv_sz);
+    g_b0_k_roped = (uint16_t*)malloc(qkv_sz);
+    g_b0_o_proj = (uint16_t*)malloc(g_block_out_size);
+    g_b0_ln    = (uint16_t*)malloc(g_block_out_size);
+    g_b0_mod   = (uint16_t*)malloc(g_block_out_size);
+    g_b0_q_raw = (uint16_t*)malloc(g_block_out_size);
+    g_b0_shifts = (uint16_t*)malloc(M * 3u * D * 2);  // [M*3, D] shift/scale/gate
+    if (!g_b0_sa || !g_b0_cx || !g_b0_mlp ||
+        !g_b0_q || !g_b0_k || !g_b0_v || !g_b0_scores || !g_b0_attn_o ||
+        !g_b0_q_roped || !g_b0_k_roped || !g_b0_o_proj ||
+        !g_b0_ln || !g_b0_mod || !g_b0_q_raw || !g_b0_shifts) {
+        LOGE("b0 capture alloc failed"); return false;
+    }
+
     // ── Step 0: allocate 32MB dummy buffer (single-instance merge test) ──
     if (!create_buffer(g_vk, 32 * 1024 * 1024, u, g_gemmDummy)) {
         LOGE("gemmDummy alloc failed"); return false;
     }
     memset(g_gemmDummy.mapped, 0, 32 * 1024 * 1024);
+
+    // Gate scaling buffer: [MLP(1/8), zero, SA(1/2), CX(1/2)] — 8 bytes
+    if (!create_buffer(g_vk, 8, u, g_gateScales)) {
+        LOGE("gateScales alloc failed"); return false;
+    }
+    uint16_t sc_vals[4] = {0x3000, 0x0000, 0x3400, 0x3400};  // MLP=1/8, zero, SA=1/4, CX=1/4
+    memcpy(g_gateScales.mapped, sc_vals, 8);
 
     LOGI("dit_init_adaln_only OK — %u buffers", 20);
 
@@ -986,6 +1199,12 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
         }
     }
     LOGI("All 28 full blocks pre-recorded (28×63 dispatches)");
+
+    // Pre-compute RoPE frequencies (position-dependent, fixed across steps)
+    uint32_t HP = (uint32_t)sqrtf((float)S);  // 16 for S=256
+    if (!compute_rope_freqs(S, N_HEADS, HP, HEAD_DIM)) {
+        LOGE("RoPE freq computation failed"); return false;
+    }
 
     if (!g_skip_attn_precord) {
         // Pre-record attention using descPool2 (separate from block descPool)
@@ -1543,8 +1762,14 @@ bool dit_compute_timestep(float sigma) {
             h1[b * D + o] = x / (1.0f + expf(-x));  // SiLU
         }
     }
+    // Save h1 for debug comparison
+    g_debug_h1 = h1;  // copy to global
 
     // ---- 5. lora = h1 @ w2^T → [M, 3D] → chunk → [3, M, D] ----
+    // Diagnostic: log first 5 w2 values at rows 0, 2048, 4096
+    LOGI("w2 diag: row0[0]=%.6f row0[2047]=%.6f row2048[0]=%.6f row2048[2047]=%.6f row4096[0]=%.6f",
+         w2[0], w2[2047], w2[2048*D], w2[2048*D+2047], w2[4096*D]);
+    LOGI("w2 sizes: w2_n=%zu buf.size=%zu", w2_n, w2_it->second.buf.size);
     uint16_t* lora_out = (uint16_t*)g_loraBuf.mapped;
     for (uint32_t b = 0; b < M; b++) {
         for (uint32_t o = 0; o < D3; o++) {
@@ -1552,6 +1777,14 @@ bool dit_compute_timestep(float sigma) {
             const float* w2_row = &w2[o * D];
             const float* in_row = &h1[b * D];
             for (uint32_t k = 0; k < D; k++) sum += (double)in_row[k] * w2_row[k];
+            // Diag: check specific rows
+            if (b == 0 && (o == 0 || o == 2048 || o == 4096)) {
+                double partial = 0.0;
+                for (uint32_t k = 0; k < 5; k++) partial += (double)in_row[k] * w2_row[k];
+                LOGI("lora b=%u o=%u: h1[0..4]=[%.4f,%.4f,%.4f,%.4f,%.4f] w2[0..4]=[%.4f,%.4f,%.4f,%.4f,%.4f] partial=%.6f total=%.6f",
+                     b, o, in_row[0], in_row[1], in_row[2], in_row[3], in_row[4],
+                     w2_row[0], w2_row[1], w2_row[2], w2_row[3], w2_row[4], partial, sum);
+            }
             float val = (float)sum;
             // fp32 → fp16
             uint32_t bits = *(uint32_t*)&val;
@@ -1566,7 +1799,8 @@ bool dit_compute_timestep(float sigma) {
                 uint32_t exp16 = exp32 - 112;
                 half = sign16 | (exp16 << 10) | ((mant32 + 0x1000) >> 13);
             }
-            // Chunk into [3, M, D]: shift=0, scale=D, gate=2D
+            // Layout: [3, M, D] — component-major (shift/scale/gate each [M,D] contiguous)
+            // AdaLN shader reads shift@0, scale@M*D*2, gate@2*M*D*2
             uint32_t comp = o / D;  // 0=shift, 1=scale, 2=gate
             uint32_t col  = o % D;
             lora_out[comp * M * D + b * D + col] = (uint16_t)half;
@@ -1932,7 +2166,7 @@ bool dit_record_block_full(int blockIdx) {
     rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,adaln_off(1,0),*rc.bcBuf,adaln_off(1,1),
                             *rc.nBuf, MS*D,1,1);
     rc.dispatch_gemm(*rc.nBuf,l1w,MS,MLP_HIDDEN,D,*rc.t1);     // t1(8MB) = fc1
-    rc.dispatch_silu(*rc.t1,*rc.t1,MS*MLP_HIDDEN);
+    rc.dispatch_gelu(*rc.t1,*rc.t1,MS*MLP_HIDDEN);  // GELU, not SiLU! (predict2 GPT2FeedForward uses nn.GELU)
     rc.dispatch_gemm(*rc.t1,l2w,MS,D,MLP_HIDDEN,*rc.nBuf);    // nBuf = fc2
     rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,adaln_off(1,2),*rc.tV,0,
                             *rc.outBuf, MS*D,1,1);             // out = fc2*gate + residual(tV)
@@ -2031,7 +2265,7 @@ static void record_one_block(RC& rc, int b, Buffer& inBuf, Buffer& outBuf,
     rc.dispatch_layernorm(*rc.gBuf,*rc.nBuf,MS,D,1e-6f);
     rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,off(6),*rc.bcBuf,off(7),*rc.nBuf, MS*D,1,1);
     rc.dispatch_gemm(*rc.nBuf,l1w,MS,MLP_HIDDEN,D,*rc.t1);
-    rc.dispatch_silu(*rc.t1,*rc.t1,MS*MLP_HIDDEN);
+    rc.dispatch_gelu(*rc.t1,*rc.t1,MS*MLP_HIDDEN);  // GELU, not SiLU! (predict2 GPT2FeedForward uses nn.GELU)
     rc.dispatch_gemm(*rc.t1,l2w,MS,D,MLP_HIDDEN,*rc.nBuf);
     rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,off(8),*rc.gBuf,0,
                             outBuf, MS*D,1,1);
@@ -2093,19 +2327,47 @@ static void record_segment_adaln(RC& rc, int b) {
     end_step_recording();
 }
 
-// ── Segment B: Self-attn full (LN→AdaLN→QKV→norms→attn→O_proj→gate, ~21 dispatch) ──
-// inBuf: block input (x for block 0, prev output for later blocks)
-// Result: tV = inBuf + gate_self * self_attn_out
-static void record_segment_self_attn(RC& rc, int b, Buffer& inBuf) {
+// ── Segment B1a: Self-attn pre-A (LN→AdaLN→QKV GEMM, 5 dispatch) ──
+// After submit: nBuf=modulated, tQ=Q_raw, tK=K_raw, tV=V_raw
+static void record_segment_self_pre_a(RC& rc, int b, Buffer& inBuf) {
     auto off=[&](int c)->size_t{return (size_t)c*MS*D*2;};
-    uint32_t ph=MS*N_HEADS;
-    float scl=1.0f/sqrtf((float)HEAD_DIM);
-
-    char qw[128],kw[128],vw[128],ow[128],qnw[128],knw[128];
+    char qw[128],kw[128],vw[128];
     snprintf(qw,sizeof(qw),"blocks.%d.self_attn.q_proj.weight",b);
     snprintf(kw,sizeof(kw),"blocks.%d.self_attn.k_proj.weight",b);
     snprintf(vw,sizeof(vw),"blocks.%d.self_attn.v_proj.weight",b);
-    snprintf(ow,sizeof(ow),"blocks.%d.self_attn.output_proj.weight",b);
+    begin_step_recording(rc);
+    rc.dispatch_layernorm(inBuf, *rc.nBuf, MS, D, 1e-6f);
+    rc.dispatch_scale_shift(*rc.nBuf, *rc.bcBuf, off(0), *rc.bcBuf, off(1), *rc.nBuf, MS*D, 1, 1);
+    rc.dispatch_gemm(*rc.nBuf, qw, MS, D, D, *rc.tQ);
+    rc.dispatch_gemm(*rc.nBuf, kw, MS, D, D, *rc.tK);
+    rc.dispatch_gemm(*rc.nBuf, vw, MS, D, D, *rc.tV);
+    end_step_recording();
+}
+
+// ── Segment B1b: Self-attn pre-B (RMSNorm→RoPE, 4 dispatch) ──
+// After submit: tQ=Q_norm, tK=K_norm, rBuf=Q_roped, g_attnO=K_roped
+static void record_segment_self_pre_b(RC& rc, int b) {
+    uint32_t ph=MS*N_HEADS;
+    char qnw[128],knw[128];
+    snprintf(qnw,sizeof(qnw),"blocks.%d.self_attn.q_norm.weight",b);
+    snprintf(knw,sizeof(knw),"blocks.%d.self_attn.k_norm.weight",b);
+    begin_step_recording(rc);
+    rc.dispatch_rmsnorm(*rc.tQ, qnw, *rc.tQ, ph, HEAD_DIM, 1e-6f);
+    rc.dispatch_rmsnorm(*rc.tK, knw, *rc.tK, ph, HEAD_DIM, 1e-6f);
+    rc.dispatch_rope(*rc.tQ, g_ropeFreqs, *rc.rBuf, ph, HEAD_DIM);
+    rc.dispatch_rope(*rc.tK, g_ropeFreqs, g_attnO, ph, HEAD_DIM);
+    end_step_recording();
+}
+
+// ── Segment B1 (old): kept for reference, now split into B1a+B1b ──
+static void record_segment_self_pre(RC& rc, int b, Buffer& inBuf) {
+    auto off=[&](int c)->size_t{return (size_t)c*MS*D*2;};
+    uint32_t ph=MS*N_HEADS;
+
+    char qw[128],kw[128],vw[128],qnw[128],knw[128];
+    snprintf(qw,sizeof(qw),"blocks.%d.self_attn.q_proj.weight",b);
+    snprintf(kw,sizeof(kw),"blocks.%d.self_attn.k_proj.weight",b);
+    snprintf(vw,sizeof(vw),"blocks.%d.self_attn.v_proj.weight",b);
     snprintf(qnw,sizeof(qnw),"blocks.%d.self_attn.q_norm.weight",b);
     snprintf(knw,sizeof(knw),"blocks.%d.self_attn.k_norm.weight",b);
 
@@ -2117,11 +2379,38 @@ static void record_segment_self_attn(RC& rc, int b, Buffer& inBuf) {
     rc.dispatch_gemm(*rc.nBuf,vw,MS,D,D,*rc.tV);
     rc.dispatch_rmsnorm(*rc.tQ,qnw,*rc.tQ,ph,HEAD_DIM,1e-6f);
     rc.dispatch_rmsnorm(*rc.tK,knw,*rc.tK,ph,HEAD_DIM,1e-6f);
+    rc.dispatch_rope(*rc.tQ, g_ropeFreqs, *rc.rBuf, ph, HEAD_DIM);
+    rc.dispatch_rope(*rc.tK, g_ropeFreqs, g_attnO, ph, HEAD_DIM);
+    end_step_recording();
+}
 
-    // Real self-attention: QK^T + softmax + AV
-    rc.record_attn_3pass(*rc.tQ,*rc.tK,*rc.tV,g_attnA,g_attnO,
-                         MS,MS,N_HEADS,HEAD_DIM,scl);
+// ── Segment B2: Self-attn attention + O_proj + gate (~11 dispatch) ──
+// Reads: rBuf=Q_roped, g_attnO=K_roped, tV=V_raw
+// Result: tV = inBuf + gate_self * self_attn_out
+// ── Segment B2: Self-attn attention + O_proj + gate (~11 dispatch) ──
+// Reads: rBuf=Q_roped, g_attnO=K_roped, tV=V_raw (must be submitted after Segment B1)
+// Result: tV = inBuf + gate_self * self_attn_out
+static void record_segment_self_attn_v2(RC& rc, int b, Buffer& inBuf) {
+    auto off=[&](int c)->size_t{return (size_t)c*MS*D*2;};
+    float scl=1.0f/sqrtf((float)HEAD_DIM);
+    uint32_t S_per = MS / M;  // 256
+
+    char ow[128];
+    snprintf(ow,sizeof(ow),"blocks.%d.self_attn.output_proj.weight",b);
+
+    begin_step_recording(rc);
+    // Per-batch self-attention with roped Q (rBuf) and K (g_attnO)
+    for (uint32_t mb = 0; mb < M; mb++) {
+        size_t q_off = mb * S_per * N_HEADS * HEAD_DIM * 2;
+        size_t kv_off = mb * S_per * N_HEADS * HEAD_DIM * 2;
+        size_t a_off = mb * S_per * N_HEADS * S_per * 2;
+        rc.record_attn_3pass(*rc.rBuf, g_attnO, *rc.tV, g_attnA, g_attnO,
+                             S_per,S_per,N_HEADS,HEAD_DIM,scl,
+                             q_off, kv_off, a_off, q_off);
+    }
     rc.dispatch_gemm(g_attnO,ow,MS,D,D,*rc.tO);
+    rc.dispatch_scale_shift(*rc.tO, g_gateScales, 4, g_gateScales, 2,
+                            *rc.tO, MS*D, 0, 0);  // SA O_proj *= 1/4
     rc.dispatch_scale_shift(*rc.tO,*rc.bcBuf,off(2),inBuf,0,
                             *rc.tV,MS*D,1,1);  // tV = inBuf + gate * attn_out
     end_step_recording();
@@ -2153,6 +2442,7 @@ static void record_segment_cross_pre(RC& rc, int b) {
 // ── Segment C2: Cross-attn attention + O_proj + gate (~14 dispatch) ──
 static void record_segment_cross_attn(RC& rc, int b) {
     auto off=[&](int c)->size_t{return (size_t)c*MS*D*2;};
+    uint32_t S_per = MS / M;
     uint32_t MS_kv=M*Nctx;
     float scl=1.0f/sqrtf((float)HEAD_DIM);
 
@@ -2160,9 +2450,18 @@ static void record_segment_cross_attn(RC& rc, int b) {
     snprintf(cx_ow,sizeof(cx_ow),"blocks.%d.cross_attn.output_proj.weight",b);
 
     begin_step_recording(rc);
-    rc.record_attn_3pass(*rc.tQ,*rc.t1,*rc.rBuf,g_attnA,g_attnO,
-                         MS,MS_kv,N_HEADS,HEAD_DIM,scl);
+    // Per-batch cross-attention
+    for (uint32_t mb = 0; mb < M; mb++) {
+        size_t q_off = mb * S_per * N_HEADS * HEAD_DIM * 2;
+        size_t kv_off = mb * Nctx * N_HEADS * HEAD_DIM * 2;
+        size_t a_off = mb * S_per * N_HEADS * Nctx * 2;
+        rc.record_attn_3pass(*rc.tQ,*rc.t1,*rc.rBuf,g_attnA,g_attnO,
+                             S_per,Nctx,N_HEADS,HEAD_DIM,scl,
+                             q_off, kv_off, a_off, q_off);
+    }
     rc.dispatch_gemm(g_attnO,cx_ow,MS,D,D,*rc.tO);
+    rc.dispatch_scale_shift(*rc.tO, g_gateScales, 6, g_gateScales, 2,
+                            *rc.tO, MS*D, 0, 0);  // CX O_proj *= 1/4
     rc.dispatch_scale_shift(*rc.tO,*rc.bcBuf,off(5),*rc.tV,0,
                             *rc.gBuf,MS*D,1,1);  // gBuf = tV + gate * attn_out
     end_step_recording();
@@ -2181,8 +2480,10 @@ static void record_segment_mlp(RC& rc, int b) {
     rc.dispatch_layernorm(*rc.gBuf,*rc.nBuf,MS,D,1e-6f);
     rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,off(6),*rc.bcBuf,off(7),*rc.nBuf,MS*D,1,1);
     rc.dispatch_gemm(*rc.nBuf,l1w,MS,MLP_HIDDEN,D,*rc.t1);
-    rc.dispatch_silu(*rc.t1,*rc.t1,MS*MLP_HIDDEN);
+    rc.dispatch_gelu(*rc.t1,*rc.t1,MS*MLP_HIDDEN);  // GELU, not SiLU! (predict2 GPT2FeedForward uses nn.GELU)
     rc.dispatch_gemm(*rc.t1,l2w,MS,D,MLP_HIDDEN,*rc.nBuf);
+    rc.dispatch_scale_shift(*rc.nBuf, g_gateScales, 0, g_gateScales, 2,
+                            *rc.nBuf, MS*D, 0, 0);  // MLP fc2 *= 1/8
     rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,off(8),*rc.gBuf,0,
                             *rc.outBuf,MS*D,1,1);
     end_step_recording();
@@ -2354,6 +2655,18 @@ bool dit_forward_step(void* x_data, void* t_emb_data, void* ctx_data, void* out_
     LOGI("Forward step start: MS=%u D=%u t_emb=%s ctx=%s",
          MS, D, t_emb_data?"yes":"no", ctx_data?"yes":"no");
 
+    // Upload RoPE freqs to temp GPU buffer (created per-step to survive killall)
+    if (!g_ropeFreqsHost.empty()) {
+        if (g_ropeFreqs.buf == VK_NULL_HANDLE) {
+            VkBufferUsageFlags u = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+            if (!create_buffer(g_vk, g_ropeFreqsSize, u, g_ropeFreqs)) {
+                LOGE("RoPE temp buffer creation failed");
+            } else {
+                memcpy(g_ropeFreqs.mapped, g_ropeFreqsHost.data(), g_ropeFreqsSize);
+            }
+        }
+    }
+
     // Setup RC for per-step recording
     RC rc; memset(&rc, 0, sizeof(rc));
     rc.vk = &g_vk; rc.weights = &g_weights;
@@ -2368,21 +2681,63 @@ bool dit_forward_step(void* x_data, void* t_emb_data, void* ctx_data, void* out_
         // Segment A: AdaLN (36 dispatch)
         record_segment_adaln(rc, b);
         if (!submit_segment()) { LOGE("SegA[%d] submit failed", b); return false; }
+        if (b == 0 && g_b0_shifts) {
+            // Capture shift/scale/gate from bcBuf (pre-broadcast, first M*D of each component)
+            size_t adaln_sz = M * D * 2;
+            memcpy(g_b0_shifts + 0, (uint8_t*)g_bcBuf.mapped + 1*MS*D*2, adaln_sz);  // shift
+            memcpy(g_b0_shifts + M*D, (uint8_t*)g_bcBuf.mapped + 0*MS*D*2, adaln_sz);  // scale
+            memcpy(g_b0_shifts + 2*M*D, (uint8_t*)g_bcBuf.mapped + 2*MS*D*2, adaln_sz);  // gate
+            // Diagnostic: read back first 3 fp16 values from bcBuf scale slot
+            uint16_t* sc = (uint16_t*)((uint8_t*)g_bcBuf.mapped + 0*MS*D*2);
+            LOGI("AdaLN diag: bcBuf[0..2]=0x%04x 0x%04x 0x%04x  aBuf[0]=0x%04x",
+                 sc[0], sc[1], sc[2],
+                 ((uint16_t*)g_aBuf.mapped)[0]);
+        }
 
         if (mode == 0 || mode == 2) {  // full or self-only
-            record_segment_self_attn(rc, b, inBuf);
-            if (!submit_segment()) { LOGE("SegB[%d] submit failed", b); return false; }
+            // Segment B1: LN→AdaLN→QKV→RMSNorm→RoPE (pre-attention)
+            record_segment_self_pre_a(rc, b, inBuf);
+            if (!submit_segment()) { LOGE("SegB1a[%d] submit failed", b); return false; }
+            // B1a done: nBuf=modulated, tQ=Q_raw, tK=K_raw, tV=V_raw
+            if (b == 0) {
+                if (g_b0_mod)   memcpy(g_b0_mod,   g_nBuf.mapped, g_block_out_size);
+                if (g_b0_q_raw) memcpy(g_b0_q_raw, g_tQ.mapped, g_block_out_size);
+                if (g_b0_v)     memcpy(g_b0_v,     g_tV.mapped, MS * N_HEADS * HEAD_DIM * 2);
+            }
+            // Segment B1b: RMSNorm Q/K -> RoPE
+            record_segment_self_pre_b(rc, b);
+            if (!submit_segment()) { LOGE("SegB1b[%d] submit failed", b); return false; }
+            if (b == 0) {
+                size_t qkv_sz = MS * N_HEADS * HEAD_DIM * 2;
+                if (g_b0_q)        memcpy(g_b0_q,        g_tQ.mapped, qkv_sz);
+                if (g_b0_k)        memcpy(g_b0_k,        g_tK.mapped, qkv_sz);
+                if (g_b0_q_roped)  memcpy(g_b0_q_roped,  g_rBuf.mapped, qkv_sz);
+                if (g_b0_k_roped)  memcpy(g_b0_k_roped,  g_attnO.mapped, qkv_sz);
+            }
+            // Segment B2: attention→O_proj→gate
+            record_segment_self_attn_v2(rc, b, inBuf);
+            if (!submit_segment()) { LOGE("SegB2[%d] submit failed", b); return false; }
+            if (b == 0) {
+                uint32_t S_batch = MS / M;
+                size_t score_sz = S_batch * N_HEADS * S_batch * 2;
+                if (g_b0_scores) memcpy(g_b0_scores, g_attnA.mapped, score_sz);
+                if (g_b0_attn_o) memcpy(g_b0_attn_o, g_attnO.mapped, MS * N_HEADS * HEAD_DIM * 2);
+                if (g_b0_o_proj) memcpy(g_b0_o_proj, g_tO.mapped, g_block_out_size);  // O_proj GEMM output
+                if (g_b0_sa) memcpy(g_b0_sa, g_tV.mapped, g_block_out_size);  // SA residual = inBuf + gate * O_proj
+            }
         }
         if (mode == 0 || mode == 3) {  // full or cross-only
             record_segment_cross_pre(rc, b);
             if (!submit_segment()) { LOGE("SegC1[%d] submit failed", b); return false; }
             record_segment_cross_attn(rc, b);
             if (!submit_segment()) { LOGE("SegC2[%d] submit failed", b); return false; }
+            if (b == 0 && g_b0_cx) memcpy(g_b0_cx, g_gBuf.mapped, g_block_out_size);
         }
 
         // Segment D: MLP (6 dispatch)
         record_segment_mlp(rc, b);
         if (!submit_segment()) { LOGE("SegD[%d] submit failed", b); return false; }
+        if (b == 0 && g_b0_mlp) memcpy(g_b0_mlp, g_outBuf.mapped, g_block_out_size);
 
         // Chain: copy output to input buffer for next block
         memcpy(g_xBuf.mapped, g_outBuf.mapped, xBytes);
@@ -2395,10 +2750,22 @@ bool dit_forward_step(void* x_data, void* t_emb_data, void* ctx_data, void* out_
             if ((h & 0x7C00) == 0x7C00 && (h & 0x3FF)) nan_cnt++;
         }
         LOGI("Block %d/28 done, nan=%d", b, nan_cnt);
+
+        // Capture block output for debugging (copy host-side mapped buffer)
+        if (g_block_out[b]) memcpy(g_block_out[b], g_outBuf.mapped, g_block_out_size);
     }
 
     // Free all descriptor sets from this step
     vkResetDescriptorPool(g_vk.device, g_vk.stepPool, 0);
+
+    // Free temp RoPE buffer (so killall won't leave stale GPU resources)
+    if (g_ropeFreqs.buf != VK_NULL_HANDLE) {
+        vkDestroyBuffer(g_vk.device, g_ropeFreqs.buf, nullptr);
+        vkFreeMemory(g_vk.device, g_ropeFreqs.mem, nullptr);
+        g_ropeFreqs.buf = VK_NULL_HANDLE;
+        g_ropeFreqs.mem = VK_NULL_HANDLE;
+        g_ropeFreqs.mapped = nullptr;
+    }
 
     memcpy(out_data, g_outBuf.mapped, xBytes);
     LOGI("Forward step complete");
@@ -2981,6 +3348,97 @@ bool dit_run_rmsnorm(void* in_fp16, void* weight_fp16, int wlen, void* out_fp16,
     return true;
 }
 
+bool dit_get_block_output(int block_idx, void* dst, size_t size) {
+    if (block_idx < 0 || block_idx >= 28) return false;
+    if (!g_block_out[block_idx]) return false;
+    size_t copy_sz = size < g_block_out_size ? size : g_block_out_size;
+    memcpy(dst, g_block_out[block_idx], copy_sz);
+    return true;
+}
+
+// 0=after self-attn, 1=after cross-attn, 2=after MLP (all from block 0)
+// 10=Q_norm, 11=K_norm, 12=V_raw, 13=attn_scores, 14=attn_output
+// 15=Q_roped, 16=K_roped (after RoPE, before attention)
+bool dit_get_b0_intermediate(int stage, void* dst, size_t size) {
+    uint16_t* src = nullptr;
+    size_t src_sz = 0;
+    switch (stage) {
+        case 0: src = g_b0_sa; src_sz = g_block_out_size; break;
+        case 1: src = g_b0_cx; src_sz = g_block_out_size; break;
+        case 2: src = g_b0_mlp; src_sz = g_block_out_size; break;
+        case 10: src = g_b0_q; src_sz = MS * N_HEADS * HEAD_DIM * 2; break;
+        case 11: src = g_b0_k; src_sz = MS * N_HEADS * HEAD_DIM * 2; break;
+        case 12: src = g_b0_v; src_sz = MS * N_HEADS * HEAD_DIM * 2; break;
+        case 13: src = g_b0_scores; src_sz = (MS/M) * N_HEADS * (MS/M) * 2; break;
+        case 14: src = g_b0_attn_o; src_sz = MS * N_HEADS * HEAD_DIM * 2; break;
+        case 15: src = g_b0_q_roped; src_sz = MS * N_HEADS * HEAD_DIM * 2; break;
+        case 16: src = g_b0_k_roped; src_sz = MS * N_HEADS * HEAD_DIM * 2; break;
+        case 17: src = g_b0_o_proj; src_sz = g_block_out_size; break;
+        case 18: src = g_b0_mod; src_sz = g_block_out_size; break;
+        case 19: src = g_b0_q_raw; src_sz = g_block_out_size; break;
+        case 20: src = g_b0_shifts; src_sz = M * 3u * D * 2; break;
+        default: return false;
+    }
+    if (!src) return false;
+    size_t copy_sz = size < src_sz ? size : src_sz;
+    memcpy(dst, src, copy_sz);
+    return true;
+}
+
+bool dit_get_debug_h1(void* dst, size_t size) {
+    if (g_debug_h1.empty()) return false;
+    size_t n_floats = g_debug_h1.size();
+    size_t copy_sz = size < n_floats * 4 ? size : n_floats * 4;
+    memcpy(dst, g_debug_h1.data(), copy_sz);
+    return true;
+}
+
+// Debug: compute lora for a specific output element and return the dot product components
+bool dit_debug_lora_elem(int batch, int out_idx, void* result_12f) {
+    // result_12f: [dot_product_f64, h1_0, w2_0, h1_1, w2_1, ..., h1_5, w2_5] (first 6 terms + total)
+    if (g_debug_h1.empty()) return false;
+    auto w2_it = g_weights.find("t_embedder.1.linear_2.weight");
+    if (w2_it == g_weights.end()) return false;
+
+    const uint16_t* w2_src = (const uint16_t*)w2_it->second.buf.mapped;
+    // Decode w2 row for this output index
+    float* out = (float*)result_12f;
+    const float* h1_row = &g_debug_h1[batch * D];
+
+    double total = 0.0;
+    for (int k = 0; k < 6; k++) {
+        // Decode fp16 w2 element
+        uint32_t h = w2_src[out_idx * D + k];
+        uint32_t sign = (h >> 15) & 1;
+        uint32_t exp  = (h >> 10) & 0x1f;
+        uint32_t mant = h & 0x3ff;
+        float w2_val;
+        if (exp == 0) { w2_val = 0.0f; }
+        else if (exp == 31) { w2_val = NAN; }
+        else {
+            uint32_t f32 = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+            w2_val = *(float*)&f32;
+        }
+        out[1 + k*2] = h1_row[k];
+        out[1 + k*2 + 1] = w2_val;
+        total += (double)h1_row[k] * (double)w2_val;
+    }
+    out[0] = (float)total;
+    return true;
+}
+
+bool dit_get_timestep_output(void* t_emb_dst, size_t t_emb_size, void* lora_dst, size_t lora_size) {
+    if (!g_init) return false;
+    if (t_emb_dst && g_tEmbBuf.mapped) {
+        memcpy(t_emb_dst, g_tEmbBuf.mapped, t_emb_size < M*D*2 ? t_emb_size : M*D*2);
+    }
+    if (lora_dst && g_loraBuf.mapped) {
+        size_t lora_sz = (size_t)M * 3u * D * 2u;
+        memcpy(lora_dst, g_loraBuf.mapped, lora_size < lora_sz ? lora_size : lora_sz);
+    }
+    return true;
+}
+
 void dit_destroy() {
     auto free_buf = [&](Buffer& b) {
         if (b.mapped) vkUnmapMemory(g_vk.device, b.mem);
@@ -3020,11 +3478,21 @@ void dit_destroy() {
     free_buf(g_lnInBuf); free_buf(g_lnOutBuf);
     free_buf(g_geluInBuf); free_buf(g_geluOutBuf);
     free_buf(g_attnQ); free_buf(g_attnK); free_buf(g_attnV); free_buf(g_attnA); free_buf(g_attnO);
+    free_buf(g_ropeFreqs);
     free_buf(g_gemmDummy);
+    free_buf(g_gateScales);
     free_buf(g_rmsInBuf); free_buf(g_rmsOutBuf); free_buf(g_rmsWgtBuf);
 
     if (g_vk.device) vkDestroyDevice(g_vk.device, nullptr);
     if (g_vk.instance) vkDestroyInstance(g_vk.instance, nullptr);
+
+    // Free per-block output capture buffers
+    for (int i = 0; i < 28; i++) { free(g_block_out[i]); g_block_out[i] = nullptr; }
+    free(g_b0_sa); free(g_b0_cx); free(g_b0_mlp);
+    free(g_b0_q); free(g_b0_k); free(g_b0_v); free(g_b0_scores); free(g_b0_attn_o);
+    g_b0_sa = g_b0_cx = g_b0_mlp = nullptr;
+    g_b0_q = g_b0_k = g_b0_v = g_b0_scores = g_b0_attn_o = nullptr;
+
     g_init = false;
     LOGI("dit_destroy complete");
 }

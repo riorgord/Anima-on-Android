@@ -9,12 +9,16 @@ def export(pt_path, bin_path):
     with open(bin_path, 'wb') as f:
         f.write(struct.pack('<I', len(sd)))
         for name, tensor in sd.items():
+            # Strip "net." prefix to match C++ engine expectations
+            clean_name = name
+            while clean_name.startswith("net."):
+                clean_name = clean_name[4:]
             # Convert to fp16 if needed
             t = tensor.detach().cpu()
             if t.dtype != torch.float16:
                 t = t.half()
             data = t.numpy().tobytes()
-            name_bytes = name.encode('utf-8')
+            name_bytes = clean_name.encode('utf-8')
             f.write(struct.pack('<H', len(name_bytes)))
             f.write(name_bytes)
             f.write(struct.pack('<B', len(t.shape)))
