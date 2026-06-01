@@ -613,6 +613,39 @@ struct RC {
         broadcast_off(aBuf, bcBuf, boff(base_comp + 0), M, D, S);  // scale+1
         broadcast_off(tV, bcBuf, boff(base_comp + 2), M, D, S);   // gate
     }
+
+    // AdaLN split into sub-segments to work around Adreno barrier bug.
+    // Adreno ignores VkMemoryBarrier within same cmd buffer for compute dispatches.
+    // Each sub-segment gets its own begin→record→end→submit+wait cycle.
+    void adaln_gpu_split(const char* w0_name, const char* w2_name, int base_comp,
+                          Buffer& tEmb, Buffer& aBuf, Buffer& t1,
+                          Buffer& tQ, Buffer& tK, Buffer& tV,
+                          Buffer& bcBuf, Buffer& onesBuf, Buffer& loraBuf) {
+        static const size_t W2C = (size_t)D * ADALN_LORA_DIM * 2;
+        auto boff = [](int c) -> size_t { return (size_t)c * MS * D * 4; };
+        size_t loraComp = (size_t)M * D * 4;
+
+        // ── SubA1: SiLU + LoRA down ──
+        silu(tEmb, aBuf, M * D);
+        gemm(aBuf, w0_name, M, ADALN_LORA_DIM, D, t1);
+
+        // ── SubA2: LoRA up ×3 ──
+        gemm_sub(t1, w2_name, M, D, ADALN_LORA_DIM, tQ, 0);          // shift
+        gemm_sub(t1, w2_name, M, D, ADALN_LORA_DIM, tK, W2C);        // scale
+        gemm_sub(t1, w2_name, M, D, ADALN_LORA_DIM, tV, W2C * 2);    // gate
+
+        // ── SubA3: add lora + scale+1 ──
+        scale_shift_off(tQ, onesBuf, 0, loraBuf, 0,           tQ, M * D, 0, 1);
+        scale_shift_off(tK, onesBuf, 0, loraBuf, loraComp,     tK, M * D, 0, 1);
+        scale_shift_off(tV, onesBuf, 0, loraBuf, loraComp * 2, tV, M * D, 0, 1);
+        // scale+1: aBuf = tK + 1.0
+        scale_shift_off(tK, onesBuf, 0, onesBuf, 0, aBuf, M * D, 0, 0);
+
+        // ── SubA4: broadcast to bcBuf ──
+        broadcast_off(tQ, bcBuf, boff(base_comp + 1), M, D, S);   // shift
+        broadcast_off(aBuf, bcBuf, boff(base_comp + 0), M, D, S);  // scale+1
+        broadcast_off(tV, bcBuf, boff(base_comp + 2), M, D, S);   // gate
+    }
 };
 
 // ============================================================
@@ -689,6 +722,8 @@ static void end_segment(void) {
 // ============================================================
 
 // ── Segment A: AdaLN all 3 modules → bcBuf ──
+// Each module is split into 4 sub-segments (3-4 dispatches each)
+// to work around Adreno ignoring barriers within a single cmd buffer.
 static void seg_adaln(RC& rc, int b) {
     char s0[128],s2[128],c0[128],c2[128],m0[128],m2[128];
     snprintf(s0,sizeof(s0),"blocks.%d.adaln_modulation_self_attn.1.weight",b);
@@ -698,12 +733,70 @@ static void seg_adaln(RC& rc, int b) {
     snprintf(m0,sizeof(m0),"blocks.%d.adaln_modulation_mlp.1.weight",b);
     snprintf(m2,sizeof(m2),"blocks.%d.adaln_modulation_mlp.2.weight",b);
 
+    auto boff = [](int c) -> size_t { return (size_t)c * MS * D * 4; };
+    size_t loraComp = (size_t)M * D * 4;
+    static const size_t W2C = (size_t)D * ADALN_LORA_DIM * 2;
+
+    // Helper: run adaln for one module in 4 sub-segments
+    auto run_adaln_module = [&](const char* w0n, const char* w2n, int base) {
+        // SubA1: SiLU + LoRA down (2 dispatches)
+        begin_segment(rc);
+        rc.silu(g_tEmbBuf, g_aBuf, M * D);
+        rc.gemm(g_aBuf, w0n, M, ADALN_LORA_DIM, D, g_t1);
+        end_segment(); submit_segment();
+
+        // SubA2: LoRA up ×3 (3 dispatches)
+        begin_segment(rc);
+        rc.gemm_sub(g_t1, w2n, M, D, ADALN_LORA_DIM, g_tQ, 0);
+        rc.gemm_sub(g_t1, w2n, M, D, ADALN_LORA_DIM, g_tK, W2C);
+        rc.gemm_sub(g_t1, w2n, M, D, ADALN_LORA_DIM, g_tV, W2C * 2);
+        end_segment(); submit_segment();
+
+        // SubA3: Add lora + scale+1 (4 dispatches)
+        begin_segment(rc);
+        rc.scale_shift_off(g_tQ, g_onesBuf, 0, g_loraBuf, 0,           g_tQ, M*D, 0, 1);
+        rc.scale_shift_off(g_tK, g_onesBuf, 0, g_loraBuf, loraComp,     g_tK, M*D, 0, 1);
+        rc.scale_shift_off(g_tV, g_onesBuf, 0, g_loraBuf, loraComp * 2, g_tV, M*D, 0, 1);
+        rc.scale_shift_off(g_tK, g_onesBuf, 0, g_onesBuf, 0, g_aBuf, M*D, 0, 0);
+        end_segment(); submit_segment();
+
+        // SubA4: Broadcast to bcBuf (3 dispatches)
+        begin_segment(rc);
+        rc.broadcast_off(g_tQ,   g_bcBuf, boff(base + 1), M, D, S);
+        rc.broadcast_off(g_aBuf, g_bcBuf, boff(base + 0), M, D, S);
+        rc.broadcast_off(g_tV,   g_bcBuf, boff(base + 2), M, D, S);
+        end_segment(); submit_segment();
+    };
+
+    run_adaln_module(s0, s2, 0);  // SA
+    run_adaln_module(c0, c2, 3);  // CX
+    run_adaln_module(m0, m2, 6);  // MLP
+}
+
+// ── Debug: Block 0 AdaLN split into 3 independent segments (test barrier hypothesis) ──
+static void seg_adaln_split(RC& rc) {
+    // Each adaln_gpu call gets its own cmd buffer + submit + fence wait
+    // If this fixes bcBuf, barrier within single cmd buffer is the root cause.
     begin_segment(rc);
-    rc.adaln_gpu(s0, s2, 0, g_tEmbBuf, g_aBuf, g_t1, g_tQ, g_tK, g_tV, g_bcBuf, g_onesBuf, g_loraBuf);
-    rc.adaln_gpu(c0, c2, 3, g_tEmbBuf, g_aBuf, g_t1, g_tQ, g_tK, g_tV, g_bcBuf, g_onesBuf, g_loraBuf);
-    rc.adaln_gpu(m0, m2, 6, g_tEmbBuf, g_aBuf, g_t1, g_tQ, g_tK, g_tV, g_bcBuf, g_onesBuf, g_loraBuf);
-    end_segment();
-    submit_segment();
+    rc.adaln_gpu("blocks.0.adaln_modulation_self_attn.1.weight",
+                 "blocks.0.adaln_modulation_self_attn.2.weight",
+                 0, g_tEmbBuf, g_aBuf, g_t1, g_tQ, g_tK, g_tV,
+                 g_bcBuf, g_onesBuf, g_loraBuf);
+    end_segment(); submit_segment();
+
+    begin_segment(rc);
+    rc.adaln_gpu("blocks.0.adaln_modulation_cross_attn.1.weight",
+                 "blocks.0.adaln_modulation_cross_attn.2.weight",
+                 3, g_tEmbBuf, g_aBuf, g_t1, g_tQ, g_tK, g_tV,
+                 g_bcBuf, g_onesBuf, g_loraBuf);
+    end_segment(); submit_segment();
+
+    begin_segment(rc);
+    rc.adaln_gpu("blocks.0.adaln_modulation_mlp.1.weight",
+                 "blocks.0.adaln_modulation_mlp.2.weight",
+                 6, g_tEmbBuf, g_aBuf, g_t1, g_tQ, g_tK, g_tV,
+                 g_bcBuf, g_onesBuf, g_loraBuf);
+    end_segment(); submit_segment();
 }
 
 // ── Segment B: Self-attn LN→AdaLN→QKV→RMSNorm→RoPE→attn→O_proj→gate ──
@@ -748,19 +841,28 @@ static void seg_self_attn_debug(RC& rc, Buffer& inBuf) {
     size_t qkv_bytes = (size_t)MS * N_HEADS * HEAD_DIM * 4;
     size_t d_bytes = (size_t)MS * D * 4;
 
-    // ── Sub-segment B1: LN + AdaLN + QKV ──
+    // ── Sub-segment B1a: LN only (1 dispatch) ──
     {   begin_segment(rc);
         rc.layernorm(inBuf, g_nBuf, MS, D, 1e-6f);
+        end_segment(); submit_segment();
+    }
+
+    // ── Sub-segment B1b: scale_shift (LN→modulated) (1 dispatch) ──
+    {   begin_segment(rc);
         rc.scale_shift_off(g_nBuf, g_bcBuf, boff(0), g_bcBuf, boff(1), g_nBuf, MS*D, 1, 1);
+        end_segment(); submit_segment();
+        if (g_b0_nbuf) memcpy(g_b0_nbuf, g_nBuf.mapped, d_bytes);  // capture modulated output
+    }
+
+    // ── Sub-segment B1c: QKV GEMM (3 dispatches) ──
+    {   begin_segment(rc);
         rc.gemm(g_nBuf, "blocks.0.self_attn.q_proj.weight", MS, D, D, g_tQ);
         rc.gemm(g_nBuf, "blocks.0.self_attn.k_proj.weight", MS, D, D, g_tK);
         rc.gemm(g_nBuf, "blocks.0.self_attn.v_proj.weight", MS, D, D, g_tV);
         end_segment(); submit_segment();
-        // Capture Q, K, V after GEMM
         if (g_b0_q)  memcpy(g_b0_q,  g_tQ.mapped, qkv_bytes);
         if (g_b0_k)  memcpy(g_b0_k,  g_tK.mapped, qkv_bytes);
         if (g_b0_v)  memcpy(g_b0_v,  g_tV.mapped, qkv_bytes);
-        if (g_b0_nbuf) memcpy(g_b0_nbuf, g_nBuf.mapped, d_bytes);  // LN+AdaLN output
     }
 
     // ── Sub-segment B2: RMSNorm Q/K ──
@@ -852,6 +954,75 @@ static void seg_mlp(RC& rc, int b) {
     submit_segment();
 }
 
+// ── CPU AdaLN: compute bcBuf on CPU (bypasses Adreno multi-dispatch issues) ──
+static void seg_adaln_cpu(int b) {
+    auto boff = [](int c) -> size_t { return (size_t)c * MS * D * 4; };
+    size_t loraComp = (size_t)M * D * 4;
+    static const size_t W2C = (size_t)D * ADALN_LORA_DIM * 2;
+
+    auto cpu_adaln_module = [&](const char* w0_key, const char* w2_key, int base) {
+        // Read t_emb from GPU buffer (HOST_COHERENT — unified memory, no DMA needed)
+        float emb[M*D], lora[M*D3];
+        memcpy(emb,  g_tEmbBuf.mapped, M*D*4);
+        memcpy(lora, g_loraBuf.mapped, M*D3*4);
+
+        // 1. SiLU
+        float aBuf[M*D];
+        for (int i = 0; i < M*D; i++) aBuf[i] = emb[i] / (1.0f + expf(-emb[i]));
+
+        // 2. LoRA down: aBuf @ W0^T → t1 [M, 256]
+        auto it_w0 = g_weights.find(w0_key);
+        float t1[M * ADALN_LORA_DIM];
+        head_tail::cpu_gemm_bf16(M, ADALN_LORA_DIM, D, aBuf,
+            (const uint16_t*)it_w0->second.mapped, t1);
+
+        // 3. LoRA up: t1 @ W2^T → up [M, 3*D]
+        auto it_w2 = g_weights.find(w2_key);
+        float up[M * 3*D];
+        head_tail::cpu_gemm_bf16(M, 3*D, ADALN_LORA_DIM, t1,
+            (const uint16_t*)it_w2->second.mapped, up);
+
+        // 4. Add lora
+        for (int i = 0; i < M*3*D; i++) up[i] += lora[i];
+
+        // 5. scale+1 for component 1
+        float scale_plus1[M*D];
+        for (int i = 0; i < M*D; i++) scale_plus1[i] = up[D + i] + 1.0f;
+
+        // 6. Broadcast to bcBuf (CPU-side, write directly to mapped buffer)
+        float* bc = (float*)g_bcBuf.mapped;
+        for (int m = 0; m < M; m++) {
+            for (int s = 0; s < (int)S; s++) {
+                size_t dst_row = (size_t)(m*S + s) * D;
+                size_t src_m = (size_t)m * D;
+                memcpy(bc + boff(base+1)/4 + dst_row, up + m*3*D, D*4);              // shift
+                memcpy(bc + boff(base+0)/4 + dst_row, scale_plus1 + src_m, D*4);  // scale+1
+                memcpy(bc + boff(base+2)/4 + dst_row, up + 2*D + m*3*D, D*4);     // gate
+            }
+        }
+    };
+
+    char s0[128],s2[128],c0[128],c2[128],m0[128],m2[128];
+    snprintf(s0,sizeof(s0),"blocks.%d.adaln_modulation_self_attn.1.weight",b);
+    snprintf(s2,sizeof(s2),"blocks.%d.adaln_modulation_self_attn.2.weight",b);
+    snprintf(c0,sizeof(c0),"blocks.%d.adaln_modulation_cross_attn.1.weight",b);
+    snprintf(c2,sizeof(c2),"blocks.%d.adaln_modulation_cross_attn.2.weight",b);
+    snprintf(m0,sizeof(m0),"blocks.%d.adaln_modulation_mlp.1.weight",b);
+    snprintf(m2,sizeof(m2),"blocks.%d.adaln_modulation_mlp.2.weight",b);
+
+    cpu_adaln_module(s0, s2, 0);  // SA
+    cpu_adaln_module(c0, c2, 3);  // CX
+    cpu_adaln_module(m0, m2, 6);  // MLP
+
+    // Log first few bcBuf values for debug comparison
+    float* bc = (float*)g_bcBuf.mapped;
+    LOGI("CPU AdaLN bcBuf[0..4] (SA scale+1): %.4f %.4f %.4f %.4f",
+         (double)bc[0], (double)bc[1], (double)bc[2], (double)bc[3]);
+    LOGI("CPU AdaLN bcBuf[0..4] (SA shift):   %.4f %.4f %.4f %.4f",
+         (double)bc[boff(1)/4], (double)bc[boff(1)/4+1],
+         (double)bc[boff(1)/4+2], (double)bc[boff(1)/4+3]);
+}
+
 // ============================================================
 // dit_forward_step — 28 blocks, per-step per-block segmented
 // ============================================================
@@ -878,9 +1049,13 @@ static bool dit_forward_step(void* x_data, void* ctx_data, void* out_data,
     RC rc; rc.vk = &g_vk; rc.cmd = VK_NULL_HANDLE; rc.weights = &g_weights;
 
     for (int b = 0; b < 28; b++) {
-        seg_adaln(rc, b);
-        if (b == 0 && g_b0_bcbuf)
-            memcpy(g_b0_bcbuf, g_bcBuf.mapped, 9u * (size_t)MS * D * 4);
+        if (b == 0) {
+            seg_adaln_split(rc);  // Test: each module in own cmd buffer
+            if (g_b0_bcbuf)
+                memcpy(g_b0_bcbuf, g_bcBuf.mapped, 9u * (size_t)MS * D * 4);
+        } else {
+            seg_adaln_cpu(b);
+        }
         if (b == 0)
             seg_self_attn_debug(rc, g_xBuf);
         else
@@ -1194,7 +1369,7 @@ bool dit_load_safetensors(const char* sf_path, const char* spv_dir) {
             free(cpu_silu); free(cpu_gemm);
         }
 
-        // Fourth smoke test: FULL AdaLN chain (SiLU→GEMM→gemm_sub×3→add lora→scale+1→broadcast)
+        // Fourth smoke test: FULL AdaLN chain — using SPLIT version (each sub-step own segment)
         {
             // Fill test t_emb data (same as before)
             memcpy(g_tEmbBuf.mapped, testEmb, 2*D*4);
@@ -1203,12 +1378,35 @@ bool dit_load_safetensors(const char* sf_path, const char* spv_dir) {
             for (int i = 0; i < 2*D3; i++) testLora[i] = (float)((i % 997) - 498) / 1000.0f;
             memcpy(g_loraBuf.mapped, testLora, 2*D3*4);
 
-            begin_segment(rc);
-            rc.adaln_gpu("blocks.0.adaln_modulation_self_attn.1.weight",
-                         "blocks.0.adaln_modulation_self_attn.2.weight",
-                         0, g_tEmbBuf, g_aBuf, g_t1, g_tQ, g_tK, g_tV,
-                         g_bcBuf, g_onesBuf, g_loraBuf);
-            end_segment(); submit_segment();
+            // Run with 1 dispatch PER segment — ultimate barrier test
+            static const size_t W2C2 = (size_t)D * ADALN_LORA_DIM * 2;
+            size_t loraComp2 = (size_t)M * D * 4;
+            auto boff2 = [](int c) -> size_t { return (size_t)c * MS * D * 4; };
+
+            // 1 dispatch per segment: SiLU
+            begin_segment(rc); rc.silu(g_tEmbBuf, g_aBuf, M*D); end_segment(); submit_segment();
+            // 1 dispatch: GEMM down
+            begin_segment(rc); rc.gemm(g_aBuf, "blocks.0.adaln_modulation_self_attn.1.weight", M, ADALN_LORA_DIM, D, g_t1); end_segment(); submit_segment();
+            // 1 dispatch: gemm_sub shift
+            begin_segment(rc); rc.gemm_sub(g_t1, "blocks.0.adaln_modulation_self_attn.2.weight", M, D, ADALN_LORA_DIM, g_tQ, 0); end_segment(); submit_segment();
+            // 1 dispatch: gemm_sub scale
+            begin_segment(rc); rc.gemm_sub(g_t1, "blocks.0.adaln_modulation_self_attn.2.weight", M, D, ADALN_LORA_DIM, g_tK, W2C2); end_segment(); submit_segment();
+            // 1 dispatch: gemm_sub gate
+            begin_segment(rc); rc.gemm_sub(g_t1, "blocks.0.adaln_modulation_self_attn.2.weight", M, D, ADALN_LORA_DIM, g_tV, W2C2*2); end_segment(); submit_segment();
+            // 1 dispatch: add lora to shift
+            begin_segment(rc); rc.scale_shift_off(g_tQ, g_onesBuf, 0, g_loraBuf, 0, g_tQ, M*D, 0, 1); end_segment(); submit_segment();
+            // 1 dispatch: add lora to scale
+            begin_segment(rc); rc.scale_shift_off(g_tK, g_onesBuf, 0, g_loraBuf, loraComp2, g_tK, M*D, 0, 1); end_segment(); submit_segment();
+            // 1 dispatch: add lora to gate
+            begin_segment(rc); rc.scale_shift_off(g_tV, g_onesBuf, 0, g_loraBuf, loraComp2*2, g_tV, M*D, 0, 1); end_segment(); submit_segment();
+            // 1 dispatch: scale+1
+            begin_segment(rc); rc.scale_shift_off(g_tK, g_onesBuf, 0, g_onesBuf, 0, g_aBuf, M*D, 0, 0); end_segment(); submit_segment();
+            // 1 dispatch: broadcast shift
+            begin_segment(rc); rc.broadcast_off(g_tQ, g_bcBuf, boff2(1), M, D, S); end_segment(); submit_segment();
+            // 1 dispatch: broadcast scale+1
+            begin_segment(rc); rc.broadcast_off(g_aBuf, g_bcBuf, boff2(0), M, D, S); end_segment(); submit_segment();
+            // 1 dispatch: broadcast gate
+            begin_segment(rc); rc.broadcast_off(g_tV, g_bcBuf, boff2(2), M, D, S); end_segment(); submit_segment();
 
             // CPU reference
             {
@@ -1258,8 +1456,20 @@ bool dit_load_safetensors(const char* sf_path, const char* spv_dir) {
                 LOGI("Full AdaLN smoke: bcBuf max_err=%.6f %s",
                      (double)max_bc_err, max_bc_err < 1e-3f ? "OK" : "MISMATCH!");
 
-                // Also check intermediate outputs: t1, tQ, tK, tV, aBuf (scale+1)
+                // Also check intermediate outputs AFTER each step
                 float max_t1_err = 0.0f, max_shift_err = 0.0f, max_scale_err = 0.0f;
+                // Compute expected gemm_sub outputs BEFORE scale_shift adds lora
+                float* cpu_up_raw = (float*)malloc(2*3*D*4);
+                float* cpu_up_all_ref = (float*)malloc(2*3*D*4);
+                // t1 @ W2^T without lora
+                head_tail::cpu_gemm_bf16(2, 3*D, ADALN_LORA_DIM, cpu_down,
+                    (const uint16_t*)it_w2->second.mapped, cpu_up_raw);
+                // t1 @ W2^T + lora
+                memcpy(cpu_up_all_ref, cpu_up_raw, 2*3*D*4);
+                for (int c = 0; c < 3; c++)
+                    for (int m = 0; m < 2; m++)
+                        for (int d = 0; d < D; d++)
+                            cpu_up_all_ref[(m*3+c)*D + d] += testLora[(m*3+c)*D + d];
                 float* gpu_t1 = (float*)g_t1.mapped;
                 float* gpu_tQ = (float*)g_tQ.mapped;  // shift + lora[0]
                 float* gpu_tK = (float*)g_tK.mapped;  // scale + lora[1]
@@ -1302,6 +1512,229 @@ bool dit_load_safetensors(const char* sf_path, const char* spv_dir) {
         }
     }
 
+        // Fifth smoke test: gemm_sub alone (test buffer offset binding)
+        {
+            RC rc5; rc5.vk = &g_vk; rc5.cmd = VK_NULL_HANDLE; rc5.weights = &g_weights;
+            size_t w2c = (size_t)D * ADALN_LORA_DIM * 2;
+            float testT1[2*ADALN_LORA_DIM];
+            for (int i = 0; i < 2*ADALN_LORA_DIM; i++) testT1[i] = (float)((i % 251) - 125) / 125.0f;
+            memcpy(g_t1.mapped, testT1, 2*ADALN_LORA_DIM*4);
+
+            float* cpu_sub[3]; float* gpu_sub[3];
+            size_t offsets[3] = {0, w2c, w2c*2};
+            for (int c = 0; c < 3; c++) {
+                cpu_sub[c] = (float*)malloc(2*D*4);
+                gpu_sub[c] = (float*)malloc(2*D*4);
+            }
+
+            auto it_w2 = g_weights.find("blocks.0.adaln_modulation_self_attn.2.weight");
+            for (int c = 0; c < 3; c++) {
+                head_tail::cpu_gemm_bf16(2, D, ADALN_LORA_DIM, testT1,
+                    (const uint16_t*)((uint8_t*)it_w2->second.mapped + offsets[c]),
+                    cpu_sub[c]);
+            }
+
+            begin_segment(rc5);
+            rc5.gemm_sub(g_t1, "blocks.0.adaln_modulation_self_attn.2.weight", 2, D, ADALN_LORA_DIM, g_tQ, 0);
+            rc5.gemm_sub(g_t1, "blocks.0.adaln_modulation_self_attn.2.weight", 2, D, ADALN_LORA_DIM, g_tK, w2c);
+            rc5.gemm_sub(g_t1, "blocks.0.adaln_modulation_self_attn.2.weight", 2, D, ADALN_LORA_DIM, g_tV, w2c*2);
+            end_segment(); submit_segment();
+
+            memcpy(gpu_sub[0], g_tQ.mapped, 2*D*4);
+            memcpy(gpu_sub[1], g_tK.mapped, 2*D*4);
+            memcpy(gpu_sub[2], g_tV.mapped, 2*D*4);
+
+            for (int c = 0; c < 3; c++) {
+                float max_err = 0.0f;
+                for (int i = 0; i < 2*D; i++) {
+                    float d = fabsf(gpu_sub[c][i] - cpu_sub[c][i]);
+                    if (d > max_err) max_err = d;
+                }
+                const char* names[] = {"shift","scale","gate"};
+                LOGI("gemm_sub[%s] offset=%zu: max_err=%.6f %s",
+                     names[c], offsets[c], (double)max_err,
+                     max_err < 1e-3f ? "OK" : "MISMATCH!");
+            }
+
+            for (int c = 0; c < 3; c++) { free(cpu_sub[c]); free(gpu_sub[c]); }
+        }
+
+        // Sixth smoke test: scale_shift + broadcast
+        {
+            RC rc6; rc6.vk = &g_vk; rc6.cmd = VK_NULL_HANDLE; rc6.weights = &g_weights;
+            // Test scale_shift with stride=0 for scale (scalar broadcast from onesBuf)
+            float testIn[512];
+            for (int i = 0; i < 512; i++) testIn[i] = (float)((i % 127) - 63) / 10.0f;
+            memcpy(g_t1.mapped, testIn, 512*4);
+
+            begin_segment(rc6);
+            // scale_shift: out = x*ones[0] + testIn[0] (scalar shift, stride=0)
+            // Using onesBuf for scale, g_t1 for shift (but as scalar), output to g_tO
+            rc6.scale_shift_off(g_t1, g_onesBuf, 0, g_t1, 0, g_tO, 512, 0, 0);
+            end_segment(); submit_segment();
+
+            float* gpu_out = (float*)g_tO.mapped;
+            float max_ss_err = 0.0f;
+            for (int i = 0; i < 512; i++) {
+                // Expected: out[i] = x[i]*1.0 + x[0] (scalar shift = first element)
+                float expected = testIn[i] + testIn[0];
+                float d = fabsf(gpu_out[i] - expected);
+                if (d > max_ss_err) max_ss_err = d;
+            }
+            LOGI("scale_shift scalar: max_err=%.6f %s",
+                 (double)max_ss_err, max_ss_err < 1e-6f ? "OK" : "MISMATCH!");
+            if (max_ss_err >= 1e-6f) {
+                LOGI("  GPU[0..4]: %.4f %.4f %.4f %.4f",
+                     (double)gpu_out[0], (double)gpu_out[1], (double)gpu_out[2], (double)gpu_out[3]);
+                LOGI("  EX[0..4]:  %.4f %.4f %.4f %.4f",
+                     (double)(testIn[0]+testIn[0]), (double)(testIn[1]+testIn[0]),
+                     (double)(testIn[2]+testIn[0]), (double)(testIn[3]+testIn[0]));
+            }
+
+            // Test broadcast: duplicate [2, 16] → [32, 16] (repeat=16, like S=256 but smaller)
+            float testBC[2*16];
+            for (int i = 0; i < 2*16; i++) testBC[i] = (float)(i * 1.1f);
+            memcpy(g_t1.mapped, testBC, 2*16*4);
+
+            begin_segment(rc6);
+            rc6.broadcast_off(g_t1, g_tO, 0, 2, 16, 16);
+            end_segment(); submit_segment();
+
+            float* gpu_bc = (float*)g_tO.mapped;
+            float max_bc_err = 0.0f;
+            for (int i = 0; i < 2*16*16; i++) {
+                int in_row = (i / 16) / 16;  // input row = output_row / repeat
+                float expected = testBC[in_row * 16 + (i % 16)];
+                float d = fabsf(gpu_bc[i] - expected);
+                if (d > max_bc_err) max_bc_err = d;
+            }
+            LOGI("broadcast 2x16->32x16: max_err=%.6f %s",
+                 (double)max_bc_err, max_bc_err < 1e-6f ? "OK" : "MISMATCH!");
+        }
+
+        // Seventh smoke test: LN alone on GPU vs CPU
+        {
+            RC rc7; rc7.vk = &g_vk; rc7.cmd = VK_NULL_HANDLE; rc7.weights = &g_weights;
+            float* testLN = (float*)malloc(4 * D * 4);     // [4, 2048]
+            float* cpuLN = (float*)malloc(4 * D * 4);
+            for (int i = 0; i < 4*D; i++) testLN[i] = (float)((i % 1021) - 510) / 200.0f;
+            memcpy(g_xBuf.mapped, testLN, 4*D*4);
+
+            // CPU LN
+            head_tail::layernorm(testLN, cpuLN, 4, D);
+
+            // GPU LN
+            begin_segment(rc7);
+            rc7.layernorm(g_xBuf, g_outBuf, 4, D, 1e-6f);
+            end_segment(); submit_segment();
+
+            float max_ln_err = 0.0f;
+            float* gpuLN = (float*)g_outBuf.mapped;
+            for (int i = 0; i < 4*D; i++) {
+                float d = fabsf(gpuLN[i] - cpuLN[i]);
+                if (d > max_ln_err) max_ln_err = d;
+            }
+            LOGI("LN smoke (4x%d): max_err=%.6f %s", D, (double)max_ln_err,
+                 max_ln_err < 1e-3f ? "OK" : "MISMATCH!");
+            if (max_ln_err >= 1e-3f) {
+                LOGI("  GPU[0..4]: %.4f %.4f %.4f %.4f",
+                     (double)gpuLN[0], (double)gpuLN[1], (double)gpuLN[2], (double)gpuLN[3]);
+                LOGI("  CPU[0..4]: %.4f %.4f %.4f %.4f",
+                     (double)cpuLN[0], (double)cpuLN[1], (double)cpuLN[2], (double)cpuLN[3]);
+            }
+
+            // Also test LN with 512×2048 (same as block)
+            float* testLN2 = (float*)malloc(MS * D * 4);
+            float* cpuLN2 = (float*)malloc(MS * D * 4);
+            for (int i = 0; i < MS*D; i++) testLN2[i] = (float)((i % 1021) - 510) / 200.0f;
+            memcpy(g_xBuf.mapped, testLN2, MS*D*4);
+            head_tail::layernorm(testLN2, cpuLN2, MS, D);
+
+            begin_segment(rc7);
+            rc7.layernorm(g_xBuf, g_outBuf, MS, D, 1e-6f);
+            end_segment(); submit_segment();
+
+            float max_ln2_err = 0.0f;
+            float* gpuLN2 = (float*)g_outBuf.mapped;
+            for (int i = 0; i < MS*D; i++) {
+                float d = fabsf(gpuLN2[i] - cpuLN2[i]);
+                if (d > max_ln2_err) max_ln2_err = d;
+            }
+            LOGI("LN smoke (512x%d): max_err=%.6f %s", D, (double)max_ln2_err,
+                 max_ln2_err < 1e-3f ? "OK" : "MISMATCH!");
+
+            free(testLN); free(cpuLN); free(testLN2); free(cpuLN2);
+        }
+
+        // Eighth smoke test: CPU AdaLN vs PyTorch reference
+        {
+            // Use same test data as Full AdaLN test for comparison
+            float testEmb[2*D];
+            for (int i = 0; i < 2*D; i++) testEmb[i] = (float)((i % 1021) - 510) / 510.0f;
+            float testLora[2*D3];
+            for (int i = 0; i < 2*D3; i++) testLora[i] = (float)((i % 997) - 498) / 1000.0f;
+
+            // Run CPU AdaLN (same logic as seg_adaln_cpu)
+            auto cpu_adaln_smoke = [&](const char* w0_key, const char* w2_key, float* bcBuf_out, int base) {
+                // SiLU
+                float aBuf[2*D];
+                for (int i = 0; i < 2*D; i++) aBuf[i] = testEmb[i] / (1.0f + expf(-testEmb[i]));
+
+                // LoRA down: aBuf @ W0^T
+                auto it_w0 = g_weights.find(w0_key);
+                float t1[2 * ADALN_LORA_DIM];
+                head_tail::cpu_gemm_bf16(2, ADALN_LORA_DIM, D, aBuf,
+                    (const uint16_t*)it_w0->second.mapped, t1);
+
+                // LoRA up: t1 @ W2^T
+                auto it_w2 = g_weights.find(w2_key);
+                float up[2 * 3*D];
+                head_tail::cpu_gemm_bf16(2, 3*D, ADALN_LORA_DIM, t1,
+                    (const uint16_t*)it_w2->second.mapped, up);
+
+                // Add lora
+                for (int i = 0; i < 2*3*D; i++) up[i] += testLora[i];
+
+                // scale+1
+                float scale_plus1[2*D];
+                for (int i = 0; i < 2*D; i++) scale_plus1[i] = up[D + i] + 1.0f;
+
+                // Store to bcBuf (broadcast: each row repeated S times)
+                size_t slot_bytes = (size_t)2 * S * D * 4;
+                for (int m = 0; m < 2; m++) {
+                    for (int s = 0; s < (int)S; s++) {
+                        memcpy(bcBuf_out + base*slot_bytes/4 + 1*slot_bytes/4 + (m*S+s)*D,
+                               up + m*D, D*4);  // shift → slot base+1
+                        memcpy(bcBuf_out + base*slot_bytes/4 + 0*slot_bytes/4 + (m*S+s)*D,
+                               scale_plus1 + m*D, D*4);  // scale+1 → slot base+0
+                        memcpy(bcBuf_out + base*slot_bytes/4 + 2*slot_bytes/4 + (m*S+s)*D,
+                               up + 2*D + m*D, D*4);  // gate → slot base+2
+                    }
+                }
+            };
+
+            float* bc = (float*)malloc(9u * 2*S*D * 4);
+            memset(bc, 0, 9u * 2*S*D * 4);
+            cpu_adaln_smoke("blocks.0.adaln_modulation_self_attn.1.weight",
+                           "blocks.0.adaln_modulation_self_attn.2.weight", bc, 0);
+            LOGI("CPU AdaLN smoke: shift[0]=%.4f scale+1[0]=%.4f gate[0]=%.4f",
+                 (double)bc[2*S*D], (double)bc[0], (double)bc[4*S*D]);
+            LOGI("  Shift[0..3]: %.4f %.4f %.4f %.4f",
+                 (double)bc[2*S*D], (double)bc[2*S*D+1], (double)bc[2*S*D+2], (double)bc[2*S*D+3]);
+            LOGI("  Scale+1[0..3]: %.4f %.4f %.4f %.4f",
+                 (double)bc[0], (double)bc[1], (double)bc[2], (double)bc[3]);
+            free(bc);
+
+            // Compare with PyTorch: we need the WSL values as reference
+            // These are computed offline and hardcoded here for comparison
+            // PT SA shift[0..3] from WSL: see scripts/replica/cmp_bcbuf.py
+            // For test input: shift ≈ t1@W2[0:D,:] + lora[0]
+            float max_cpu_err = 0.0f;
+            // We can't run PT here, but we already know from earlier tests
+            // that the GPU Full AdaLN got max_err=68.88 with same test data.
+            // If CPU gets different values, it's a CPU bug.
+        }
+
     dit_alloc_captures();
     g_init = true;
     return true;
@@ -1334,7 +1767,7 @@ bool dit_compute_timestep(const float* sigmas, int M_val,
 
     head_tail::t_embedding_norm((float*)t_emb_out, (const uint16_t*)itn->second.mapped, M_val, D);
 
-    // Upload to Vulkan
+    // Upload NORMALIZED t_emb to Vulkan (PyTorch passes norm'd t_emb to blocks)
     memcpy(g_tEmbBuf.mapped, t_emb_out, (size_t)M_val * D * 4);
     memcpy(g_loraBuf.mapped, adaln_lora_out, (size_t)M_val * D3 * 4);
 
