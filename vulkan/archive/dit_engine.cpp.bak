@@ -72,7 +72,11 @@ struct VulkanCtx {
     uint32_t queueFamily = 0;
     VkCommandPool cmdPool = VK_NULL_HANDLE;
     VkCommandBuffer cmd[28] = {};
+<<<<<<< Updated upstream:vulkan/archive/dit_engine.cpp.bak
     VkCommandBuffer cmd_attn[28] = {}; VkCommandBuffer cmd_post[28] = {};
+=======
+    VkCommandBuffer cmd_attn[28] = {};  // 3-pass attention
+>>>>>>> Stashed changes:vulkan/dit_engine.cpp
     VkFence fence = VK_NULL_HANDLE;
     VkFence stepFence = VK_NULL_HANDLE;  // per-step ops fence
     VkDescriptorPool descPool  = VK_NULL_HANDLE;  // blocks
@@ -210,7 +214,10 @@ static bool init_vulkan(VulkanCtx& ctx) {
     cbInfo.commandPool = ctx.cmdPool; cbInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cbInfo.commandBufferCount = 28;
     if (vkAllocateCommandBuffers(ctx.device, &cbInfo, ctx.cmd) != VK_SUCCESS) return false;
     if (vkAllocateCommandBuffers(ctx.device, &cbInfo, ctx.cmd_attn) != VK_SUCCESS) return false;
+<<<<<<< Updated upstream:vulkan/archive/dit_engine.cpp.bak
     if (vkAllocateCommandBuffers(ctx.device, &cbInfo, ctx.cmd_post) != VK_SUCCESS) return false;
+=======
+>>>>>>> Stashed changes:vulkan/dit_engine.cpp
 
     VkFenceCreateInfo fenceInfo = {};
     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
@@ -1176,6 +1183,7 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
     }
     LOGI("All 28 full blocks pre-recorded (28×63 dispatches)");
 
+<<<<<<< Updated upstream:vulkan/archive/dit_engine.cpp.bak
     // Pre-compute RoPE frequencies (position-dependent, fixed across steps)
     uint32_t HP = (uint32_t)sqrtf((float)S);  // 16 for S=256
     if (!compute_rope_freqs(S, N_HEADS, HP, HEAD_DIM)) {
@@ -1208,6 +1216,14 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
         }
         g_vk.descPool = savedPool;
         LOGI("All 28 cmd_attn pre-recorded with cross-attention (28×24 dispatches, descPool2)");
+=======
+    // Init empty cmd_attn (valid no-op for 3-submit forward loop)
+    for (int i = 0; i < 28; i++) {
+        VkCommandBufferBeginInfo bi = {};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        vkBeginCommandBuffer(g_vk.cmd_attn[i], &bi);
+        vkEndCommandBuffer(g_vk.cmd_attn[i]);
+>>>>>>> Stashed changes:vulkan/dit_engine.cpp
     }
 
     // ── Step 1: GEMM smoke test ──
@@ -2558,11 +2574,13 @@ bool dit_forward_nblocks(void* x_data, void* t_emb_data, void* ctx_data, void* o
     }
 
     for (int i = 0; i < nblocks; i++) {
-        vkResetFences(g_vk.device, 1, &g_vk.fence);
         VkSubmitInfo submit = {};
         submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         submit.commandBufferCount = 1;
+
+        vkResetFences(g_vk.device, 1, &g_vk.fence);
         submit.pCommandBuffers = &g_vk.cmd[i];
+<<<<<<< Updated upstream:vulkan/archive/dit_engine.cpp.bak
         VkResult sr = vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.fence);
         if (sr != VK_SUCCESS) {
             LOGE("Submit cmd[%d] FAILED (VkResult=%d)", i, (int)sr); return false;
@@ -2575,6 +2593,17 @@ bool dit_forward_nblocks(void* x_data, void* t_emb_data, void* ctx_data, void* o
         sr = vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.fence);
         if (sr != VK_SUCCESS) {
             LOGE("Submit cmd_attn[%d] FAILED (VkResult=%d)", i, (int)sr); return false;
+=======
+        if (vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.fence) != VK_SUCCESS) {
+            LOGE("Submit pre[%d] failed", i); return false;
+        }
+        vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+
+        vkResetFences(g_vk.device, 1, &g_vk.fence);
+        submit.pCommandBuffers = &g_vk.cmd_attn[i];
+        if (vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.fence) != VK_SUCCESS) {
+            LOGE("Submit attn[%d] failed", i); return false;
+>>>>>>> Stashed changes:vulkan/dit_engine.cpp
         }
         vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
 
@@ -3410,7 +3439,10 @@ void dit_destroy() {
     if (g_lnCmdBuf) vkFreeCommandBuffers(g_vk.device, g_vk.cmdPool, 1, &g_lnCmdBuf);
     if (g_vk.cmd[0])      vkFreeCommandBuffers(g_vk.device, g_vk.cmdPool, 28, g_vk.cmd);
     if (g_vk.cmd_attn[0]) vkFreeCommandBuffers(g_vk.device, g_vk.cmdPool, 28, g_vk.cmd_attn);
+<<<<<<< Updated upstream:vulkan/archive/dit_engine.cpp.bak
     if (g_vk.cmd_post[0]) vkFreeCommandBuffers(g_vk.device, g_vk.cmdPool, 28, g_vk.cmd_post);
+=======
+>>>>>>> Stashed changes:vulkan/dit_engine.cpp
     if (g_vk.cmdPool) vkDestroyCommandPool(g_vk.device, g_vk.cmdPool, nullptr);
     if (g_vk.fence) vkDestroyFence(g_vk.device, g_vk.fence, nullptr);
 
