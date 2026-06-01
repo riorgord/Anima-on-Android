@@ -653,7 +653,29 @@ torch
 
 Do not install large or mobile-specific toolchains yet. Do not start QNN/Android work yet.
 
-## 12. Current status (updated 2026-06-02 凌晨)
+## 12. 自研轮子现状 (2026-06-02 凌晨, v0.2)
+
+### anima_rt 轻量推理库 ✅
+
+**策略**：不从零写——从 PyTorch 源码 `aten/src/ATen/native/cpu/` 直接抠 C++ kernel，去 ATen 依赖，组装成轻量 `.so`。因为是 PT 自己的代码，与 PyTorch 数学公式完全一致。
+
+**类型路线**：BF16 权重存储 + FP32 计算（不做 FP16）。BF16 动态范围 = FP32 不溢出，高通 NPU 原生支持 → 未来直通。
+
+**已替换 6 类算子**：GELU、SiLU、LayerNorm、RMSNorm、Softmax、Welford（抠自 PT）+ BF16+FP32 Vulkan GEMM shader。
+
+**未替换**：Attention SDPA、RoPE、VAE（复杂度或非瓶颈，暂留 PyTorch）。详见 STATUS.md "自研轮子 vs 未替换清单"。
+
+### BF16+FP32 Vulkan GEMM ✅
+
+gemm_bf16.comp：权重 BF16 packed uint（safetensors 原生零转换）、激活值 FP32、内部 FP32 FMA、输出 FP32。显存不变，计算精度提升 25% vs 之前 FP16 GEMM。
+
+### 中期目标：自研轮子 → Vulkan → QNN 全后端
+
+当前 anima_rt 是纯 CPU 实现。下一步：
+1. **GEMM 脱离 PyTorch**：dlopen OpenBLAS `sbgemm_`（BF16 GEMM，与 PT 同一 BLAS → err=0 保证），替代当前 Python `F.linear`
+2. **Attention CPU kernel**：从 PT 抠 `scaled_dot_product_attention` 的 math backend，用 anima_rt 的 Softmax kernel 组合
+3. **anima_rt 后端扩展**：把已有的 Vulkan GEMM (gemm_bf16.comp) 注册为 anima_rt 的 `GemmBackend`，其余 op 保留 CPU。实现单份代码 CPU/Vulkan/QNN 三后端切换
+4. **QNN NPU**：高通 QNN 支持 BF16 I/O，anima_rt 的 BF16 Tensor 可直接对接，无需精度转换
 
 ### C++ 手写复刻 PyTorch 算子路线 — 终止 ❌
 

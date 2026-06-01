@@ -4,9 +4,46 @@
 在 Snapdragon 8+ Gen1 手机上跑 Anima DiT 2B 模型。
 
 ## 当前状态（一句话）
-**anima_rt 轻量推理库 v0.1 就绪！** 从 PyTorch 源码抠出 GELU/SiLU/LayerNorm/RMSNorm/Softmax 六个 kernel，去 ATen 依赖组装成 454KB `.so`，手机出图 77,942 字节（PC 基准 73,840，差 5.6%）。BF16 权重 + FP32 计算，无 FP16，预留 INT8/BF16 对接 NPU。GEMM 暂留 PyTorch/Vulkan，后续 dlopen OpenBLAS 替换。
+**anima_rt 轻量推理库 v0.2！** 从 PyTorch 源码抠出 GELU/SiLU/LayerNorm/RMSNorm/Softmax/Welford 六个 C++ kernel + BF16 权重 FP32 计算的 Vulkan GEMM shader，手机出图 77,056 字节（PC 基准 73,840，差 4.4%）。自研轮子已覆盖 LayerNorm×85、RMSNorm×113、GELU×28、SiLU×86、Softmax×56、GEMM×280。**未替换**：Attention SDPA、RoPE、VAE（仍在 PyTorch）。中期目标：自研轮子扩展 Vulkan/QNN 后端，最终全链路脱离 PyTorch。
 
 ---
+
+## 自研轮子 vs 未替换清单 (2026-06-02 凌晨)
+
+### ✅ 已替换（anima_rt + BF16 Vulkan GEMM）
+
+| DiT 算子 | 每步次数 | 实现 | 来源 | 手机 err vs PT |
+|----------|---------|------|------|---------------|
+| **GEMM** (block 内) | 280 | Vulkan `gemm_bf16.comp` | BF16 权重 + FP32 FMA 累加 | 0.0044 (v_cond) |
+| **GEMM** (AdaLN/head/tail) | 174 | Vulkan `gemm_bf16.comp` | 同上 | — |
+| **LayerNorm** | 85 | `layernorm_kernel.h` | 抠自 PT `cpu/layer_norm_kernel.cpp` | 3.3e-06 |
+| **RMSNorm** | 113 | `rmsnorm_kernel.h` | 自写 dedicated kernel | 9.5e-06 |
+| **GELU** | 28 | `gelu_kernel.h` | 抠自 PT `cpu/Gelu.h` (exact erf) | 4.8e-07 |
+| **SiLU** | 86 | `silu_kernel.h` | 抠自 PT `cpu/Activation.cpp` | **0** (bit-exact!) |
+| **Softmax** | 56 | `softmax_kernel.h` | 抠自 PT `cpu/SoftMaxKernel.cpp` | 2.2e-08 |
+| **Welford** | LN/RMS 内部 | `welford.h` | 简化自 PT `cpu/moments_utils.h` | — |
+
+### ❌ 未替换（仍在 PyTorch / Vulkan 旧 shader）
+
+| 算子 | 每步次数 | 还走 | 原因 |
+|------|---------|------|------|
+| **Attention SDPA** | 56 | PyTorch `F.scaled_dot_product_attention` | 多后端 dispatch 复杂，需 CPU→Vulkan→QNN 三后端 |
+| **RoPE** | 28 | PyTorch `apply_rotary_pos_emb` | 纯 cos/sin 乘加，精度无损，非瓶颈 |
+| **AdaLN modulation** | 84 | PyTorch `SiLU→Linear→Linear` | SiLU 已替换，小 Linear 走 Vulkan GEMM |
+| **x_embedder** | 1 | PyTorch PatchEmbed | 单次调用，非瓶颈 |
+| **t_embedder** | 1 | PyTorch TimestepEmbedding | 单次调用，SiLU 已替换 |
+| **final_layer** | 1 | PyTorch FinalLayer | 单次调用 |
+| **VAE decoder** | 1 | PyTorch WanVAE | 独立模块，3D conv 复杂 |
+
+### 管线精度演进
+
+| 版本 | 图片大小 | v_cond max_err vs PC | 说明 |
+|------|---------|---------------------|------|
+| PC 基准 (RTX 3060) | 73,840 | 0 | PyTorch CUDA |
+| C++ v2 fp32 best | 75,000 | ~5 | 6 bug 修复后，手写 kernel 终止 |
+| **anima_rt + BF16 GEMM** | **77,056** | **0.0044** | 今晚成果 |
+| anima_rt + FP16 GEMM | 77,942 | 0.0059 | 昨晚 |
+| HybridOps fp16 | 81,000 | — | 原始管线 |
 
 ## 2026-06-02 凌晨：anima_rt 轻量推理库 v0.1 ✅
 
