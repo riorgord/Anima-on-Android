@@ -1109,9 +1109,7 @@ void dit_dump_captures(const char* dir) {
         memcpy(header+8, &hdr_short, 2);
         header[10 + hdr_len] = '\n';
         size_t total = 10 + hdr_len + 1;
-        size_t padded = ((total + 15) / 16) * 16;
         fwrite(header, 1, total, f);
-        for (size_t i = total; i < padded; i++) fputc(' ', f);
         fwrite(data, 4, n, f);
         fclose(f);
     };
