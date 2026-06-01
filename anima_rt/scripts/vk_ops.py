@@ -1,5 +1,5 @@
-"""Hybrid ops: Vulkan GEMM/ LN/ RMSNorm/ GELU via libhybrid_engine.so.
-Weights stored in Vulkan (BF16→FP16 on load), PyTorch holds only shell (~200MB).
+"""Hybrid ops: Vulkan GEMM (BF16 weights + FP32 compute) / LN / RMSNorm / GELU
+via libhybrid_engine.so. PyTorch holds only shell (~200MB).
 """
 import time, struct
 import torch
@@ -71,24 +71,22 @@ class VulkanGemmLinear(nn.Module):
         out_f = self.out_features
 
         if _VK_AVAILABLE and out_f >= _VK_N_THRESHOLD and M >= 16:
-            x_f16 = x.reshape(M, in_f).cpu().contiguous().to(torch.float16)
-            x_u16 = x_f16.numpy().view(np.uint16).copy()
-            out_u16 = np.zeros(M * out_f, dtype=np.uint16)
+            # BF16 weight + FP32 compute: input FP32, output FP32
+            x_f32 = x.reshape(M, in_f).cpu().contiguous().float().numpy().copy()
+            out_f32 = np.zeros(M * out_f, dtype=np.float32)
 
             t0 = time.perf_counter()
             ok = _lib.vk_run_gemm(
                 self.weight_name.encode(),
-                x_u16.ctypes.data_as(_ct.c_void_p),
-                out_u16.ctypes.data_as(_ct.c_void_p),
+                x_f32.ctypes.data_as(_ct.c_void_p),
+                out_f32.ctypes.data_as(_ct.c_void_p),
                 M, out_f, in_f)
             _VK_TIME += time.perf_counter() - t0
 
             if not ok:
-                # Fallback: read weight from Vulkan buffer? Can't easily.
-                # Fall back to CPU with temporary weight.
                 return F.linear(x, self._cpu_weight(x.device, x.dtype), self.bias)
 
-            result = torch.tensor(out_u16.view(np.float16), device=x.device)
+            result = torch.from_numpy(out_f32).to(device=x.device, dtype=x.dtype)
             result = result.reshape(*batch, out_f) if batch else result.squeeze(0)
             if self.bias is not None:
                 result += self.bias.to(result.device, result.dtype)

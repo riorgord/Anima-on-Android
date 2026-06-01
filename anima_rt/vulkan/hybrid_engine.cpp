@@ -1,5 +1,5 @@
 // Hybrid Vulkan Inference Engine
-// Weight storage (BF16→FP16) + per-call GEMM/LN/RMSNorm/GELU dispatch.
+// BF16 weight storage (packed uint32) + FP32 GEMM + per-call LN/RMSNorm/GELU dispatch.
 // Target: Snapdragon 8+ Gen 1 (Adreno 730), Android NDK.
 #include <vulkan/vulkan.h>
 #include <android/log.h>
@@ -161,22 +161,9 @@ static bool create_pipe(VKCtx& ctx, const char* spv_path, uint32_t nBindings,
     return true;
 }
 
-// ── BF16 → FP16 conversion ──
-static inline uint16_t bf16_to_fp16(uint16_t bf16) {
-    uint32_t sign = (bf16 >> 15) & 1;
-    uint32_t exp  = (bf16 >> 7) & 0xFF;
-    uint32_t mant = bf16 & 0x7F;
-
-    if (exp == 0) return (uint16_t)(sign << 15);           // zero / subnormal → 0
-    if (exp == 0xFF) {                                      // Inf / NaN
-        if (mant == 0) return (uint16_t)((sign << 15) | (0x1F << 10));
-        return (uint16_t)((sign << 15) | (0x1F << 10) | 1);
-    }
-    int fp16_exp = (int)exp - 112;                          // BF16 bias 127 → FP16 bias 15
-    if (fp16_exp >= 31) return (uint16_t)((sign << 15) | (0x1E << 10) | 0x3FF);  // overflow → max
-    if (fp16_exp <= 0) return (uint16_t)(sign << 15);       // underflow → 0
-    uint32_t fp16_mant = mant << 3;                         // 7-bit → 10-bit mantissa
-    return (uint16_t)((sign << 15) | (fp16_exp << 10) | fp16_mant);
+// ── BF16 → packed uint32 (2 BF16 per uint, shader unpacks via uintBitsToFloat) ──
+static inline uint32_t pack_bf16_pair(uint16_t a, uint16_t b) {
+    return ((uint32_t)a) | ((uint32_t)b << 16);
 }
 
 // ============================================================
@@ -283,10 +270,13 @@ int vk_weight_add(const char* name, const void* data, int dtype,
 
     uint16_t* dst = (uint16_t*)w.mapped;
     if (dtype == 2) {
-        // BF16 → FP16 conversion
+        // BF16 → packed uint32 (2 BF16 per uint, same byte size as FP16)
         const uint16_t* src = (const uint16_t*)data;
-        for (size_t i = 0; i < elems; i++)
-            dst[i] = bf16_to_fp16(src[i]);
+        for (size_t i = 0; i < elems; i += 2) {
+            uint16_t a = src[i];
+            uint16_t b = (i + 1 < elems) ? src[i + 1] : 0;
+            ((uint32_t*)dst)[i/2] = pack_bf16_pair(a, b);
+        }
     } else if (dtype == 1) {
         // Already FP16 — direct copy
         memcpy(dst, data, w.size);
@@ -336,16 +326,16 @@ bool vk_engine_finalize(void) {
         if (!create_pipe(g_ctx, path, nBindings, pushSize, g_ctx.name)) { \
             LOGE("Pipeline %s failed", spv_file); return false; \
         }
-    CP(gemm, "gemm_fp16.spv", 3, sizeof(PC_Gemm));
+    CP(gemm, "gemm_bf16.spv", 3, sizeof(PC_Gemm));
     CP(layernorm, "layernorm_fp32.spv", 2, sizeof(PC_LayerNorm));
     CP(rmsnorm, "rms_norm_fp16.spv", 3, sizeof(PC_RmsNorm));
     CP(gelu, "gelu_fp16.spv", 2, sizeof(PC_Element));
     #undef CP
     LOGI("All 4 pipelines created");
 
-    // Scratch buffers
+    // Scratch buffers (GEMM now FP32 in/out)
     VkBufferUsageFlags u = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    size_t gemmMax = MS * MLP_HIDDEN * 2;   // 8MB (M=512, K=8192 → fp16)
+    size_t gemmMax = MS * MLP_HIDDEN * 4;   // 16MB (M=512, K=8192 → fp32)
     size_t lnMax   = MS * D * 4;             // 4MB FP32
     size_t rmsMax  = MS * D * 2;             // 2MB FP16
     size_t geluMax = MS * MLP_HIDDEN * 2;    // 8MB
@@ -442,8 +432,8 @@ bool vk_reset_pool(void) {
     return true;
 }
 
-// ── GEMM: C[M,N] = A[M,K] @ weight_name[N,K]^T ──
-bool vk_run_gemm(const char* weight_name, void* x_fp16, void* out_fp16,
+// ── GEMM: C[M,N] = A[M,K] (fp32) @ weight_name[N,K]^T (BF16 packed) ──
+bool vk_run_gemm(const char* weight_name, void* x_fp32, void* out_fp32,
                  int _M, int _N, int _K) {
     if (!g_finalized) return false;
 
@@ -454,11 +444,11 @@ bool vk_run_gemm(const char* weight_name, void* x_fp16, void* out_fp16,
     }
 
     uint32_t Mv = (uint32_t)_M, Nv = (uint32_t)_N, Kv = (uint32_t)_K;
-    size_t inBytes  = Mv * Kv * 2;  // fp16
-    size_t outBytes = Mv * Nv * 2;
+    size_t inBytes  = Mv * Kv * 4;  // fp32
+    size_t outBytes = Mv * Nv * 4;
 
     // Upload input
-    memcpy(g_gemmIn.mapped, x_fp16, inBytes);
+    memcpy(g_gemmIn.mapped, x_fp32, inBytes);
 
     // Bind: A(input), B(weight), C(output)
     VkDescriptorBufferInfo bA = { g_gemmIn.buf, 0, inBytes };
@@ -467,13 +457,13 @@ bool vk_run_gemm(const char* weight_name, void* x_fp16, void* out_fp16,
     VkDescriptorBufferInfo infos[3] = { bA, bB, bC };
 
     PC_Gemm pc = { Mv, Nv, Kv, 1, 1.0f };
-    uint32_t gx = (Nv + 7) / 8;  // gemm_fp16 uses 8×8 workgroups
+    uint32_t gx = (Nv + 7) / 8;  // gemm_bf16 uses 8×8 workgroups
     uint32_t gy = (Mv + 7) / 8;
     if (!one_shot(g_ctx.gemm, 3, infos, &pc, sizeof(pc), gx, gy, 1))
         return false;
 
     // Download output
-    memcpy(out_fp16, g_gemmOut.mapped, outBytes);
+    memcpy(out_fp32, g_gemmOut.mapped, outBytes);
     return true;
 }
 
