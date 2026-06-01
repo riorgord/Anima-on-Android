@@ -1,0 +1,30 @@
+#version 450
+// GELU activation (tanh approximation)
+// y = 0.5 * x * (1 + tanh(beta * (x + kappa * x^3)))
+// PyTorch constants: beta = M_SQRT2 * M_2_SQRTPI * 0.5 = sqrt(2/pi)
+//                    kappa = 0.044715
+// Element-wise, fp32 I/O.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer In  { float in_data[];  };
+layout(binding = 1) writeonly buffer Out { float out_data[]; };
+
+layout(push_constant) uniform PC {
+    uint n_total;
+} pc;
+
+// sqrt(2/π) = sqrt(0.636619772...) = 0.79788456...
+const float GELU_BETA  = 0.7978845608;
+const float GELU_KAPPA = 0.044715;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n_total) return;
+
+    float x = in_data[i];
+    float x3 = x * x * x;
+    float inner = GELU_BETA * (x + GELU_KAPPA * x3);
+    float y = 0.5 * x * (1.0 + tanh(inner));
+    out_data[i] = y;
+}

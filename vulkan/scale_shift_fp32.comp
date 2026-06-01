@@ -1,0 +1,29 @@
+#version 450
+// Fused multiply-add: out = x * scale + shift — element-wise, fp32.
+// Used for AdaLN modulation and gated residual connections.
+// Matches PyTorch: x * (1 + scale) + shift via separate ops;
+// we compute x * scale + shift with fma for numerical accuracy.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer X     { float x_data[];     };
+layout(binding = 1) readonly  buffer Scl   { float scale_data[];  };
+layout(binding = 2) readonly  buffer Sft   { float shift_data[];  };
+layout(binding = 3) writeonly buffer Out   { float out_data[];    };
+
+layout(push_constant) uniform PC {
+    uint n_total;       // total elements
+    uint scale_stride;  // 1 if per-element scale, 0 if scalar broadcast
+    uint shift_stride;  // 1 if per-element shift, 0 if scalar broadcast
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n_total) return;
+
+    float x = x_data[i];
+    float s = scale_data[i * pc.scale_stride];
+    float b = shift_data[i * pc.shift_stride];
+    // fma: x*s + b with single rounding
+    out_data[i] = fma(x, s, b);
+}

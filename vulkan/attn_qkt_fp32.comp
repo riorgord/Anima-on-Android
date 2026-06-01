@@ -1,0 +1,43 @@
+#version 450
+// Attention QK^T: scores[m_q, h, m_kv] = sum_d Q[m_q,h,d] * K[m_kv,h,d] * scale
+// fp32 I/O, fp32 internal dot product.
+// Q: [M_q * H * D] flat  (token-major: token,head,dim interleaved)
+// K: [M_kv * H * D] flat
+// A: [M_q * H * M_kv] flat
+// Per (query_row, head) workgroup. 256 threads.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer Qbuf { float Q[]; };  // [M_q * H * D]
+layout(binding = 1) readonly  buffer Kbuf { float K[]; };  // [M_kv * H * D]
+layout(binding = 2) writeonly buffer Abuf { float A[]; };  // [M_q * H * M_kv]
+
+layout(push_constant) uniform PC {
+    uint M_q;    // per-head query tokens
+    uint M_kv;   // per-head key tokens
+    uint H;      // n_heads
+    uint D;      // head_dim
+    float scale; // 1/sqrt(D)
+} pc;
+
+void main() {
+    uint gid = gl_WorkGroupID.x;
+    uint total_q = pc.M_q * pc.H;
+    if (gid >= total_q) return;
+
+    uint m_q = gid / pc.H;
+    uint h   = gid % pc.H;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint q_off = m_q * pc.H * pc.D + h * pc.D;
+
+    // Each thread handles M_kv values in strides of 256
+    for (uint m_kv = tid; m_kv < pc.M_kv; m_kv += 256u) {
+        float sum = 0.0;
+        uint k_off = m_kv * pc.H * pc.D + h * pc.D;
+        for (uint d = 0u; d < pc.D; d++) {
+            sum = fma(Q[q_off + d], K[k_off + d], sum);
+        }
+        A[gid * pc.M_kv + m_kv] = sum * pc.scale;
+    }
+}

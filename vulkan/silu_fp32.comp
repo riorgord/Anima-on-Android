@@ -1,0 +1,23 @@
+#version 450
+// SiLU (Swish) activation: y = x * sigmoid(x) = x / (1 + exp(-x))
+// Element-wise, fp32 I/O.  Internal: fp32.
+// Matches PyTorch: float(x) / (1.0f + std::exp(-float(x)))
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer In  { float in_data[];  };
+layout(binding = 1) writeonly buffer Out { float out_data[]; };
+
+layout(push_constant) uniform PC {
+    uint n_total;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n_total) return;
+
+    float x = in_data[i];
+    // PyTorch: x / (1 + exp(-x)) — same formula
+    float y = x / (1.0 + exp(-x));
+    out_data[i] = y;
+}

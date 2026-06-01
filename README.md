@@ -122,30 +122,27 @@ output/       生成图片输出
 
 ## Vulkan GPU 加速状态
 
-**HybridOps 管线**：手机直读 BF16 `.safetensors`（3.9GB），加载时一次性 BF16→FP16 存入 Vulkan。PyTorch 只做路由壳（~200MB）。~47s/步，出图干净。
+### 管线对比（2026-06-01）
 
-**GPU 模块注入一览**（`hybridops/scripts/`）：
+| 管线 | 精度 | 出图大小 | 速度 | 状态 |
+|------|------|---------|------|------|
+| **v2 fp32** (`libdit_vk_v2.so`) | fp32 全链路 | **75KB** ✅ | ~100s/步 | 全 DiT ops GPU (12 shader) |
+| HybridOps (`libhybrid_engine.so`) | fp16 | 81KB | 47s/步 | GEMM/LN/RMS/GELU GPU, Attn PyTorch |
+| PC 参考 (RTX 3060) | — | 74KB | — | 干净基准 |
 
-| 模块 | 引擎 | 注入方式 |
-|------|------|---------|
-| GEMM | **libhybrid_engine.so** | VulkanGemmLinear（按名取 Vulkan 权重） |
-| LayerNorm | libhybrid_engine.so FP32 | HybridLayerNorm |
-| RMSNorm | libhybrid_engine.so FP16 | HybridRMSNorm |
-| GELU | libhybrid_engine.so FP16 | HybridGELU |
-| Attention | PyTorch (SDPA) | 暂为 PyTorch, Vulkan shader 已有 |
+**v2 fp32 管线**：`vulkan/dit_engine_v2.cpp` (~1180行) + `vulkan/head_tail_ops.h` (C++ CPU head/tail)。safetensors 直读 BF16 权重，全 fp32 计算，4 段/block TDR-safe dispatch，3-pass attention shader。**唯一代码修复**：`head_tail_ops.h` sin/cos 顺序（PyTorch `[sin|cos]`，之前错写成 `[cos|sin]`）。全部 12 个 shader 通过 PyTorch 对齐验证。
 
-**C++ 引擎 `libhybrid_engine.so`**（~500KB, `hybridops/vulkan/hybrid_engine.cpp` ~360行）：
-- 所有权重以 per-tensor Vulkan buffer 存储，按名索引
-- BF16→FP16 加载时一次性转换
-- 每调用 per-call dispatch（录制→提交→等待→下载），用 `vkResetDescriptorPool` 管理步间资源
+**HybridOps 管线**：`hybridops/vulkan/hybrid_engine.cpp` (~360行)。BF16→FP16 加载，GEMM/LN/RMSNorm/GELU 走 Vulkan per-call dispatch，Attention 走 PyTorch SDPA。47s/步，出图 81KB。
 
-**已知 Adreno 730 限制**：加载阶段峰值 ~5.6GB（mmap 页缓存 + Vulkan buffer），可能触发 OOM；GPU 底频 515MHz 下 dispatch 可能超 TDR；BLAS bad memory unallocation 警告不阻碍出图。
+**已知 Adreno 730 限制**：加载阶段峰值 ~5.6GB；GPU 底频 515MHz 下 dispatch 可能超 TDR（v2 的 4 段/block TDR-safe 架构已规避）；BLAS bad memory unallocation 警告不阻碍出图。
 
-**待开发**：优化加载峰值、Attention/RoPE GPU 化 → APK 打包 → QNN NPU 探索
+**待开发**：v2 锁频+GEMM 优化降速 → APK 打包 → QNN NPU 探索
 
 ## 致谢
 
 - 模型：[circlestone-labs/Anima](https://huggingface.co/circlestone-labs/Anima)
 - 代码改编自：ComfyUI ([GPL-3.0](https://github.com/comfyanonymous/ComfyUI))、[DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio) (Apache 2.0)、NVIDIA Cosmos (Apache 2.0)、Wan-Video VAE (Apache 2.0)
 - Vulkan GEMM shader 参考：[ncnn](https://github.com/Tencent/ncnn) (BSD-3-Clause) by Tencent — innerproduct pack4 + fp16 vectorization 设计思路
+- CPU kernel 算法参考：[PyTorch](https://github.com/pytorch/pytorch) (BSD-3-Clause) — LayerNorm Welford、GELU 常数、BF16 点积累加
+- Vulkan shader 架构参考：[ExecuTorch](https://github.com/pytorch/executorch) (BSD-3-Clause) — attention 3-pass 拆分、cooperative reduction、per-texel RoPE
 - 开发辅助：DeepSeek V4 Pro + Claude Code

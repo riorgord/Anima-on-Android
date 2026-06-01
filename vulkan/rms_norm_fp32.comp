@@ -1,0 +1,59 @@
+#version 450
+// RMS Norm fp32 I/O with BF16 weight
+// x = x * weight * rsqrt(mean(x^2) + eps)
+// Weight stored as packed uint (2×BF16 per uint), unpacked via uintBitsToFloat(bits << 16)
+// One workgroup per row, 256 threads parallel reduction.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer In  { float in_data[];  };
+layout(binding = 1) readonly  buffer W   { uint  weight_packed[]; };  // BF16 packed as uint
+layout(binding = 2) writeonly buffer Out { float out_data[]; };
+
+layout(push_constant) uniform PC {
+    uint n_rows;
+    uint n_elems;
+    float eps;
+} pc;
+
+shared float shm_sq[256];
+
+// Unpack BF16 stored as uint16_t → float32
+// 2 BF16 values per uint: low 16 bits → idx 0, high 16 bits → idx 1
+float bf16_load(uint packed, uint idx_in_pair) {
+    uint bits = (idx_in_pair == 0u) ? (packed & 0xFFFFu) : (packed >> 16u);
+    return uintBitsToFloat(bits << 16u);
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.n_rows) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint offset = row * pc.n_elems;
+
+    // 1. Sum squares (fp32)
+    float my_sq = 0.0;
+    for (uint i = tid; i < pc.n_elems; i += 256u) {
+        float v = in_data[offset + i];
+        my_sq = fma(v, v, my_sq);
+    }
+    shm_sq[tid] = my_sq;
+    barrier();
+
+    // 2. Tree reduce
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) shm_sq[tid] += shm_sq[tid + s];
+        barrier();
+    }
+
+    // 3. rsqrt
+    float rms = inversesqrt(shm_sq[0] / float(pc.n_elems) + pc.eps);
+
+    // 4. Apply: x * rms * weight
+    for (uint i = tid; i < pc.n_elems; i += 256u) {
+        float v = in_data[offset + i] * rms;
+        float w = bf16_load(weight_packed[i / 2u], i & 1u);
+        out_data[offset + i] = v * w;
+    }
+}

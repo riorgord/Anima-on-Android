@@ -1,0 +1,62 @@
+#version 450
+// In-place safe softmax over M_kv dimension, fp32 I/O.
+// A[m_q, h, :] = softmax(A[m_q, h, :])
+// 3-pass: find max → sum(exp(x-max)) → normalize
+// Per (query_row, head) workgroup. 256 threads.
+// Matches PyTorch softmax exactly: exp(x - max) / sum(exp(x - max))
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) buffer Abuf { float A[]; };  // [M_q * H * M_kv] in-place
+
+layout(push_constant) uniform PC {
+    uint M_q;
+    uint M_kv;
+    uint H;
+} pc;
+
+shared float shm_max[256];
+shared float shm_sum[256];
+
+void main() {
+    uint gid = gl_WorkGroupID.x;
+    uint total_q = pc.M_q * pc.H;
+    if (gid >= total_q) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint off = gid * pc.M_kv;
+
+    // Pass 1: find row max
+    float my_max = -1.0e30;
+    for (uint i = tid; i < pc.M_kv; i += 256u) {
+        float v = A[off + i];
+        if (v > my_max) my_max = v;
+    }
+    shm_max[tid] = my_max;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s && shm_max[tid + s] > shm_max[tid])
+            shm_max[tid] = shm_max[tid + s];
+        barrier();
+    }
+    float row_max = shm_max[0];
+    barrier();
+
+    // Pass 2: exp sum
+    float my_sum = 0.0;
+    for (uint i = tid; i < pc.M_kv; i += 256u) {
+        my_sum += exp(A[off + i] - row_max);
+    }
+    shm_sum[tid] = my_sum;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) shm_sum[tid] += shm_sum[tid + s];
+        barrier();
+    }
+    float inv_sum = 1.0 / shm_sum[0];
+
+    // Pass 3: normalize and write back
+    for (uint i = tid; i < pc.M_kv; i += 256u) {
+        A[off + i] = exp(A[off + i] - row_max) * inv_sum;
+    }
+}

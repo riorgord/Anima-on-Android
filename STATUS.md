@@ -6,9 +6,44 @@
 ## 当前状态（一句话）
 **HybridOps 管线已重写**：手机直读 BF16 safetensors，权重只存 Vulkan（libhybrid_engine.so ~500KB）。PyTorch shell ~200MB，稳态内存 ~3.9GB，峰值 ~5.6GB。出图干净，3步 142s (47s/步)，840/840 GEMM 走 Vulkan。**下一步：优化峰值内存 → APK 打包 → QNN NPU 探索。**
 
+## 2026-06-01 白天：v2 fp32 管线达标 ✅
+
+### 成果
+- **定位并修复 head_tail_ops.h sin/cos 顺序 bug**：PyTorch `Timesteps.forward()` 是 `torch.cat([sin_emb, cos_emb], dim=-1)`（sin 在前），C++ 写成了 cos 在前。这个 bug 导致 t_emb/adanaln_lora 完全错误（max_err=329.9），是之前 1e+31 溢出和 123KB 出图的根因。
+- **系统性验证框架**：`scripts/replica/` 新建 7 个测试脚本，覆盖 CPU vs CUDA 基线、逐 op 复刻验证、shader 算法模拟、RoPE 逐行对比、head/tail E2E
+- **全部 12 个 shader 验证通过**：GEMM、LN、RMSNorm、GELU、SiLU、ScaleShift、Gate、Broadcast、RoPE、attn_qkt、attn_softmax、attn_out 均与 PyTorch fp32 误差 < 1.5× CPU-vs-CUDA 基线
+- **RoPE 确认正确**：逐行对比 `VideoRopePosition3DEmb`，3D 维度分割、NTK 缩放公式、频率布局全部一致
+- **出图**：3 步 75KB（PC 参考 74KB），是目前最接近参考的手机管线
+- **速度**：~100s/步（fp32 带宽 + 515MHz 底频），锁 912MHz + GEMM 优化后预期 30-40s/步
+
+### 代码改动（仅一行）
+`vulkan/head_tail_ops.h:213-214` — sin 和 cos 对调：
+```cpp
+// 修复前（错误 — PyTorch 是 [sin|cos]，这里是 [cos|sin]）
+emb[m * D + i] = cosf(val);
+emb[m * D + half + i] = sinf(val);
+
+// 修复后
+emb[m * D + i] = sinf(val);
+emb[m * D + half + i] = cosf(val);
+```
+
+### 验证脚本
+| 脚本 | 用途 |
+|------|------|
+| `scripts/replica/bench_cpu_cuda.py` | CPU vs CUDA 基线测量（13 ops） |
+| `scripts/replica/test_t_embed.py` | sin/cos bug 复现 & 验证 |
+| `scripts/replica/test_head_tail_e2e.py` | head/tail 全链路 E2E |
+| `scripts/replica/verify_shaders.py` | 12 shader 算法 vs PyTorch |
+
 ## 出图演进
 
 | 版本 | 大小 | 改动 |
+|------|------|------|
+| C++ v2 (sin/cos bug) | 123,000 | ❌ |
+| HybridOps (fp16) | 81,000 | — |
+| **v2 fp32 fixed** | **75,000** | **sin/cos 修复** |
+| PC 基准 (RTX 3060) | **73,840** | 干净 |
 |------|------|------|
 | 原始 | 118,681 | — |
 | GEMM FMA + Welford LN | 118,614 | 同前 |

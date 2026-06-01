@@ -1,0 +1,40 @@
+#version 450
+// RoPE (Rotary Position Embedding) — apply 2D rotation, fp32 I/O
+// t: [N, head_dim]  freqs: [N, head_dim/2, 2, 2]  →  out: [N, head_dim]
+// freqs layout per pair: [cos, -sin, sin, cos]
+// This matches PyTorch's rotary embedding (RoPE) formula exactly.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer T_in    { float t_data[];   };
+layout(binding = 1) readonly  buffer Freqs   { float freq_data[]; };
+layout(binding = 2) writeonly buffer T_out   { float out_data[];  };
+
+layout(push_constant) uniform PC {
+    uint N;          // total number of (token, head) rows
+    uint head_dim;   // 128 for DiT
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.N) return;
+
+    uint half_dim = pc.head_dim / 2u;
+    uint t_base = idx * pc.head_dim;
+
+    for (uint i = 0u; i < half_dim; i++) {
+        float a = t_data[t_base + 2u * i];     // x_i (real part)
+        float b = t_data[t_base + 2u * i + 1u]; // x_{i+1} (imag part)
+
+        uint f_base = (idx * half_dim + i) * 4u;
+        // freqs layout: [cos, -sin, sin, cos] per pair
+        float c  = freq_data[f_base + 0u];  // cos
+        float ms = freq_data[f_base + 1u];  // -sin
+        float s  = freq_data[f_base + 2u];  // sin
+        float mc = freq_data[f_base + 3u];  // cos
+
+        // Complex rotation: out_a + i*out_b = (cos + i*sin) * (a + i*b)
+        out_data[t_base + 2u * i]     = fma(c,  a, ms * b);  // cos*a + (-sin)*b
+        out_data[t_base + 2u * i + 1u] = fma(s,  a, mc * b); // sin*a + cos*b
+    }
+}

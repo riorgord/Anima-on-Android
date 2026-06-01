@@ -1,0 +1,28 @@
+#version 450
+// Broadcast [M, D] → [N, D] by repeating each row repeat times.
+// out[i*repeat + r][d] = in[i][d]
+// Used to expand per-batch AdaLN modulations to per-token.
+// fp32 I/O.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer In  { float in_data[];  };
+layout(binding = 1) writeonly buffer Out { float out_data[]; };
+
+layout(push_constant) uniform PC {
+    uint M;        // input rows
+    uint D;        // elements per row
+    uint repeat;   // repeat each row this many times
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total_out = pc.M * pc.repeat * pc.D;
+    if (idx >= total_out) return;
+
+    uint out_row = idx / pc.D;
+    uint col = idx % pc.D;
+    uint in_row = out_row / pc.repeat;
+
+    out_data[idx] = in_data[in_row * pc.D + col];
+}

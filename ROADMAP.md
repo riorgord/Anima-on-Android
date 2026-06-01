@@ -653,7 +653,17 @@ torch
 
 Do not install large or mobile-specific toolchains yet. Do not start QNN/Android work yet.
 
-## 12. Current status (updated 2026-05-27 evening)
+## 12. Current status (updated 2026-06-01 daytime)
+
+### Vulkan v2 fp32 管线达标 ✅ (2026-06-01 白天)
+
+- **bug 定位**：`head_tail_ops.h:213` sin/cos 顺序反了（PyTorch `[sin|cos]`，C++ 写成 `[cos|sin]`），导致 t_emb/adanaln_lora max_err=329.9 → GEMM 1e+31 溢出 → 出图 123KB
+- **修复**：一行代码，sin 和 cos 对调
+- **验证**：系统性 4-phase 验证（CPU vs CUDA 基线 → 逐函数 test → 12 shader 算法模拟 → RoPE 逐行对比），全部通过
+- **出图**：3 步 **75KB**（PC 参考 74KB），是目前最接近参考的手机管线 ✅
+- **速度**：~100s/步（fp32 + 515MHz 底频），HybridOps 47s/步（fp16）仍是速度基线
+- **代码**：`vulkan/dit_engine_v2.cpp` (~1180行) + `vulkan/head_tail_ops.h` (C++ CPU head/tail)，12 fp32 shader
+- **验证脚本**：`scripts/replica/` 下 7 个测试脚本
 
 ### HybridOps safetensors 直读 ✅ (2026-06-01 凌晨)
 
@@ -689,12 +699,18 @@ Do not install large or mobile-specific toolchains yet. Do not start QNN/Android
 
 ### Pending
 
-- Cross-attention (K/V from ctx, shapes differ)
-- GPU-side AdaLN (currently CPU pre-compute 504MB upload)
-- RoPE + Attention dispatch integration
-- x_embedder, t_embedder, final_layer C++ port
 - VAE decode (stay PyTorch for now)
-- End-to-end phone_pipeline integration
+- Lock GPU 912MHz + GEMM shader optimization → target <30s/step
+- APK packaging
+- QNN NPU exploration
+
+### Completed (2026-06-01 daytime)
+
+- ✅ sin/cos bug fix (head_tail_ops.h) — root cause of 123KB output
+- ✅ 12 shader algorithm verification vs PyTorch (all within 1.5× CPU-vs-CUDA baseline)
+- ✅ RoPE 3D dimension split verified correct (matches VideoRopePosition3DEmb line-by-line)
+- ✅ Systematic verification framework (scripts/replica/)
+- ✅ End-to-end pipeline: 75KB output image ✅
 
 **The "driver bug" was wrong.** All prior "inf/nan/.so garbage" diagnoses were parameter pollution (tile=4 or shape=4×4 triggered shader degeneration). Binary baseline re-verified clean. The real bugs found and fixed:
 
