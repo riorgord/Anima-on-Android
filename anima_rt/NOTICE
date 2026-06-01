@@ -1,0 +1,34 @@
+This project incorporates source code from PyTorch
+(https://github.com/pytorch/pytorch), which is licensed under the
+BSD 3-Clause License:
+
+Copyright (c) 2016-     Facebook, Inc            (Adam Paszke)
+Copyright (c) 2014-     Facebook, Inc            (Soumith Chintala)
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+
+3. Neither the names of Facebook, Deepmind Technologies, NYU, NEC
+   Laboratories America and IDIAP Research Institute nor the names of
+   its contributors may be used to endorse or promote products derived
+   from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED.
+
+The extracted kernel code is located in:
+  include/cpu/gelu_kernel.h    — derived from aten/src/ATen/native/cpu/Gelu.h
+  include/cpu/silu_kernel.h    — derived from aten/src/ATen/native/cpu/Activation.cpp
+  include/cpu/softmax_kernel.h — derived from aten/src/ATen/native/cpu/SoftMaxKernel.cpp
+  include/cpu/layernorm_kernel.h — derived from aten/src/ATen/native/cpu/layer_norm_kernel.cpp
+  include/cpu/welford.h        — derived from aten/src/ATen/native/cpu/moments_utils.h

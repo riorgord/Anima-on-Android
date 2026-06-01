@@ -1,14 +1,121 @@
-# Anima 项目状态摘要 (2026-06-01)
+# Anima 项目状态摘要 (2026-06-02 凌晨)
 
 ## 我们在做什么
-在 Snapdragon 8+ Gen1 手机上运行 Anima 动漫风格图像生成模型 (2B DiT)。
+在 Snapdragon 8+ Gen1 手机上跑 Anima DiT 2B 模型。
 
 ## 当前状态（一句话）
-**HybridOps 管线已重写**：手机直读 BF16 safetensors，权重只存 Vulkan（libhybrid_engine.so ~500KB）。PyTorch shell ~200MB，稳态内存 ~3.9GB，峰值 ~5.6GB。出图干净，3步 142s (47s/步)，840/840 GEMM 走 Vulkan。**下一步：优化峰值内存 → APK 打包 → QNN NPU 探索。**
+**anima_rt 轻量推理库 v0.1 就绪！** 从 PyTorch 源码抠出 GELU/SiLU/LayerNorm/RMSNorm/Softmax 六个 kernel，去 ATen 依赖组装成 454KB `.so`，手机出图 77,942 字节（PC 基准 73,840，差 5.6%）。BF16 权重 + FP32 计算，无 FP16，预留 INT8/BF16 对接 NPU。GEMM 暂留 PyTorch/Vulkan，后续 dlopen OpenBLAS 替换。
 
-## 2026-06-01 白天：v2 fp32 管线达标 ✅
+---
+
+## 2026-06-02 凌晨：anima_rt 轻量推理库 v0.1 ✅
 
 ### 成果
+- **复制 hybridops → anima_rt**，对副本动刀
+- **从 PyTorch 源码抠出 6 个 kernel**:
+  | Kernel | 来源 | 手机 max_err vs PT |
+  |--------|------|-------------------|
+  | GELU | PT cpu/Gelu.h | 4.77e-07 (1 ULP) |
+  | SiLU | PT cpu/Activation.cpp | **0.00e+00** (bit-exact!) |
+  | LayerNorm | PT cpu/layer_norm_kernel.cpp | 3.34e-06 (14 ULP) |
+  | RMSNorm | 自写 dedicated kernel | 9.54e-06 (40 ULP) |
+  | Softmax | PT cpu/SoftMaxKernel.cpp | 2.24e-08 (<0.1 ULP) |
+- **`libanima_rt.so`**: 454KB (Android), 18KB (host)
+- **类型策略**: BF16 权重 + FP32 计算（不做 FP16），预留 INT8/BF16 对接 NPU
+- **手机管线出图**: **77,942 字节**，无 NaN，v_cond 正常
+
+### 误差 vs C++ v2 的本质区别
+C++ v2 后来确实转了 FP32（shader 内部 fp32 累加+FMA），但**仍因并行归约求和顺序 ≠ PT 而失败**。即使都是 FP32，`(a+b)+(c+d) ≠ ((a+b)+c)+d`。
+anima_rt 的标量 Welford 更接近 PT 的串行路径 → 误差 10⁻⁶ 级（FP32 的 ULP），而 v2 shader 的并行归约误差在 10⁻² 级 → 28 层累积后放大。
+
+### 误差解释
+| 来源 | 量级 | 原因 |
+|------|------|------|
+| GELU (1 ULP) | 2-5e-07 | NDK libm `erff` ≠ PT 的 libm |
+| SiLU (0) | **0** | NDK `expf` 恰好和 PT 逐位一致 |
+| LN/RMS (14-40 ULP) | 3e-06~1e-05 | 标量 Welford vs PT 向量化 cascade-sum 的累加顺序不同 |
+| Softmax | 2e-08 | 算法结构简单，几乎无差异 |
+
+### vs 基准对比
+| 版本 | 图片大小 |
+|------|---------|
+| PC 基准 (RTX 3060) | 73,840 |
+| C++ v2 fp32 best | 75,000 |
+| **anima_rt (今晚)** | **77,942** |
+| HybridOps fp16 | 81,000 |
+
+### 架构
+```
+anima_rt/
+  include/
+    anima_tensor.h       ← 最小化 Tensor (FP32/BF16/INT8)
+    anima_backend.h      ← 函数指针表 (CPU/Vulkan/QNN 可插拔)
+    cpu/                 ← 抠自 PT 的 6 个 kernel headers + 3 stub
+  src/                   ← tensor + backend + C API (3 文件)
+  scripts/               ← Python ctypes 绑定 + 验证脚本
+  libanima_rt.so         ← 454KB NDK 交叉编译产物
+```
+
+### 下一步
+- GEMM: dlopen OpenBLAS `sbgemm_` 替代 PyTorch Linear
+- Vulkan: 只加速 GEMM（已验证 149 GFLOPS），其余全走 anima_rt CPU kernel
+- QNN NPU: BF16 直接对接高通 NPU
+
+## 2026-06-01 晚间~凌晨：v2 fp32 管线大规模 debug（终止）
+
+### 修复的 6 个 bug
+
+| # | Bug | 修复位置 |
+|---|-----|---------|
+| 1 | loraBuf 布局 `[M,3D]` vs `[3,M,D]` | `dit_compute_timestep` 上传前转置 |
+| 2 | CPU scale+1 flat index（i≥D 读错 batch） | `seg_adaln_cpu` per-batch 索引 |
+| 3 | SiLU 顺序：PT 是 SiLU→Linear→Linear（无中间 SiLU），错误加了 SiLU #2 | **已 revert** |
+| 4 | final_layer lora flat index（同 #2） | `head_tail_ops.h:final_layer` per-batch |
+| 5 | `record_attn_3pass` sub-batch buffer offset bug | batch_q=M_q 消除分批 |
+| 6 | GELU tanh 近似 → exact erf | `gelu_fp32.comp` 重写 |
+
+### 验证通过（逐 op vs PT）
+
+| 模块 | max_err | 
+|------|---------|
+| bcBuf (AdaLN 9 slot) | **0.000015** |
+| g_nBuf (LN+调制) | **0.000092** |
+| Q/K/V GEMM | **0.0003~0.0007** |
+| RMSNorm | **0.000004** |
+| RoPE | magnitude ratio=1.0 |
+| Block 0 SA → CX → MLP 全链路 | SA=0.0015, CX=0.0000, MLP=0.05 |
+| Block 27 C++ vs PT range | 基本一致 (`[-441k,10k]` vs `[-440k,10k]`) |
+
+### 出图演进
+
+| 版本 | 大小 | 说明 |
+|------|------|------|
+| v2 原始 (sin/cos fix) | 85KB | 有 lora/scale+1/SiLU 多个 bug |
+| +所有修复 | **121KB** | 6 bug 修复 + GELU exact erf |
+
+### 为什么终止
+
+1. **Smoke test 只比 GPU vs CPU 不比 PT** — 自洽不代表正确
+2. **每轮迭代 6 分钟** — 调试效率太低
+3. **Python RoPE 实现有 bug** — PT 参考自己不准，丢失信任锚
+4. **GEMM/GELU/softmax 的浮点累积差异** — 手写 shader 和 PT 的累加顺序不同，无法消除
+5. **AI 生成的代码**（`cpu_gemm_bf16`、shader）没有经过 PyTorch 级别的测试和 review
+
+### 新方向
+
+从 PyTorch 源码 (`aten/src/ATen/native/cpu/`) 抠出 DiT 所需算子的 C++ kernel：
+- `gelu_kernel.cpp`、`layer_norm_kernel.cpp`、`softmax_kernel.cpp`
+- `Linear.cpp`（GEMM）、`Activation.cpp`（SiLU）
+- 替换 malloc/tensor 抽象为轻量实现
+- 此基础上做 Vulkan compute shader 和 QNN NPU 加速
+
+### 关键教训
+- 不要手写 kernel
+- Smoke test 必须包含 PT 参考
+- 对比脚本本身也可能是 bug 来源（SiLU 顺序反了两次）
+- `adb pull` 目录会在目标下创建嵌套子目录
+
+### 成果（白天）
 - **定位并修复 head_tail_ops.h sin/cos 顺序 bug**：PyTorch `Timesteps.forward()` 是 `torch.cat([sin_emb, cos_emb], dim=-1)`（sin 在前），C++ 写成了 cos 在前。这个 bug 导致 t_emb/adanaln_lora 完全错误（max_err=329.9），是之前 1e+31 溢出和 123KB 出图的根因。
 - **系统性验证框架**：`scripts/replica/` 新建 7 个测试脚本，覆盖 CPU vs CUDA 基线、逐 op 复刻验证、shader 算法模拟、RoPE 逐行对比、head/tail E2E
 - **全部 12 个 shader 验证通过**：GEMM、LN、RMSNorm、GELU、SiLU、ScaleShift、Gate、Broadcast、RoPE、attn_qkt、attn_softmax、attn_out 均与 PyTorch fp32 误差 < 1.5× CPU-vs-CUDA 基线

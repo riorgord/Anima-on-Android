@@ -653,32 +653,36 @@ torch
 
 Do not install large or mobile-specific toolchains yet. Do not start QNN/Android work yet.
 
-## 12. Current status (updated 2026-06-01 daytime)
+## 12. Current status (updated 2026-06-02 凌晨)
 
-### Vulkan v2 fp32 管线达标 ✅ (2026-06-01 白天)
+### C++ 手写复刻 PyTorch 算子路线 — 终止 ❌
 
-- **bug 定位**：`head_tail_ops.h:213` sin/cos 顺序反了（PyTorch `[sin|cos]`，C++ 写成 `[cos|sin]`），导致 t_emb/adanaln_lora max_err=329.9 → GEMM 1e+31 溢出 → 出图 123KB
-- **修复**：一行代码，sin 和 cos 对调
-- **验证**：系统性 4-phase 验证（CPU vs CUDA 基线 → 逐函数 test → 12 shader 算法模拟 → RoPE 逐行对比），全部通过
-- **出图**：3 步 **75KB**（PC 参考 74KB），是目前最接近参考的手机管线 ✅
-- **速度**：~100s/步（fp32 + 515MHz 底频），HybridOps 47s/步（fp16）仍是速度基线
-- **代码**：`vulkan/dit_engine_v2.cpp` (~1180行) + `vulkan/head_tail_ops.h` (C++ CPU head/tail)，12 fp32 shader
-- **验证脚本**：`scripts/replica/` 下 7 个测试脚本
+6 月 1 日晚间大规模 debug 会话：定位并修复 6 个 bug（lora 布局、scale+1 flat index、SiLU 顺序、final_layer lora、attention sub-batch、GELU approximation）。Block 0 逐 op vs PT 全链路验证通过。但出图 121KB（目标 74KB，最佳 85KB）。剩余误差源于手写 GEMM/GELU/attention shader 与 PyTorch kernel 的系统性浮点差异。
+
+**终止原因：**
+- 手写 kernel 和 PT 的累加顺序/公式不同，差异无法通过逐 op 排查消除
+- 每轮调试 6 分钟，效率太低
+- AI 生成的 C++/GLSL 代码缺乏 PyTorch 级别的测试覆盖
+
+### 新方向：从 PyTorch 抠 kernel → 轻量推理库 → Vulkan/QNN
+
+基于 `hybridops/` 管线架构，用从 PyTorch 源码 (`aten/src/ATen/native/cpu/`) 抠出的 C++ kernel 替换手写算子：
+1. 提取 `gelu_kernel.cpp`、`layer_norm_kernel.cpp`、`softmax_kernel.cpp`、`Linear.cpp`、`Activation.cpp`
+2. 替换 ATen 的 malloc/tensor 抽象为轻量实现
+3. 组装成独立 C++ 推理库（~几百 KB），替代 hybridops 中 PyTorch 的部分
+4. 在此基础上做 Vulkan compute shader 和 QNN NPU 加速
+5. 目标：APK < 50MB，稳态内存 < 4GB
 
 ### HybridOps safetensors 直读 ✅ (2026-06-01 凌晨)
 
-`hybridops/` 已实现：
-- 手机直读 `.safetensors`（BF16），加载时一次性 BF16→FP16 存入 Vulkan
-- 新 Vulkan 引擎 `libhybrid_engine.so` (~500KB): GEMM/LN/RMSNorm/GELU per-call dispatch
-- PyTorch 不再持有 block 权重 (~200MB shell), 稳态内存 ~3.9GB
-- 详见 `STATUS.md` 和 `hybridops/scripts/phone_pipeline.py`
+保留为管线骨架。`hybridops/` 的 safetensors 直读 + Vulkan 权重管理架构可复用。
 
-### C++ Vulkan Engine v2 — REWRITTEN & WORKING
+### v2 fp32 管线 debug 成果（保留参考）
 
-- **libdit_vk.so**: ~1000 lines, 8 shader pipelines, 28 per-block cmd buffers
-- **Speed**: 9.9s/step (28 blocks, self-attn+MLP), 12× vs CPU 120s, 5.7× vs Python ctypes 56s
-- **Correctness**: Block 0 with real pipeline inputs — max_err=0.75 vs PyTorch, mean/std matching
-- **Architecture**: Per-tensor weight buffers (567 tensors, 3.9GB), shared bcBuf (18MB), Type 6 unified memory
+6 个 bug 修复细节和验证数据见 `STATUS.md`。关键认知：
+- Smoke test GPU vs CPU 不保证 vs PT 正确
+- 对比脚本本身也可能是 bug 源
+- Block 0 全链路已验证（bcBuf/GEMM/RMSNorm/RoPE/Attention/Cross-attn/MLP 全部 vs PT 对齐）
 
 ### Key technical findings
 
