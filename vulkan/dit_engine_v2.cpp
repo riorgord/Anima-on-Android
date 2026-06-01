@@ -634,6 +634,8 @@ static float *g_b0_qn=nullptr, *g_b0_kn=nullptr, *g_b0_qr=nullptr, *g_b0_kr=null
 static float *g_b0_scores=nullptr, *g_b0_attn_o=nullptr, *g_b0_oproj=nullptr;
 static float *g_b0_fc1=nullptr, *g_b0_fc2=nullptr;
 static float *g_b0_sa=nullptr, *g_b0_cx=nullptr, *g_b0_mlp=nullptr;
+static float *g_b0_nbuf=nullptr;
+static float *g_b0_bcbuf=nullptr;  // AdaLN modulation buffer
 
 // RoPE host-side frequencies
 static std::vector<float> g_ropeFreqsHost;
@@ -738,6 +740,67 @@ static void seg_self_attn(RC& rc, int b, Buffer& inBuf) {
     submit_segment();
 }
 
+// ── Debug: Block 0 self-attn split into sub-segments for intermediate capture ──
+static void seg_self_attn_debug(RC& rc, Buffer& inBuf) {
+    auto boff = [](int c) -> size_t { return (size_t)c * MS * D * 4; };
+    float scl = 1.0f / sqrtf((float)HEAD_DIM);
+    uint32_t ph = MS * N_HEADS, S_per = MS / M;
+    size_t qkv_bytes = (size_t)MS * N_HEADS * HEAD_DIM * 4;
+    size_t d_bytes = (size_t)MS * D * 4;
+
+    // ── Sub-segment B1: LN + AdaLN + QKV ──
+    {   begin_segment(rc);
+        rc.layernorm(inBuf, g_nBuf, MS, D, 1e-6f);
+        rc.scale_shift_off(g_nBuf, g_bcBuf, boff(0), g_bcBuf, boff(1), g_nBuf, MS*D, 1, 1);
+        rc.gemm(g_nBuf, "blocks.0.self_attn.q_proj.weight", MS, D, D, g_tQ);
+        rc.gemm(g_nBuf, "blocks.0.self_attn.k_proj.weight", MS, D, D, g_tK);
+        rc.gemm(g_nBuf, "blocks.0.self_attn.v_proj.weight", MS, D, D, g_tV);
+        end_segment(); submit_segment();
+        // Capture Q, K, V after GEMM
+        if (g_b0_q)  memcpy(g_b0_q,  g_tQ.mapped, qkv_bytes);
+        if (g_b0_k)  memcpy(g_b0_k,  g_tK.mapped, qkv_bytes);
+        if (g_b0_v)  memcpy(g_b0_v,  g_tV.mapped, qkv_bytes);
+        if (g_b0_nbuf) memcpy(g_b0_nbuf, g_nBuf.mapped, d_bytes);  // LN+AdaLN output
+    }
+
+    // ── Sub-segment B2: RMSNorm Q/K ──
+    {   begin_segment(rc);
+        rc.rmsnorm(g_tQ, "blocks.0.self_attn.q_norm.weight", g_tQ, ph, HEAD_DIM, 1e-6f);
+        rc.rmsnorm(g_tK, "blocks.0.self_attn.k_norm.weight", g_tK, ph, HEAD_DIM, 1e-6f);
+        end_segment(); submit_segment();
+        // Capture Q, K after RMSNorm (g_tQ/g_tK modified in-place)
+        if (g_b0_qn) memcpy(g_b0_qn, g_tQ.mapped, qkv_bytes);
+        if (g_b0_kn) memcpy(g_b0_kn, g_tK.mapped, qkv_bytes);
+    }
+
+    // ── Sub-segment B3: RoPE ──
+    {   begin_segment(rc);
+        rc.rope(g_tQ, g_ropeFreqsBuf, g_rBuf, ph, HEAD_DIM);
+        rc.rope(g_tK, g_ropeFreqsBuf, g_attnO, ph, HEAD_DIM);
+        end_segment(); submit_segment();
+        // Capture Q, K after RoPE
+        if (g_b0_qr) memcpy(g_b0_qr, g_rBuf.mapped, qkv_bytes);
+        if (g_b0_kr) memcpy(g_b0_kr, g_attnO.mapped, qkv_bytes);
+    }
+
+    // ── Sub-segment B4: Attention + O_proj + gate ──
+    {   begin_segment(rc);
+        // Self-attention: per-batch Q·K^T + softmax + AV
+        for (uint32_t mb = 0; mb < M; mb++) {
+            size_t off = (size_t)mb * S_per * N_HEADS * HEAD_DIM * 4;
+            rc.record_attn_3pass(g_rBuf, g_attnO, g_tV, g_attnA, g_attnO,
+                                 S_per, S_per, N_HEADS, HEAD_DIM, scl,
+                                 off, off, off, off);
+        }
+        rc.gemm(g_attnO, "blocks.0.self_attn.output_proj.weight", MS, D, D, g_tO);
+        rc.gate_residual(inBuf, g_bcBuf, boff(2), g_tO, g_tV, MS * D);
+        end_segment(); submit_segment();
+        // Capture attention output, O_proj, SA residual
+        if (g_b0_attn_o) memcpy(g_b0_attn_o, g_attnO.mapped, qkv_bytes);
+        if (g_b0_oproj)  memcpy(g_b0_oproj,  g_tO.mapped,    d_bytes);
+    }
+}
+
 // ── Segment C: Cross-attn LN→AdaLN→QKV→RMSNorm→attn→O_proj→gate ──
 static void seg_cross_attn(RC& rc, int b) {
     auto boff = [](int c) -> size_t { return (size_t)c * MS * D * 4; };
@@ -816,7 +879,12 @@ static bool dit_forward_step(void* x_data, void* ctx_data, void* out_data,
 
     for (int b = 0; b < 28; b++) {
         seg_adaln(rc, b);
-        seg_self_attn(rc, b, g_xBuf);
+        if (b == 0 && g_b0_bcbuf)
+            memcpy(g_b0_bcbuf, g_bcBuf.mapped, 9u * (size_t)MS * D * 4);
+        if (b == 0)
+            seg_self_attn_debug(rc, g_xBuf);
+        else
+            seg_self_attn(rc, b, g_xBuf);
         if (b == 0 && g_b0_sa) memcpy(g_b0_sa, g_tV.mapped, (size_t)MS * D * 4);  // SA residual in g_tV
 
         seg_cross_attn(rc, b);
@@ -1001,6 +1069,239 @@ bool dit_load_safetensors(const char* sf_path, const char* spv_dir) {
     LOGI("dit_load_safetensors OK — %zu weight tensors, fp32 activations (~%.0f MB total)",
          g_weights.size(),
          (double)(bSz*4 + mlpSz + bcSz + attnASz + crossKVSz*3) / 1e6);
+
+    // ── GPU vs CPU GEMM smoke test ──
+    {
+        int tM=4, tN=128, tK=128;  // small test
+        float* testA = (float*)malloc(tM * tK * 4);
+        float* testC_gpu = (float*)malloc(tM * tN * 4);
+        float* testC_cpu = (float*)malloc(tM * tN * 4);
+        for (int i = 0; i < tM*tK; i++) testA[i] = (float)((i % 127) - 63) / 63.0f;
+
+        // Run GPU GEMM
+        RC rc; rc.vk = &g_vk; rc.cmd = VK_NULL_HANDLE; rc.weights = &g_weights;
+        begin_segment(rc);
+        // Find a weight to test with — use first block's q_proj (first 128 cols)
+        auto it = g_weights.find("blocks.0.self_attn.q_proj.weight");
+        if (it != g_weights.end()) {
+            // Copy test input to g_t1
+            memcpy(g_t1.mapped, testA, tM * tK * 4);
+            rc.gemm(g_t1, "blocks.0.self_attn.q_proj.weight", tM, tN, tK, g_tO);
+            end_segment(); submit_segment();
+            memcpy(testC_gpu, g_tO.mapped, tM * tN * 4);
+
+            // Run CPU GEMM on same weight
+            head_tail::cpu_gemm_bf16(tM, tN, tK, testA,
+                (const uint16_t*)it->second.mapped, testC_cpu);
+
+            float max_err = 0.0f;
+            for (int i = 0; i < tM*tN; i++) {
+                float d = fabsf(testC_gpu[i] - testC_cpu[i]);
+                if (d > max_err) max_err = d;
+            }
+            LOGI("GEMM smoke test: GPU vs CPU max_err=%.6f %s",
+                 (double)max_err, max_err < 1e-3f ? "OK" : "MISMATCH!");
+            if (max_err >= 1e-3f) {
+                LOGI("  GPU[0..4]: %.4f %.4f %.4f %.4f",
+                     (double)testC_gpu[0], (double)testC_gpu[1],
+                     (double)testC_gpu[2], (double)testC_gpu[3]);
+                LOGI("  CPU[0..4]: %.4f %.4f %.4f %.4f",
+                     (double)testC_cpu[0], (double)testC_cpu[1],
+                     (double)testC_cpu[2], (double)testC_cpu[3]);
+            }
+        }
+        free(testA); free(testC_gpu); free(testC_cpu);
+
+        // Second smoke test: larger GEMM (K=2048) — same dimensions as block Q_proj
+        int tM2=16, tN2=128, tK2=2048;
+        float* testA2 = (float*)malloc(tM2 * tK2 * 4);
+        float* testC_gpu2 = (float*)malloc(tM2 * tN2 * 4);
+        float* testC_cpu2 = (float*)malloc(tM2 * tN2 * 4);
+        for (int i = 0; i < tM2*tK2; i++) testA2[i] = (float)((i % 1021) - 510) / 510.0f;
+
+        begin_segment(rc);
+        memcpy(g_t1.mapped, testA2, tM2 * tK2 * 4);
+        rc.gemm(g_t1, "blocks.0.self_attn.q_proj.weight", tM2, tN2, tK2, g_tO);
+        end_segment(); submit_segment();
+        memcpy(testC_gpu2, g_tO.mapped, tM2 * tN2 * 4);
+        head_tail::cpu_gemm_bf16(tM2, tN2, tK2, testA2,
+            (const uint16_t*)it->second.mapped, testC_cpu2);
+
+        float max_err2 = 0.0f;
+        for (int i = 0; i < tM2*tN2; i++) {
+            float d = fabsf(testC_gpu2[i] - testC_cpu2[i]);
+            if (d > max_err2) max_err2 = d;
+        }
+        LOGI("GEMM smoke K=2048: GPU vs CPU max_err=%.6f %s",
+             (double)max_err2, max_err2 < 1e-3f ? "OK" : "MISMATCH!");
+        if (max_err2 >= 1e-3f) {
+            LOGI("  GPU[0..4]: %.4f %.4f %.4f %.4f",
+                 (double)testC_gpu2[0], (double)testC_gpu2[1],
+                 (double)testC_gpu2[2], (double)testC_gpu2[3]);
+            LOGI("  CPU[0..4]: %.4f %.4f %.4f %.4f",
+                 (double)testC_cpu2[0], (double)testC_cpu2[1],
+                 (double)testC_cpu2[2], (double)testC_cpu2[3]);
+        }
+
+        free(testA2); free(testC_gpu2); free(testC_cpu2);
+
+        // Third smoke test: SiLU + GEMM chain (same as adaln_gpu step 1-2)
+        // SiLU(tEmb) → aBuf, then gemm(aBuf, W0) → t1
+        float testEmb[4*D];  // simulate t_emb [M=2, D], repeat for consistent test
+        for (int i = 0; i < 2*D; i++) testEmb[i] = (float)((i % 1021) - 510) / 510.0f;
+        memcpy(g_tEmbBuf.mapped, testEmb, 2*D*4);
+
+        begin_segment(rc);
+        rc.silu(g_tEmbBuf, g_aBuf, 2*D);
+        rc.barrier_buf(g_aBuf.buf);
+        rc.gemm(g_aBuf, "blocks.0.adaln_modulation_self_attn.1.weight", 2, ADALN_LORA_DIM, D, g_t1);
+        end_segment(); submit_segment();
+
+        // CPU version
+        {
+            float* cpu_silu = (float*)malloc(2*D*4);
+            float* cpu_gemm = (float*)malloc(2*ADALN_LORA_DIM*4);
+            for (int i = 0; i < 2*D; i++) cpu_silu[i] = testEmb[i] / (1.0f + expf(-testEmb[i]));
+            auto it2 = g_weights.find("blocks.0.adaln_modulation_self_attn.1.weight");
+            head_tail::cpu_gemm_bf16(2, ADALN_LORA_DIM, D, cpu_silu,
+                (const uint16_t*)it2->second.mapped, cpu_gemm);
+
+            float max_err3 = 0.0f;
+            float* gpu_out = (float*)g_t1.mapped;
+            for (int i = 0; i < 2*ADALN_LORA_DIM; i++) {
+                float d = fabsf(gpu_out[i] - cpu_gemm[i]);
+                if (d > max_err3) max_err3 = d;
+            }
+            LOGI("SiLU+GEMM chain smoke: GPU vs CPU max_err=%.6f %s",
+                 (double)max_err3, max_err3 < 1e-3f ? "OK" : "MISMATCH!");
+            if (max_err3 >= 1e-3f) {
+                LOGI("  GPU[0..4]: %.4f %.4f %.4f %.4f",
+                     (double)gpu_out[0], (double)gpu_out[1],
+                     (double)gpu_out[2], (double)gpu_out[3]);
+                LOGI("  CPU[0..4]: %.4f %.4f %.4f %.4f",
+                     (double)cpu_gemm[0], (double)cpu_gemm[1],
+                     (double)cpu_gemm[2], (double)cpu_gemm[3]);
+                // Also check SiLU output alone
+                float* gpu_silu = (float*)g_aBuf.mapped;
+                float max_silu_err = 0.0f;
+                for (int i = 0; i < 2*D; i++) {
+                    float d = fabsf(gpu_silu[i] - cpu_silu[i]);
+                    if (d > max_silu_err) max_silu_err = d;
+                }
+                LOGI("  SiLU alone: max_err=%.6f GPU[0]=%.4f CPU[0]=%.4f",
+                     (double)max_silu_err, (double)gpu_silu[0], (double)cpu_silu[0]);
+            }
+            free(cpu_silu); free(cpu_gemm);
+        }
+
+        // Fourth smoke test: FULL AdaLN chain (SiLU→GEMM→gemm_sub×3→add lora→scale+1→broadcast)
+        {
+            // Fill test t_emb data (same as before)
+            memcpy(g_tEmbBuf.mapped, testEmb, 2*D*4);
+            // Fill test lora data
+            float testLora[2*D3];
+            for (int i = 0; i < 2*D3; i++) testLora[i] = (float)((i % 997) - 498) / 1000.0f;
+            memcpy(g_loraBuf.mapped, testLora, 2*D3*4);
+
+            begin_segment(rc);
+            rc.adaln_gpu("blocks.0.adaln_modulation_self_attn.1.weight",
+                         "blocks.0.adaln_modulation_self_attn.2.weight",
+                         0, g_tEmbBuf, g_aBuf, g_t1, g_tQ, g_tK, g_tV,
+                         g_bcBuf, g_onesBuf, g_loraBuf);
+            end_segment(); submit_segment();
+
+            // CPU reference
+            {
+                float* cpu_silu = (float*)malloc(2*D*4);
+                float* cpu_down = (float*)malloc(2*ADALN_LORA_DIM*4);
+                float* cpu_up_all = (float*)malloc(2*3*D*4);
+                for (int i = 0; i < 2*D; i++) cpu_silu[i] = testEmb[i] / (1.0f + expf(-testEmb[i]));
+                auto it_w0 = g_weights.find("blocks.0.adaln_modulation_self_attn.1.weight");
+                auto it_w2 = g_weights.find("blocks.0.adaln_modulation_self_attn.2.weight");
+                head_tail::cpu_gemm_bf16(2, ADALN_LORA_DIM, D, cpu_silu,
+                    (const uint16_t*)it_w0->second.mapped, cpu_down);
+                head_tail::cpu_gemm_bf16(2, 3*D, ADALN_LORA_DIM, cpu_down,
+                    (const uint16_t*)it_w2->second.mapped, cpu_up_all);
+
+                // Add lora: each component += lora[component]
+                for (int c = 0; c < 3; c++) {
+                    for (int m = 0; m < 2; m++) {
+                        for (int d = 0; d < D; d++) {
+                            cpu_up_all[(m*3+c)*D + d] += testLora[(m*3+c)*D + d];
+                        }
+                    }
+                }
+
+                // Scale+1 for component 1 (scale): scale = up_all[1] + 1.0
+                float* cpu_scale_plus1 = (float*)malloc(2*D*4);
+                for (int i = 0; i < 2*D; i++) cpu_scale_plus1[i] = cpu_up_all[D + i] + 1.0f;
+
+                // Compare bcBuf content:
+                // Slot 0 = scale+1, Slot 1 = shift, Slot 2 = gate
+                size_t slot_bytes = 2u * S * D * 4;
+                float* gpu_bc = (float*)g_bcBuf.mapped;
+                float max_bc_err = 0.0f;
+                for (int slot = 0; slot < 3; slot++) {
+                    float* gpu_slot = gpu_bc + slot * 2*S*D;
+                    float* cpu_slot = (slot == 0) ? cpu_scale_plus1 :
+                                     (slot == 1) ? (cpu_up_all) :
+                                     (cpu_up_all + 2*D);  // gate
+                    for (int mb = 0; mb < 2; mb++) {
+                        for (int s = 0; s < S; s++) {
+                            for (int d = 0; d < D; d++) {
+                                float diff = fabsf(gpu_slot[(mb*S+s)*D + d] - cpu_slot[mb*D + d]);
+                                if (diff > max_bc_err) max_bc_err = diff;
+                            }
+                        }
+                    }
+                }
+                LOGI("Full AdaLN smoke: bcBuf max_err=%.6f %s",
+                     (double)max_bc_err, max_bc_err < 1e-3f ? "OK" : "MISMATCH!");
+
+                // Also check intermediate outputs: t1, tQ, tK, tV, aBuf (scale+1)
+                float max_t1_err = 0.0f, max_shift_err = 0.0f, max_scale_err = 0.0f;
+                float* gpu_t1 = (float*)g_t1.mapped;
+                float* gpu_tQ = (float*)g_tQ.mapped;  // shift + lora[0]
+                float* gpu_tK = (float*)g_tK.mapped;  // scale + lora[1]
+                float* gpu_aBuf = (float*)g_aBuf.mapped;  // scale + 1.0 + lora[1]
+                for (int i = 0; i < 2*ADALN_LORA_DIM; i++) {
+                    float d = fabsf(gpu_t1[i] - cpu_down[i]);
+                    if (d > max_t1_err) max_t1_err = d;
+                }
+                for (int i = 0; i < 2*D; i++) {
+                    float d = fabsf(gpu_tQ[i] - cpu_up_all[i]);  // shift
+                    if (d > max_shift_err) max_shift_err = d;
+                }
+                for (int i = 0; i < 2*D; i++) {
+                    float d = fabsf(gpu_tK[i] - cpu_up_all[D + i]);  // scale
+                    if (d > max_scale_err) max_scale_err = d;
+                }
+                LOGI("  t1 (LoRA down): max_err=%.6f %s", (double)max_t1_err,
+                     max_t1_err < 1e-3f ? "OK" : "MISMATCH!");
+                LOGI("  shift (up+lora): max_err=%.6f %s", (double)max_shift_err,
+                     max_shift_err < 1e-3f ? "OK" : "MISMATCH!");
+                LOGI("  scale (up+lora): max_err=%.6f %s", (double)max_scale_err,
+                     max_scale_err < 1e-3f ? "OK" : "MISMATCH!");
+                if (max_shift_err >= 1e-3f || max_scale_err >= 1e-3f) {
+                    LOGI("    GPU shift[0..4]: %.4f %.4f %.4f %.4f",
+                         (double)gpu_tQ[0], (double)gpu_tQ[1], (double)gpu_tQ[2], (double)gpu_tQ[3]);
+                    LOGI("    CPU shift[0..4]: %.4f %.4f %.4f %.4f",
+                         (double)cpu_up_all[0], (double)cpu_up_all[1], (double)cpu_up_all[2], (double)cpu_up_all[3]);
+                    LOGI("    GPU scale[0..4]: %.4f %.4f %.4f %.4f",
+                         (double)gpu_tK[0], (double)gpu_tK[1], (double)gpu_tK[2], (double)gpu_tK[3]);
+                    LOGI("    CPU scale[0..4]: %.4f %.4f %.4f %.4f",
+                         (double)cpu_up_all[D], (double)cpu_up_all[D+1], (double)cpu_up_all[D+2], (double)cpu_up_all[D+3]);
+                    // Check if GPU shift == GPU scale (offset bug symptom)
+                    float diff_same = fabsf(gpu_tQ[0] - gpu_tK[0]);
+                    LOGI("    GPU shift[0] vs scale[0]: diff=%.6f %s",
+                         (double)diff_same, diff_same < 1e-6f ? "(IDENTICAL! offset bug?)" : "");
+                }
+
+                free(cpu_silu); free(cpu_down); free(cpu_up_all); free(cpu_scale_plus1);
+            }
+        }
+    }
+
     dit_alloc_captures();
     g_init = true;
     return true;
@@ -1089,7 +1390,20 @@ void dit_alloc_captures(void) {
     g_b0_mlp= (float*)malloc(sz);
     g_b0_temb = (float*)malloc((size_t)M * D * 4);
     g_b0_lora = (float*)malloc((size_t)M * D3 * 4);
-    LOGI("Block 0 capture buffers allocated (%.1f MB)", (double)(sz*4 + qkv_sz*6 + score_sz + fc1_sz) / 1e6);
+    // Fine-grained intermediates
+    g_b0_q  = (float*)malloc(qkv_sz);    // Q after GEMM [MS*NH*HD]
+    g_b0_k  = (float*)malloc(qkv_sz);    // K after GEMM
+    g_b0_v  = (float*)malloc(qkv_sz);    // V after GEMM
+    g_b0_qn = (float*)malloc(qkv_sz);    // Q after RMSNorm
+    g_b0_kn = (float*)malloc(qkv_sz);    // K after RMSNorm
+    g_b0_qr = (float*)malloc(qkv_sz);    // Q after RoPE
+    g_b0_kr = (float*)malloc(qkv_sz);    // K after RoPE
+    g_b0_attn_o = (float*)malloc(qkv_sz);// Attention output
+    g_b0_oproj = (float*)malloc(sz);     // O_proj output
+    g_b0_fc1 = (float*)malloc(fc1_sz);  // MLP fc1 output
+    g_b0_nbuf = (float*)malloc(sz);     // g_nBuf (LN+AdaLN output)
+    g_b0_bcbuf = (float*)malloc(9u * (size_t)MS * D * 4);  // bcBuf (9*MS*D)
+    LOGI("Block 0 capture buffers allocated (%.1f MB)", (double)(sz*7 + qkv_sz*7 + fc1_sz + 9u*MS*D*4) / 1e6);
 }
 
 void dit_dump_captures(const char* dir) {
@@ -1119,6 +1433,18 @@ void dit_dump_captures(const char* dir) {
     save("b0_mlp",   g_b0_mlp,MS*D);
     save("b0_temb",  g_b0_temb, M*D);
     save("b0_lora",  g_b0_lora, M*D3);
+    if (g_b0_q)  save("b0_q",  g_b0_q,  MS*N_HEADS*HEAD_DIM);
+    if (g_b0_k)  save("b0_k",  g_b0_k,  MS*N_HEADS*HEAD_DIM);
+    if (g_b0_v)  save("b0_v",  g_b0_v,  MS*N_HEADS*HEAD_DIM);
+    if (g_b0_qn) save("b0_qn", g_b0_qn, MS*N_HEADS*HEAD_DIM);
+    if (g_b0_kn) save("b0_kn", g_b0_kn, MS*N_HEADS*HEAD_DIM);
+    if (g_b0_qr) save("b0_qr", g_b0_qr, MS*N_HEADS*HEAD_DIM);
+    if (g_b0_kr) save("b0_kr", g_b0_kr, MS*N_HEADS*HEAD_DIM);
+    if (g_b0_attn_o) save("b0_attn_o", g_b0_attn_o, MS*N_HEADS*HEAD_DIM);
+    if (g_b0_oproj) save("b0_oproj", g_b0_oproj, MS*D);
+    if (g_b0_fc1) save("b0_fc1", g_b0_fc1, MS*MLP_HIDDEN);
+    if (g_b0_nbuf) save("b0_nbuf", g_b0_nbuf, MS*D);
+    if (g_b0_bcbuf) save("b0_bcbuf", g_b0_bcbuf, 9u*MS*D);
     LOGI("Block 0 captures saved to %s", dir);
 }
 
