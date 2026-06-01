@@ -505,7 +505,6 @@ static Buffer g_geluOutBuf; // FP16 GELU output
 static Buffer g_attnQ, g_attnK, g_attnV, g_attnA, g_attnO;
 // Dummy GEMM buffer — step 0 of single-instance merge test
 static Buffer g_gemmDummy;
-static Buffer g_gateScales; // [MLP=1/8, zero, SA=1/4, CX=1/4] — gate anti-overflow scaling
 
 struct RC {
     VulkanCtx* vk;
@@ -521,17 +520,6 @@ struct RC {
         b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &b, 0, nullptr, 0, nullptr);
-    }
-    // Buffer-specific barrier — Adreno needs this for same-cmd-buffer compute sync
-    void barrier_buf(VkBuffer buf) {
-        VkBufferMemoryBarrier b = {};
-        b.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-        b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        b.buffer = buf;
-        b.size = VK_WHOLE_SIZE;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &b, 0, nullptr);
     }
 
     VkDescriptorSet alloc_set(VkDescriptorSetLayout dsl) {
@@ -709,10 +697,8 @@ struct RC {
 
         // 1. SiLU(t_emb) → aBuf [M*D]
         dispatch_silu(*tEmbBuf, *aBuf, M * D);
-        barrier_buf(aBuf->buf);  // Adreno: ensure SiLU output visible before GEMM reads it
         // 2. LoRA down: aBuf @ W0^T → t1 [M, 256]
         dispatch_gemm(*aBuf, w0_name, M, ADALN_LORA_DIM, D, *t1);
-        barrier_buf(t1->buf);  // ensure GEMM1 output visible before GEMM2 reads it
         // 3-5. LoRA up × 3: t1 @ W2 components → tQ(shift), tK(scale), tV(gate)
         dispatch_gemm(*t1, w2_name, M, D, ADALN_LORA_DIM, *tQ, 0);
         dispatch_gemm(*t1, w2_name, M, D, ADALN_LORA_DIM, *tK, comp_sz);
@@ -723,10 +709,9 @@ struct RC {
         dispatch_scale_shift(*tQ, *onesBuf, 0, g_loraBuf, 0,          *tQ, M*D, 0, 1);
         dispatch_scale_shift(*tK, *onesBuf, 0, g_loraBuf, loraComp,   *tK, M*D, 0, 1);
         dispatch_scale_shift(*tV, *onesBuf, 0, g_loraBuf, loraComp*2, *tV, M*D, 0, 1);
-        barrier_buf(tQ->buf); barrier_buf(tK->buf); barrier_buf(tV->buf);
+
         // 6. scale+1: tK + 1.0 → aBuf (temporary)
         dispatch_scale_shift(*tK, *onesBuf, *onesBuf, *aBuf, M * D, 0, 0);
-        barrier_buf(aBuf->buf);
         // 7-9. Broadcast [M,D] → [MS,D] to bcBuf slots
         dispatch_broadcast(*tQ, *bcBuf, shiftSlot, M, D, S);
         dispatch_broadcast(*aBuf, *bcBuf, scaleSlot, M, D, S);  // scale+1
@@ -834,7 +819,6 @@ static uint16_t* g_b0_o_proj = nullptr;  // O_proj GEMM output [MS, D] (after at
 static uint16_t* g_b0_ln = nullptr;      // LN output [MS, D] (before AdaLN modulate)
 static uint16_t* g_b0_mod = nullptr;     // AdaLN modulated [MS, D] (after scale_shift)
 static uint16_t* g_b0_q_raw = nullptr;   // Q before RMSNorm [MS, D] (raw GEMM output)
-static uint16_t* g_b0_shifts = nullptr;  // AdaLN shift/scale/gate [M*3, D] (pre-bcast)
 
 // RoPE frequency buffer (pre-computed once per spatial position, replicated per head)
 static std::vector<uint16_t> g_ropeFreqsHost;  // host-side freqs (survives killall)
@@ -1155,11 +1139,10 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
     g_b0_ln    = (uint16_t*)malloc(g_block_out_size);
     g_b0_mod   = (uint16_t*)malloc(g_block_out_size);
     g_b0_q_raw = (uint16_t*)malloc(g_block_out_size);
-    g_b0_shifts = (uint16_t*)malloc(M * 3u * D * 2);  // [M*3, D] shift/scale/gate
     if (!g_b0_sa || !g_b0_cx || !g_b0_mlp ||
         !g_b0_q || !g_b0_k || !g_b0_v || !g_b0_scores || !g_b0_attn_o ||
         !g_b0_q_roped || !g_b0_k_roped || !g_b0_o_proj ||
-        !g_b0_ln || !g_b0_mod || !g_b0_q_raw || !g_b0_shifts) {
+        !g_b0_ln || !g_b0_mod || !g_b0_q_raw) {
         LOGE("b0 capture alloc failed"); return false;
     }
 
@@ -1168,13 +1151,6 @@ bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
         LOGE("gemmDummy alloc failed"); return false;
     }
     memset(g_gemmDummy.mapped, 0, 32 * 1024 * 1024);
-
-    // Gate scaling buffer: [MLP(1/8), zero, SA(1/2), CX(1/2)] — 8 bytes
-    if (!create_buffer(g_vk, 8, u, g_gateScales)) {
-        LOGE("gateScales alloc failed"); return false;
-    }
-    uint16_t sc_vals[4] = {0x3000, 0x0000, 0x3400, 0x3400};  // MLP=1/8, zero, SA=1/4, CX=1/4
-    memcpy(g_gateScales.mapped, sc_vals, 8);
 
     LOGI("dit_init_adaln_only OK — %u buffers", 20);
 
@@ -2409,8 +2385,6 @@ static void record_segment_self_attn_v2(RC& rc, int b, Buffer& inBuf) {
                              q_off, kv_off, a_off, q_off);
     }
     rc.dispatch_gemm(g_attnO,ow,MS,D,D,*rc.tO);
-    rc.dispatch_scale_shift(*rc.tO, g_gateScales, 4, g_gateScales, 2,
-                            *rc.tO, MS*D, 0, 0);  // SA O_proj *= 1/4
     rc.dispatch_scale_shift(*rc.tO,*rc.bcBuf,off(2),inBuf,0,
                             *rc.tV,MS*D,1,1);  // tV = inBuf + gate * attn_out
     end_step_recording();
@@ -2460,8 +2434,6 @@ static void record_segment_cross_attn(RC& rc, int b) {
                              q_off, kv_off, a_off, q_off);
     }
     rc.dispatch_gemm(g_attnO,cx_ow,MS,D,D,*rc.tO);
-    rc.dispatch_scale_shift(*rc.tO, g_gateScales, 6, g_gateScales, 2,
-                            *rc.tO, MS*D, 0, 0);  // CX O_proj *= 1/4
     rc.dispatch_scale_shift(*rc.tO,*rc.bcBuf,off(5),*rc.tV,0,
                             *rc.gBuf,MS*D,1,1);  // gBuf = tV + gate * attn_out
     end_step_recording();
@@ -2482,8 +2454,6 @@ static void record_segment_mlp(RC& rc, int b) {
     rc.dispatch_gemm(*rc.nBuf,l1w,MS,MLP_HIDDEN,D,*rc.t1);
     rc.dispatch_gelu(*rc.t1,*rc.t1,MS*MLP_HIDDEN);  // GELU, not SiLU! (predict2 GPT2FeedForward uses nn.GELU)
     rc.dispatch_gemm(*rc.t1,l2w,MS,D,MLP_HIDDEN,*rc.nBuf);
-    rc.dispatch_scale_shift(*rc.nBuf, g_gateScales, 0, g_gateScales, 2,
-                            *rc.nBuf, MS*D, 0, 0);  // MLP fc2 *= 1/8
     rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,off(8),*rc.gBuf,0,
                             *rc.outBuf,MS*D,1,1);
     end_step_recording();
@@ -2681,40 +2651,21 @@ bool dit_forward_step(void* x_data, void* t_emb_data, void* ctx_data, void* out_
         // Segment A: AdaLN (36 dispatch)
         record_segment_adaln(rc, b);
         if (!submit_segment()) { LOGE("SegA[%d] submit failed", b); return false; }
-        if (b == 0 && g_b0_shifts) {
-            // Capture shift/scale/gate from bcBuf (pre-broadcast, first M*D of each component)
-            size_t adaln_sz = M * D * 2;
-            memcpy(g_b0_shifts + 0, (uint8_t*)g_bcBuf.mapped + 1*MS*D*2, adaln_sz);  // shift
-            memcpy(g_b0_shifts + M*D, (uint8_t*)g_bcBuf.mapped + 0*MS*D*2, adaln_sz);  // scale
-            memcpy(g_b0_shifts + 2*M*D, (uint8_t*)g_bcBuf.mapped + 2*MS*D*2, adaln_sz);  // gate
-            // Diagnostic: read back first 3 fp16 values from bcBuf scale slot
-            uint16_t* sc = (uint16_t*)((uint8_t*)g_bcBuf.mapped + 0*MS*D*2);
-            LOGI("AdaLN diag: bcBuf[0..2]=0x%04x 0x%04x 0x%04x  aBuf[0]=0x%04x",
-                 sc[0], sc[1], sc[2],
-                 ((uint16_t*)g_aBuf.mapped)[0]);
-        }
 
         if (mode == 0 || mode == 2) {  // full or self-only
             // Segment B1: LN→AdaLN→QKV→RMSNorm→RoPE (pre-attention)
-            record_segment_self_pre_a(rc, b, inBuf);
-            if (!submit_segment()) { LOGE("SegB1a[%d] submit failed", b); return false; }
-            // B1a done: nBuf=modulated, tQ=Q_raw, tK=K_raw, tV=V_raw
-            if (b == 0) {
-                if (g_b0_mod)   memcpy(g_b0_mod,   g_nBuf.mapped, g_block_out_size);
-                if (g_b0_q_raw) memcpy(g_b0_q_raw, g_tQ.mapped, g_block_out_size);
-                if (g_b0_v)     memcpy(g_b0_v,     g_tV.mapped, MS * N_HEADS * HEAD_DIM * 2);
-            }
-            // Segment B1b: RMSNorm Q/K -> RoPE
-            record_segment_self_pre_b(rc, b);
-            if (!submit_segment()) { LOGE("SegB1b[%d] submit failed", b); return false; }
+            record_segment_self_pre(rc, b, inBuf);
+            if (!submit_segment()) { LOGE("SegB1[%d] submit failed", b); return false; }
+            // GPU executed: rBuf=Q_roped, g_attnO=K_roped, tV=V_raw
             if (b == 0) {
                 size_t qkv_sz = MS * N_HEADS * HEAD_DIM * 2;
                 if (g_b0_q)        memcpy(g_b0_q,        g_tQ.mapped, qkv_sz);
                 if (g_b0_k)        memcpy(g_b0_k,        g_tK.mapped, qkv_sz);
                 if (g_b0_q_roped)  memcpy(g_b0_q_roped,  g_rBuf.mapped, qkv_sz);
                 if (g_b0_k_roped)  memcpy(g_b0_k_roped,  g_attnO.mapped, qkv_sz);
+                if (g_b0_v)        memcpy(g_b0_v,        g_tV.mapped, qkv_sz);
             }
-            // Segment B2: attention→O_proj→gate
+            // Segment B2: attention→O_proj→gate (reads rBuf, g_attnO, tV; writes tV)
             record_segment_self_attn_v2(rc, b, inBuf);
             if (!submit_segment()) { LOGE("SegB2[%d] submit failed", b); return false; }
             if (b == 0) {
@@ -3374,9 +3325,6 @@ bool dit_get_b0_intermediate(int stage, void* dst, size_t size) {
         case 15: src = g_b0_q_roped; src_sz = MS * N_HEADS * HEAD_DIM * 2; break;
         case 16: src = g_b0_k_roped; src_sz = MS * N_HEADS * HEAD_DIM * 2; break;
         case 17: src = g_b0_o_proj; src_sz = g_block_out_size; break;
-        case 18: src = g_b0_mod; src_sz = g_block_out_size; break;
-        case 19: src = g_b0_q_raw; src_sz = g_block_out_size; break;
-        case 20: src = g_b0_shifts; src_sz = M * 3u * D * 2; break;
         default: return false;
     }
     if (!src) return false;
@@ -3480,7 +3428,6 @@ void dit_destroy() {
     free_buf(g_attnQ); free_buf(g_attnK); free_buf(g_attnV); free_buf(g_attnA); free_buf(g_attnO);
     free_buf(g_ropeFreqs);
     free_buf(g_gemmDummy);
-    free_buf(g_gateScales);
     free_buf(g_rmsInBuf); free_buf(g_rmsOutBuf); free_buf(g_rmsWgtBuf);
 
     if (g_vk.device) vkDestroyDevice(g_vk.device, nullptr);

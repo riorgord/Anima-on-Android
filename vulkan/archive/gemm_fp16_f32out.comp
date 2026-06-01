@@ -1,0 +1,41 @@
+#version 450
+// fp16-input GEMM with fp32 OUTPUT — preserves full fp32 precision for downstream ops
+#extension GL_EXT_shader_16bit_storage: require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16: require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer A_buf { f16vec4 A_pack4[]; };
+layout(binding = 1) readonly  buffer B_buf { f16vec4 B_pack4[]; };
+layout(binding = 2) writeonly buffer C_buf { float C[]; };
+
+layout(push_constant) uniform PC {
+    uint M; uint N; uint K; uint batch; float alpha;
+} pc;
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+    if (row >= pc.M || col >= pc.N) return;
+
+    float sum = 0.0;
+    uint k4 = pc.K / 4u;
+
+    for (uint k = 0u; k < k4; k++) {
+        f16vec4 av = A_pack4[row * k4 + k];
+        f16vec4 bv = B_pack4[col * k4 + k];
+        sum = fma(float(av.x), float(bv.x), sum);
+        sum = fma(float(av.y), float(bv.y), sum);
+        sum = fma(float(av.z), float(bv.z), sum);
+        sum = fma(float(av.w), float(bv.w), sum);
+    }
+
+    uint rem = pc.K - k4 * 4u;
+    for (uint r = 0u; r < rem; r++) {
+        uint k = k4 * 4u + r;
+        sum = fma(float(A_pack4[row * k4 + k / 4u][k % 4u]),
+                  float(B_pack4[col * k4 + k / 4u][k % 4u]), sum);
+    }
+
+    C[row * pc.N + col] = sum * pc.alpha;  // fp32 output, NOT fp16
+}

@@ -1,0 +1,3554 @@
+// DiT Vulkan Inference Engine
+// Full DiT transformer block in one pre-recorded command buffer.
+// Target: Snapdragon 8+ Gen 1 (Adreno 730), Android NDK.
+#include <vulkan/vulkan.h>
+#include <android/log.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cstdint>
+#include <vector>
+#include <unordered_map>
+#include <string>
+
+#define LOG_TAG "DiT_VK"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+// ============================================================
+// Anima DiT model constants
+// ============================================================
+static const uint32_t D       = 2048;
+static const uint32_t CtxD    = 1024;
+static const uint32_t Nctx    = 512;
+static const uint32_t N_HEADS = 16;
+static const uint32_t HEAD_DIM = 128;
+static const uint32_t MLP_HIDDEN = 8192;
+static const uint32_t ADALN_LORA_DIM = 256;
+static const uint32_t D3      = 6144;  // 3 * D
+
+static uint32_t S  = 256;
+static uint32_t M  = 2;
+static uint32_t MS = 512;
+
+// ============================================================
+// Push constant structs (must match shader layouts exactly)
+// ============================================================
+struct PC_Gemm      { uint32_t M, N, K, batch; float alpha; };
+struct PC_RmsNorm   { uint32_t n_rows, n_elems; float eps; };
+struct PC_LayerNorm { uint32_t n_rows, n_elems; float eps; };
+struct PC_Silu      { uint32_t n_total; };
+struct PC_ScaleShift{ uint32_t n_total, scale_stride, shift_stride; };
+struct PC_Rope      { uint32_t N, head_dim; };
+struct PC_Attention { uint32_t total_q, total_kv, head_dim, S_kv; float scale; };
+struct PC_Broadcast { uint32_t M, D, repeat; };
+struct PC_AttnQKT     { uint32_t M_q, M_kv, H, D; float scale; };
+struct PC_AttnSoftmax { uint32_t M_q, M_kv, H; };
+struct PC_AttnOut     { uint32_t M_q, M_kv, H, D; };
+
+// ============================================================
+// Vulkan resource structs
+// ============================================================
+struct Buffer {
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    size_t size = 0;
+    void* mapped = nullptr;
+};
+
+// Per-shader-type pipeline bundle
+struct ShaderPipe {
+    VkShaderModule shader = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+};
+
+struct VulkanCtx {
+    VkInstance instance = VK_NULL_HANDLE;
+    VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+    VkDevice device = VK_NULL_HANDLE;
+    VkQueue queue = VK_NULL_HANDLE;
+    uint32_t queueFamily = 0;
+    VkCommandPool cmdPool = VK_NULL_HANDLE;
+    VkCommandBuffer cmd[28] = {};
+    VkCommandBuffer cmd_attn[28] = {}; VkCommandBuffer cmd_post[28] = {};
+    VkFence fence = VK_NULL_HANDLE;
+    VkFence stepFence = VK_NULL_HANDLE;  // per-step ops fence
+    VkDescriptorPool descPool  = VK_NULL_HANDLE;  // blocks
+    VkDescriptorPool descPool2 = VK_NULL_HANDLE;  // attention
+    VkDescriptorPool stepPool  = VK_NULL_HANDLE;  // per-step ops
+    VkPhysicalDeviceMemoryProperties memProps = {};
+
+    ShaderPipe gemm, gemm_fp32out, gate_fp32, rms_norm, layer_norm, layer_norm_f16, silu, scale_shift, rope, attention, broadcast, gelu;
+    ShaderPipe attn_qkt, attn_softmax, attn_out;
+};
+
+struct WeightInfo {
+    std::string name;
+    Buffer buf;  // per-tensor buffer
+    size_t size;
+    uint32_t dims[4];
+    uint32_t ndim;
+};
+
+// ============================================================
+// Helpers
+// ============================================================
+static uint32_t find_memory_type(VulkanCtx& ctx, uint32_t typeBits, VkMemoryPropertyFlags props) {
+    for (uint32_t i = 0; i < ctx.memProps.memoryTypeCount; i++)
+        if ((typeBits & (1u << i)) && (ctx.memProps.memoryTypes[i].propertyFlags & props) == props)
+            return i;
+    return ~0u;
+}
+
+static bool create_buffer(VulkanCtx& ctx, size_t size, VkBufferUsageFlags usage, Buffer& buf) {
+    VkBufferCreateInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    info.size = size; info.usage = usage; info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(ctx.device, &info, nullptr, &buf.buf) != VK_SUCCESS) return false;
+    VkMemoryRequirements reqs;
+    vkGetBufferMemoryRequirements(ctx.device, buf.buf, &reqs);
+    VkMemoryAllocateInfo alloc = {};
+    alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    alloc.allocationSize = reqs.size;
+    alloc.memoryTypeIndex = find_memory_type(ctx, reqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    if (alloc.memoryTypeIndex == ~0u)
+        alloc.memoryTypeIndex = find_memory_type(ctx, reqs.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (vkAllocateMemory(ctx.device, &alloc, nullptr, &buf.mem) != VK_SUCCESS) return false;
+    if (vkBindBufferMemory(ctx.device, buf.buf, buf.mem, 0) != VK_SUCCESS) return false;
+    buf.size = size;
+    vkMapMemory(ctx.device, buf.mem, 0, size, 0, &buf.mapped);
+    return true;
+}
+
+static std::vector<uint32_t> load_spv(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) { LOGE("Cannot open %s", path); return {}; }
+    fseek(f, 0, SEEK_END); size_t size = ftell(f); fseek(f, 0, SEEK_SET);
+    std::vector<uint32_t> code(size / 4);
+    if (fread(code.data(), 1, size, f) != size) { fclose(f); return {}; }
+    fclose(f); return code;
+}
+
+// ============================================================
+// Vulkan init
+// ============================================================
+static bool init_vulkan(VulkanCtx& ctx) {
+    VkApplicationInfo appInfo = {};
+    appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    appInfo.pApplicationName = "DiT_VK"; appInfo.apiVersion = VK_API_VERSION_1_0;
+
+    // Enumerate available instance layers
+    uint32_t layerCount = 0;
+    vkEnumerateInstanceLayerProperties(&layerCount, nullptr);
+    std::vector<VkLayerProperties> layers(layerCount);
+    vkEnumerateInstanceLayerProperties(&layerCount, layers.data());
+    LOGI("Available Vulkan layers (%u):", layerCount);
+    for (auto& l : layers) LOGI("  %s", l.layerName);
+
+    // Try to enable validation layer
+    const char* wantedLayer = nullptr;
+    const char* enabledLayers[1] = {nullptr};
+    for (auto& l : layers) {
+        if (strstr(l.layerName, "validation") || strstr(l.layerName, "VK_LAYER_KHRONOS")) {
+            enabledLayers[0] = l.layerName;
+            LOGI("Found validation layer: %s, enabling...", l.layerName);
+            break;
+        }
+    }
+
+    VkInstanceCreateInfo instInfo = {};
+    instInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    instInfo.pApplicationInfo = &appInfo;
+    if (enabledLayers[0]) {
+        instInfo.enabledLayerCount = 1;
+        instInfo.ppEnabledLayerNames = enabledLayers;
+    }
+    if (vkCreateInstance(&instInfo, nullptr, &ctx.instance) != VK_SUCCESS) {
+        LOGE("vkCreateInstance failed");
+        return false;
+    }
+
+    uint32_t devCount = 0;
+    vkEnumeratePhysicalDevices(ctx.instance, &devCount, nullptr);
+    std::vector<VkPhysicalDevice> devs(devCount);
+    vkEnumeratePhysicalDevices(ctx.instance, &devCount, devs.data());
+    for (auto d : devs) {
+        VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(d, &props);
+        LOGI("GPU: %s", props.deviceName);
+        uint32_t qfCount; vkGetPhysicalDeviceQueueFamilyProperties(d, &qfCount, nullptr);
+        std::vector<VkQueueFamilyProperties> qfProps(qfCount);
+        vkGetPhysicalDeviceQueueFamilyProperties(d, &qfCount, qfProps.data());
+        for (uint32_t i = 0; i < qfCount; i++)
+            if (qfProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { ctx.physicalDevice = d; ctx.queueFamily = i; break; }
+        if (ctx.physicalDevice) break;
+    }
+    if (!ctx.physicalDevice) { LOGE("No compute GPU"); return false; }
+    vkGetPhysicalDeviceMemoryProperties(ctx.physicalDevice, &ctx.memProps);
+
+    float priority = 1.0f;
+    VkDeviceQueueCreateInfo qInfo = {};
+    qInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    qInfo.queueFamilyIndex = ctx.queueFamily; qInfo.queueCount = 1; qInfo.pQueuePriorities = &priority;
+    VkDeviceCreateInfo devInfo = {};
+    devInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    devInfo.queueCreateInfoCount = 1; devInfo.pQueueCreateInfos = &qInfo;
+    if (vkCreateDevice(ctx.physicalDevice, &devInfo, nullptr, &ctx.device) != VK_SUCCESS) return false;
+    vkGetDeviceQueue(ctx.device, ctx.queueFamily, 0, &ctx.queue);
+
+    VkCommandPoolCreateInfo poolInfo = {};
+    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    poolInfo.queueFamilyIndex = ctx.queueFamily;
+    if (vkCreateCommandPool(ctx.device, &poolInfo, nullptr, &ctx.cmdPool) != VK_SUCCESS) return false;
+    VkCommandBufferAllocateInfo cbInfo = {};
+    cbInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cbInfo.commandPool = ctx.cmdPool; cbInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cbInfo.commandBufferCount = 28;
+    if (vkAllocateCommandBuffers(ctx.device, &cbInfo, ctx.cmd) != VK_SUCCESS) return false;
+    if (vkAllocateCommandBuffers(ctx.device, &cbInfo, ctx.cmd_attn) != VK_SUCCESS) return false;
+    if (vkAllocateCommandBuffers(ctx.device, &cbInfo, ctx.cmd_post) != VK_SUCCESS) return false;
+
+    VkFenceCreateInfo fenceInfo = {};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    if (vkCreateFence(ctx.device, &fenceInfo, nullptr, &ctx.fence) != VK_SUCCESS) return false;
+
+    LOGI("Vulkan init OK");
+    return true;
+}
+
+// ============================================================
+// Shader & pipeline creation
+// ============================================================
+static bool create_shader_pipe(VulkanCtx& ctx, const char* path, uint32_t nBindings,
+                                size_t pushSize, ShaderPipe& sp) {
+    auto code = load_spv(path);
+    if (code.empty()) return false;
+    VkShaderModuleCreateInfo smInfo = {};
+    smInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    smInfo.codeSize = code.size() * 4; smInfo.pCode = code.data();
+    if (vkCreateShaderModule(ctx.device, &smInfo, nullptr, &sp.shader) != VK_SUCCESS) return false;
+
+    std::vector<VkDescriptorSetLayoutBinding> binds(nBindings);
+    for (uint32_t i = 0; i < nBindings; i++) {
+        binds[i].binding = i;
+        binds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        binds[i].descriptorCount = 1;
+        binds[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dslInfo = {};
+    dslInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dslInfo.bindingCount = nBindings; dslInfo.pBindings = binds.data();
+    if (vkCreateDescriptorSetLayout(ctx.device, &dslInfo, nullptr, &sp.dsl) != VK_SUCCESS) return false;
+
+    VkPipelineLayoutCreateInfo plInfo = {};
+    plInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plInfo.setLayoutCount = 1; plInfo.pSetLayouts = &sp.dsl;
+    VkPushConstantRange pcRange = { VK_SHADER_STAGE_COMPUTE_BIT, 0, (uint32_t)pushSize };
+    if (pushSize > 0) { plInfo.pushConstantRangeCount = 1; plInfo.pPushConstantRanges = &pcRange; }
+    if (vkCreatePipelineLayout(ctx.device, &plInfo, nullptr, &sp.layout) != VK_SUCCESS) return false;
+
+    VkComputePipelineCreateInfo cpInfo = {};
+    cpInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cpInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpInfo.stage.module = sp.shader;
+    cpInfo.stage.pName = "main";
+    cpInfo.layout = sp.layout;
+    if (vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &cpInfo, nullptr, &sp.pipeline) != VK_SUCCESS) return false;
+
+    return true;
+}
+
+static bool create_all_pipelines(VulkanCtx& ctx, const char* spv_dir) {
+    char p[256];
+    #define CP(name, bindings, pushSize) \
+        snprintf(p, sizeof(p), "%s/%s.spv", spv_dir, #name); \
+        if (!create_shader_pipe(ctx, p, bindings, pushSize, ctx.name)) return false;
+    CP(gemm, 3, sizeof(PC_Gemm));
+    CP(rms_norm, 3, sizeof(PC_RmsNorm));
+    CP(layer_norm, 2, sizeof(PC_LayerNorm));
+    CP(silu, 2, sizeof(PC_Silu));
+    CP(scale_shift, 4, sizeof(PC_ScaleShift));
+    CP(rope, 3, sizeof(PC_Rope));
+    CP(attention, 4, sizeof(PC_Attention));
+    CP(broadcast, 2, sizeof(PC_Broadcast));
+    #undef CP
+    LOGI("All 8 pipelines created");
+    return true;
+}
+
+static bool create_descriptor_pool(VulkanCtx& ctx) {
+    VkDescriptorPoolSize poolSize = {};
+    poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    poolSize.descriptorCount = 24000;
+    VkDescriptorPoolCreateInfo poolInfo = {};
+    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolInfo.maxSets = 6000;
+    poolInfo.poolSizeCount = 1;
+    poolInfo.pPoolSizes = &poolSize;
+    if (vkCreateDescriptorPool(ctx.device, &poolInfo, nullptr, &ctx.descPool) != VK_SUCCESS) return false;
+    if (vkCreateDescriptorPool(ctx.device, &poolInfo, nullptr, &ctx.descPool2) != VK_SUCCESS) return false;
+    LOGI("Descriptor pools created");
+    return true;
+}
+
+// ============================================================
+// Weight loading
+// ============================================================
+static bool load_weights(VulkanCtx& ctx, const char* path,
+                          std::unordered_map<std::string, WeightInfo>& weights) {
+    // Stream directly into per-tensor Vulkan buffers — no CPU temp buffer.
+    // On unified-memory Adreno, a 3.9GB temp buffer + 3.9GB Vulkan copies = 7.8GB peak → OOM.
+    FILE* f = fopen(path, "rb");
+    if (!f) { LOGE("Cannot open %s", path); return false; }
+
+    uint32_t N;
+    if (fread(&N, sizeof(N), 1, f) != 1) { fclose(f); return false; }
+    LOGI("Loading %u weight tensors (streaming)...", N);
+
+    VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    for (uint32_t i = 0; i < N; i++) {
+        uint16_t nl; fread(&nl, sizeof(nl), 1, f);
+        char* tmp = (char*)alloca(nl+1);
+        fread(tmp, 1, nl, f); tmp[nl] = 0;
+        std::string name(tmp, nl);
+
+        uint8_t nd; fread(&nd, 1, 1, f);
+        uint32_t sh[4] = {1,1,1,1}; size_t elems = 1;
+        for (uint8_t d = 0; d < nd; d++) { fread(&sh[d], 4, 1, f); elems *= sh[d]; }
+
+        auto& w = weights[name];
+        w.name = name;
+        w.size = elems * 2;
+        w.ndim = nd;
+        memcpy(w.dims, sh, sizeof(sh));
+        if (!create_buffer(ctx, w.size, usage, w.buf)) {
+            LOGE("Failed buffer for %s (%.1f MB)", name.c_str(), w.size/1e6);
+            fclose(f); return false;
+        }
+        fread(w.buf.mapped, 2, elems, f);
+    }
+    fclose(f);
+    LOGI("Loaded %u weights into %u Vulkan buffers (streaming, no temp CPU buf)",
+         N, (uint32_t)weights.size());
+    return true;
+}
+
+// ============================================================
+// Lightweight init — AdaLN only (no block GEMM weights)
+// ============================================================
+static bool load_adaln_weights(VulkanCtx& ctx, const char* path,
+                                std::unordered_map<std::string, WeightInfo>& weights) {
+    FILE* f = fopen(path, "rb");
+    if (!f) { LOGE("Cannot open %s", path); return false; }
+
+    uint32_t N;
+    if (fread(&N, sizeof(N), 1, f) != 1) { fclose(f); return false; }
+
+    // First pass: find all adaln-related tensors
+    std::vector<size_t> offsets, sizes;
+    std::vector<std::string> names;
+    std::vector<uint32_t> sh0, sh1;  // saved dims
+    size_t total = 0;
+    for (uint32_t i = 0; i < N; i++) {
+        uint16_t nl; fread(&nl, sizeof(nl), 1, f);
+        char* tmp = (char*)alloca(nl+1);
+        fread(tmp, 1, nl, f); tmp[nl] = 0;
+        std::string name(tmp, nl);
+        uint8_t nd; fread(&nd, 1, 1, f);
+        uint32_t sh[4] = {1,1,1,1}; size_t elems = 1;
+        for (uint8_t d = 0; d < nd; d++) { fread(&sh[d], 4, 1, f); elems *= sh[d]; }
+
+        bool want = (name.find("adaln_modulation") != std::string::npos)
+                 || (name.find("t_embedder") != std::string::npos)
+                 || (name == "t_embedding_norm.weight");
+        if (want) {
+            offsets.push_back(ftell(f));  // data starts here
+            sizes.push_back(elems * 2);
+            names.push_back(name);
+            sh0.push_back(sh[0]);
+            sh1.push_back(sh[1]);
+            total += elems * 2;
+        }
+        fseek(f, (long)(elems * 2), SEEK_CUR);
+    }
+    LOGI("AdaLN-only: %u tensors (%.1f KB)", (uint32_t)names.size(), total/1e3);
+
+    // Second pass: read selected tensors
+    VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    uint8_t* buf = new (std::nothrow) uint8_t[total];
+    if (!buf) { fclose(f); return false; }
+    size_t off = 0;
+    for (size_t j = 0; j < names.size(); j++) {
+        fseek(f, (long)offsets[j], SEEK_SET);
+        fread(buf + off, 1, sizes[j], f);
+        auto& w = weights[names[j]];
+        w.name = names[j];
+        w.size = sizes[j];
+        w.ndim = 2;
+        w.dims[0] = sh0[j];
+        w.dims[1] = sh1[j];
+        if (!create_buffer(ctx, sizes[j], usage, w.buf)) {
+            LOGE("Failed buffer for %s", names[j].c_str());
+            delete[] buf; fclose(f); return false;
+        }
+        memcpy(w.buf.mapped, buf + off, sizes[j]);
+        off += sizes[j];
+    }
+    delete[] buf; fclose(f);
+    LOGI("AdaLN weights loaded: %u tensors", (uint32_t)weights.size());
+    return true;
+}
+
+static bool load_block0_weights(VulkanCtx& ctx, const char* path,
+                                 std::unordered_map<std::string, WeightInfo>& weights) {
+    // Load block 0 GEMM/norm weights only (adaln weights already loaded).
+    FILE* f = fopen(path, "rb");
+    if (!f) { LOGE("Cannot open %s", path); return false; }
+
+    uint32_t N;
+    if (fread(&N, sizeof(N), 1, f) != 1) { fclose(f); return false; }
+
+    std::vector<size_t> offsets;
+    std::vector<std::string> names;
+    std::vector<uint32_t> sh0, sh1;
+    size_t total = 0;
+
+    for (uint32_t i = 0; i < N; i++) {
+        uint16_t nl; fread(&nl, sizeof(nl), 1, f);
+        char* tmp = (char*)alloca(nl+1);
+        fread(tmp, 1, nl, f); tmp[nl] = 0;
+        std::string name(tmp, nl);
+        uint8_t nd; fread(&nd, 1, 1, f);
+        uint32_t sh[4] = {1,1,1,1}; size_t elems = 1;
+        for (uint8_t d = 0; d < nd; d++) { fread(&sh[d], 4, 1, f); elems *= sh[d]; }
+
+        // Block 0 non-adaln GEMM/norm weights (adaln already loaded)
+        bool want = (name.find("blocks.0.") == 0)
+                 && (name.find("adaln_modulation") == std::string::npos);
+        if (want) {
+            offsets.push_back(ftell(f));
+            names.push_back(name);
+            sh0.push_back(sh[0]);
+            sh1.push_back(sh[1]);
+            total += elems * 2;
+        }
+        fseek(f, (long)(elems * 2), SEEK_CUR);
+    }
+    LOGI("Block 0 weights: %u tensors (%.1f KB)", (uint32_t)names.size(), total/1e3);
+
+    VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    uint8_t* buf = new (std::nothrow) uint8_t[total];
+    if (!buf) { fclose(f); return false; }
+    size_t off = 0;
+    for (size_t j = 0; j < names.size(); j++) {
+        fseek(f, (long)offsets[j], SEEK_SET);
+        fread(buf + off, 1, (size_t)sh0[j] * sh1[j] * 2, f);
+        auto& w = weights[names[j]];
+        w.name = names[j];
+        w.size = (size_t)sh0[j] * sh1[j] * 2;
+        w.ndim = 2;
+        w.dims[0] = sh0[j];
+        w.dims[1] = sh1[j];
+        if (!create_buffer(ctx, w.size, usage, w.buf)) {
+            LOGE("Failed buffer for %s", names[j].c_str());
+            delete[] buf; fclose(f); return false;
+        }
+        memcpy(w.buf.mapped, buf + off, w.size);
+        off += w.size;
+    }
+    delete[] buf; fclose(f);
+    LOGI("Block 0 weights loaded: %u tensors (%.1f MB)", (uint32_t)names.size(), total/1e6);
+    return true;
+}
+
+static bool create_adaln_pipelines(VulkanCtx& ctx, const char* spv_dir) {
+    char p[256];
+    #define CP(name, bindings, pushSize) \
+        snprintf(p, sizeof(p), "%s/%s.spv", spv_dir, #name); \
+        if (!create_shader_pipe(ctx, p, bindings, pushSize, ctx.name)) return false;
+    CP(gemm, 3, sizeof(PC_Gemm));
+    CP(silu, 2, sizeof(PC_Silu));
+    CP(scale_shift, 4, sizeof(PC_ScaleShift));
+    CP(broadcast, 2, sizeof(PC_Broadcast));
+    CP(layer_norm, 2, sizeof(PC_LayerNorm));
+    CP(rms_norm, 3, sizeof(PC_RmsNorm));
+    CP(gelu, 2, sizeof(PC_Silu));
+    CP(attn_qkt, 3, sizeof(PC_AttnQKT));
+    CP(attn_softmax, 1, sizeof(PC_AttnSoftmax));
+    CP(attn_out, 3, sizeof(PC_AttnOut));
+    CP(rope, 3, sizeof(PC_Rope));
+    #undef CP
+    // layer_norm_f16: FP16 I/O for pre-recorded blocks
+    snprintf(p, sizeof(p), "%s/layernorm_fp16.spv", spv_dir);
+    if (!create_shader_pipe(ctx, p, 2, sizeof(PC_LayerNorm), ctx.layer_norm_f16)) return false;
+    // gemm_fp32out: fp16 input, fp32 output GEMM
+    snprintf(p, sizeof(p), "%s/gemm_fp32out.spv", spv_dir);
+    if (!create_shader_pipe(ctx, p, 3, sizeof(PC_Gemm), ctx.gemm_fp32out)) return false;
+    // gate_fp32: fp32 gate residual (O_proj fp32 + gate fp16 + inBuf fp16 → fp16 out)
+    snprintf(p, sizeof(p), "%s/gate_fp32.spv", spv_dir);
+    if (!create_shader_pipe(ctx, p, 4, sizeof(uint32_t), ctx.gate_fp32)) return false;
+    LOGI("AdaLN pipelines created (9 types + 3 attn + ln_f16)");
+    return true;
+}
+
+// ============================================================
+// Forward declaration for adaln_gpu access
+static Buffer g_loraBuf;
+static Buffer g_onesBuf;
+static Buffer g_lnInBuf;   // FP32 LayerNorm input
+static Buffer g_lnOutBuf;  // FP32 LayerNorm output
+static Buffer g_rmsInBuf;   // FP16 RMSNorm input (max M=16384,D=128 → 4.2MB)
+static Buffer g_rmsOutBuf;  // FP16 RMSNorm output
+static Buffer g_rmsWgtBuf;  // FP16 RMSNorm weight (max D=2048)
+static Buffer g_geluInBuf;  // FP16 GELU input (M=512,D=8192 → 8.4MB)
+static Buffer g_geluOutBuf; // FP16 GELU output
+// Attention FP16 buffers — allocated at init, sized for cross-attn worst case
+static Buffer g_attnQ, g_attnK, g_attnV, g_attnA, g_attnO;
+// Dummy GEMM buffer — step 0 of single-instance merge test
+static Buffer g_gemmDummy;
+static Buffer g_gateScales; // [MLP=1/8, zero, SA=1/4, CX=1/4] — gate anti-overflow scaling
+static Buffer g_fp32_tmp;   // fp32 scratch buffer for SA gate residual (MS*D*4 bytes)
+
+struct RC {
+    VulkanCtx* vk;
+    VkCommandBuffer cmd;
+    std::unordered_map<std::string, WeightInfo>* weights;
+    Buffer *xBuf, *tEmbBuf, *ctxBuf, *outBuf;
+    Buffer *t1, *tQ, *tK, *tV, *tO, *rBuf, *aBuf, *nBuf, *gBuf, *bcBuf, *onesBuf;
+
+    void barrier() {
+        VkMemoryBarrier b = {};
+        b.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &b, 0, nullptr, 0, nullptr);
+    }
+    // Buffer-specific barrier — Adreno needs this for same-cmd-buffer compute sync
+    void barrier_buf(VkBuffer buf) {
+        VkBufferMemoryBarrier b = {};
+        b.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        b.buffer = buf;
+        b.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &b, 0, nullptr);
+    }
+
+    VkDescriptorSet alloc_set(VkDescriptorSetLayout dsl) {
+        VkDescriptorSetAllocateInfo info = {};
+        info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        info.descriptorPool = vk->descPool;
+        info.descriptorSetCount = 1;
+        info.pSetLayouts = &dsl;
+        VkDescriptorSet ds;
+        vkAllocateDescriptorSets(vk->device, &info, &ds);
+        return ds;
+    }
+
+    void bind_buf(VkDescriptorSet ds, uint32_t binding, Buffer& buf, size_t off, size_t len) {
+        VkDescriptorBufferInfo bi = { buf.buf, off, len };
+        VkWriteDescriptorSet w = {};
+        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstSet = ds;
+        w.dstBinding = binding;
+        w.dstArrayElement = 0;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w.pBufferInfo = &bi;
+        vkUpdateDescriptorSets(vk->device, 1, &w, 0, nullptr);
+    }
+
+    void dispatch_gemm(Buffer& A, const char* wname, uint32_t Mv, uint32_t Nv, uint32_t Kv, Buffer& C,
+                        size_t wSubOff = 0) {
+        auto it = weights->find(wname);
+        if (it == weights->end()) { LOGE("Weight not found: %s", wname); return; }
+        Buffer& wbuf = it->second.buf;
+        auto& sp = vk->gemm;
+        auto ds = alloc_set(sp.dsl);
+        bind_buf(ds, 0, A, 0, VK_WHOLE_SIZE);
+        bind_buf(ds, 1, wbuf, wSubOff, VK_WHOLE_SIZE);
+        bind_buf(ds, 2, C, 0, VK_WHOLE_SIZE);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.layout, 0, 1, &ds, 0, nullptr);
+        PC_Gemm pc = { Mv, Nv, Kv, 1, 1.0f };
+        vkCmdPushConstants(cmd, sp.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(cmd, (Nv + 7) / 8, (Mv + 7) / 8, 1);
+        barrier();
+    }
+
+    void dispatch_silu(Buffer& in, Buffer& out, uint32_t n) {
+        auto& sp = vk->silu;
+        auto ds = alloc_set(sp.dsl);
+        bind_buf(ds, 0, in, 0, VK_WHOLE_SIZE);
+        bind_buf(ds, 1, out, 0, VK_WHOLE_SIZE);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.layout, 0, 1, &ds, 0, nullptr);
+        PC_Silu pc = { n };
+        vkCmdPushConstants(cmd, sp.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(cmd, (n + 255) / 256, 1, 1);
+        barrier();
+    }
+
+    void dispatch_gelu(Buffer& in, Buffer& out, uint32_t n) {
+        auto& sp = vk->gelu;
+        auto ds = alloc_set(sp.dsl);
+        bind_buf(ds, 0, in, 0, VK_WHOLE_SIZE);
+        bind_buf(ds, 1, out, 0, VK_WHOLE_SIZE);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.layout, 0, 1, &ds, 0, nullptr);
+        PC_Silu pc = { n };
+        vkCmdPushConstants(cmd, sp.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(cmd, (n + 255) / 256, 1, 1);
+        barrier();
+    }
+
+    void dispatch_gemm_f32out(Buffer& A, const char* wname, uint32_t Mv, uint32_t Nv, uint32_t Kv, Buffer& C, size_t wSubOff = 0) {
+        auto it = weights->find(wname);
+        if (it == weights->end()) { LOGE("Weight not found: %s", wname); return; }
+        auto& sp = vk->gemm_fp32out;
+        auto ds = alloc_set(sp.dsl);
+        bind_buf(ds, 0, A, 0, VK_WHOLE_SIZE);
+        bind_buf(ds, 1, it->second.buf, wSubOff, VK_WHOLE_SIZE);
+        bind_buf(ds, 2, C, 0, VK_WHOLE_SIZE);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.layout, 0, 1, &ds, 0, nullptr);
+        PC_Gemm pc = { Mv, Nv, Kv, 1, 1.0f };
+        vkCmdPushConstants(cmd, sp.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(cmd, (Nv + 7) / 8, (Mv + 7) / 8, 1);
+        barrier();
+    }
+
+    void dispatch_gate_fp32(Buffer& oproj_f32, Buffer& gate_f16, Buffer& in_f16, Buffer& out_f16, uint32_t n) {
+        auto& sp = vk->gate_fp32;
+        auto ds = alloc_set(sp.dsl);
+        bind_buf(ds, 0, oproj_f32, 0, VK_WHOLE_SIZE);
+        bind_buf(ds, 1, gate_f16, 0, VK_WHOLE_SIZE);
+        bind_buf(ds, 2, in_f16, 0, VK_WHOLE_SIZE);
+        bind_buf(ds, 3, out_f16, 0, VK_WHOLE_SIZE);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.layout, 0, 1, &ds, 0, nullptr);
+        vkCmdPushConstants(cmd, sp.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(n), &n);
+        vkCmdDispatch(cmd, (n + 255) / 256, 1, 1);
+        barrier();
+    }
+
+    void dispatch_layernorm(Buffer& in, Buffer& out, uint32_t rows, uint32_t elems, float eps) {
+        auto& sp = vk->layer_norm_f16;  // fp16 I/O for pre-recorded blocks
+        auto ds = alloc_set(sp.dsl);
+        bind_buf(ds, 0, in, 0, VK_WHOLE_SIZE);
+        bind_buf(ds, 1, out, 0, VK_WHOLE_SIZE);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.layout, 0, 1, &ds, 0, nullptr);
+        PC_LayerNorm pc = { rows, elems, eps };
+        vkCmdPushConstants(cmd, sp.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(cmd, rows, 1, 1);
+        barrier();
+    }
+
+    void dispatch_rmsnorm(Buffer& in, const char* wname, Buffer& out, uint32_t rows, uint32_t elems, float eps) {
+        auto it = weights->find(wname);
+        if (it == weights->end()) { LOGE("Weight not found: %s", wname); return; }
+        Buffer& wbuf = it->second.buf;
+        auto& sp = vk->rms_norm;
+        auto ds = alloc_set(sp.dsl);
+        bind_buf(ds, 0, in, 0, VK_WHOLE_SIZE);
+        bind_buf(ds, 1, wbuf, 0, VK_WHOLE_SIZE);
+        bind_buf(ds, 2, out, 0, VK_WHOLE_SIZE);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.layout, 0, 1, &ds, 0, nullptr);
+        PC_RmsNorm pc = { rows, elems, eps };
+        vkCmdPushConstants(cmd, sp.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(cmd, rows, 1, 1);
+        barrier();
+    }
+
+    void dispatch_scale_shift(Buffer& x, Buffer& scl, size_t sclOff, Buffer& sft, size_t sftOff,
+                               Buffer& out, uint32_t n, uint32_t sS, uint32_t fS) {
+        auto& sp = vk->scale_shift;
+        auto ds = alloc_set(sp.dsl);
+        bind_buf(ds, 0, x, 0, VK_WHOLE_SIZE);
+        bind_buf(ds, 1, scl, sclOff, VK_WHOLE_SIZE);
+        bind_buf(ds, 2, sft, sftOff, VK_WHOLE_SIZE);
+        bind_buf(ds, 3, out, 0, VK_WHOLE_SIZE);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.layout, 0, 1, &ds, 0, nullptr);
+        PC_ScaleShift pc = { n, sS, fS };
+        vkCmdPushConstants(cmd, sp.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(cmd, (n + 255) / 256, 1, 1);
+        barrier();
+    }
+
+    // Convenience: scale_shift with offset=0
+    void dispatch_scale_shift(Buffer& x, Buffer& scl, Buffer& sft, Buffer& out,
+                               uint32_t n, uint32_t sS, uint32_t fS) {
+        dispatch_scale_shift(x, scl, 0, sft, 0, out, n, sS, fS);
+    }
+
+    void dispatch_broadcast(Buffer& in, Buffer& out, size_t outOff, uint32_t Mv, uint32_t Dv, uint32_t rpt) {
+        auto& sp = vk->broadcast;
+        auto ds = alloc_set(sp.dsl);
+        bind_buf(ds, 0, in, 0, VK_WHOLE_SIZE);
+        bind_buf(ds, 1, out, outOff, VK_WHOLE_SIZE);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.layout, 0, 1, &ds, 0, nullptr);
+        PC_Broadcast pc = { Mv, Dv, rpt };
+        vkCmdPushConstants(cmd, sp.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(cmd, (Mv * rpt * Dv + 255) / 256, 1, 1);
+        barrier();
+    }
+
+    void dispatch_rope(Buffer& t, Buffer& freqs, Buffer& out, uint32_t Nv, uint32_t hd) {
+        auto& sp = vk->rope;
+        auto ds = alloc_set(sp.dsl);
+        bind_buf(ds, 0, t, 0, VK_WHOLE_SIZE);
+        bind_buf(ds, 1, freqs, 0, VK_WHOLE_SIZE);
+        bind_buf(ds, 2, out, 0, VK_WHOLE_SIZE);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.layout, 0, 1, &ds, 0, nullptr);
+        PC_Rope pc = { Nv, hd };
+        vkCmdPushConstants(cmd, sp.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(cmd, (Nv + 255) / 256, 1, 1);
+        barrier();
+    }
+
+    void dispatch_attention(Buffer& Q, Buffer& K, Buffer& V, Buffer& O,
+                             uint32_t tq, uint32_t tkv, uint32_t hd, uint32_t Skv, float scl) {
+        auto& sp = vk->attention;
+        auto ds = alloc_set(sp.dsl);
+        bind_buf(ds, 0, Q, 0, VK_WHOLE_SIZE);
+        bind_buf(ds, 1, K, 0, VK_WHOLE_SIZE);
+        bind_buf(ds, 2, V, 0, VK_WHOLE_SIZE);
+        bind_buf(ds, 3, O, 0, VK_WHOLE_SIZE);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.layout, 0, 1, &ds, 0, nullptr);
+        PC_Attention pc = { tq, tkv, hd, Skv, scl };
+        vkCmdPushConstants(cmd, sp.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(cmd, tq, 1, 1);
+        barrier();
+    }
+
+    // GPU-side AdaLN for one channel (self_attn, cross_attn, or mlp)
+    // Computes: SiLU(t_emb) → LoRA down → 3×LoRA up → scale+1 → 3×broadcast
+    // Writes broadcasted shift/scale/gate to bcBuf at comp slots (base, base+1, base+2)
+    // Uses: aBuf(SiLU temp & scale+1 temp), t1(LoRA down), tQ/tK/tV(shift/scale/gate)
+    void adaln_gpu(const char* w0_name, const char* w2_name, int base_comp) {
+        size_t comp_sz = D * ADALN_LORA_DIM * 2;
+        size_t shiftSlot = (size_t)(base_comp + 1) * MS * D * 2;
+        size_t scaleSlot = (size_t)(base_comp + 0) * MS * D * 2;
+        size_t gateSlot  = (size_t)(base_comp + 2) * MS * D * 2;
+
+        // 1. SiLU(t_emb) → aBuf [M*D]
+        dispatch_silu(*tEmbBuf, *aBuf, M * D);
+        barrier_buf(aBuf->buf);  // Adreno: ensure SiLU output visible before GEMM reads it
+        // 2. LoRA down: aBuf @ W0^T → t1 [M, 256]
+        dispatch_gemm(*aBuf, w0_name, M, ADALN_LORA_DIM, D, *t1);
+        barrier_buf(t1->buf);  // ensure GEMM1 output visible before GEMM2 reads it
+        // 3-5. LoRA up × 3: t1 @ W2 components → tQ(shift), tK(scale), tV(gate)
+        dispatch_gemm(*t1, w2_name, M, D, ADALN_LORA_DIM, *tQ, 0);
+        dispatch_gemm(*t1, w2_name, M, D, ADALN_LORA_DIM, *tK, comp_sz);
+        dispatch_gemm(*t1, w2_name, M, D, ADALN_LORA_DIM, *tV, comp_sz * 2);
+        // 5b. Add external lora: tQ += lora_shift, tK += lora_scale, tV += lora_gate
+        // lora layout: [3, M, D] — 3 components, each [M,D] contiguous
+        size_t loraComp = M * D * 2;  // bytes per component
+        dispatch_scale_shift(*tQ, *onesBuf, 0, g_loraBuf, 0,          *tQ, M*D, 0, 1);
+        dispatch_scale_shift(*tK, *onesBuf, 0, g_loraBuf, loraComp,   *tK, M*D, 0, 1);
+        dispatch_scale_shift(*tV, *onesBuf, 0, g_loraBuf, loraComp*2, *tV, M*D, 0, 1);
+        barrier_buf(tQ->buf); barrier_buf(tK->buf); barrier_buf(tV->buf);
+        // 6. scale+1: tK + 1.0 → aBuf (temporary)
+        dispatch_scale_shift(*tK, *onesBuf, *onesBuf, *aBuf, M * D, 0, 0);
+        barrier_buf(aBuf->buf);
+        // 7-9. Broadcast [M,D] → [MS,D] to bcBuf slots
+        dispatch_broadcast(*tQ, *bcBuf, shiftSlot, M, D, S);
+        dispatch_broadcast(*aBuf, *bcBuf, scaleSlot, M, D, S);  // scale+1
+        dispatch_broadcast(*tV, *bcBuf, gateSlot, M, D, S);
+    }
+
+    // Weight buffer lookup
+    Buffer* wbuf(const char* name) {
+        auto it = weights->find(name);
+        if (it == weights->end()) { LOGE("Weight not found: %s", name); return nullptr; }
+        return &it->second.buf;
+    }
+
+    // Record 8-batch 3-pass attention (QK^T+softmax+AV) into current cmd buffer.
+    // Q/K/V are the full buffers; O receives the attention output.
+    // Self-attn: M_kv=S, Cross-attn: M_kv=Nctx.
+    // q_base_off, kv_base_off: byte offsets for per-batch slicing (0 for full-batch)
+    void record_attn_3pass(Buffer& Q, Buffer& K, Buffer& V, Buffer& A, Buffer& O,
+                            uint32_t M_q, uint32_t M_kv, uint32_t H, uint32_t D, float scale,
+                            size_t q_base_off = 0, size_t kv_base_off = 0,
+                            size_t a_base_off = 0, size_t o_base_off = 0) {
+        // Batch Q rows: aim for ~2048 WG per dispatch (batch_q * H WG)
+        // H=16 → batch_q=128 for 2048 WG. Safe for Adreno shared-memory reduction.
+        uint32_t batch_q = 128;
+        if (batch_q > M_q) batch_q = M_q;
+        uint32_t n_batches = (M_q + batch_q - 1) / batch_q;
+        size_t full_kv_bytes = M_kv * H * D * 2;
+
+        for (uint32_t batch = 0; batch < n_batches; batch++) {
+            uint32_t q_start = batch * batch_q;
+            uint32_t this_q = (q_start + batch_q <= M_q) ? batch_q : (M_q - q_start);
+            VkDeviceSize qOff = q_base_off + (VkDeviceSize)q_start * H * D * 2;
+            VkDeviceSize aOff = a_base_off + (VkDeviceSize)q_start * H * M_kv * 2;
+            VkDeviceSize oOff = o_base_off + (VkDeviceSize)q_start * H * D * 2;
+            size_t qBytes = this_q * H * D * 2;
+            size_t aBytes = this_q * H * M_kv * 2;
+            size_t oBytes = this_q * H * D * 2;
+
+            // Pass 1: QK^T
+            auto ds1 = alloc_set(vk->attn_qkt.dsl);
+            bind_buf(ds1, 0, Q, qOff, qBytes);
+            bind_buf(ds1, 1, K, kv_base_off, full_kv_bytes);
+            bind_buf(ds1, 2, A, aOff, aBytes);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->attn_qkt.pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->attn_qkt.layout, 0, 1, &ds1, 0, nullptr);
+            PC_AttnQKT pc1 = { this_q, M_kv, H, D, scale };
+            vkCmdPushConstants(cmd, vk->attn_qkt.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc1), &pc1);
+            vkCmdDispatch(cmd, this_q * H, 1, 1);
+            barrier();
+
+            // Pass 2: softmax in-place
+            auto ds2 = alloc_set(vk->attn_softmax.dsl);
+            bind_buf(ds2, 0, A, aOff, aBytes);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->attn_softmax.pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->attn_softmax.layout, 0, 1, &ds2, 0, nullptr);
+            PC_AttnSoftmax pc2 = { this_q, M_kv, H };
+            vkCmdPushConstants(cmd, vk->attn_softmax.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc2), &pc2);
+            vkCmdDispatch(cmd, this_q * H, 1, 1);
+            barrier();
+
+            // Pass 3: AV
+            auto ds3 = alloc_set(vk->attn_out.dsl);
+            bind_buf(ds3, 0, A, aOff, aBytes);
+            bind_buf(ds3, 1, V, kv_base_off, full_kv_bytes);
+            bind_buf(ds3, 2, O, oOff, oBytes);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->attn_out.pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->attn_out.layout, 0, 1, &ds3, 0, nullptr);
+            PC_AttnOut pc3 = { this_q, M_kv, H, D };
+            vkCmdPushConstants(cmd, vk->attn_out.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc3), &pc3);
+            vkCmdDispatch(cmd, this_q * H, 1, 1);
+            if (batch < n_batches - 1) barrier();
+        }
+    }
+};
+
+// ============================================================
+// Global state
+// ============================================================
+static VulkanCtx g_vk;
+static VkCommandBuffer g_lnCmdBuf = VK_NULL_HANDLE;  // dedicated LN cmd buf (not in g_vk.cmd[])
+static Buffer g_xBuf, g_tEmbBuf, g_ctxBuf, g_outBuf;
+static Buffer g_t1, g_tQ, g_tK, g_tV, g_tO, g_rBuf, g_aBuf, g_nBuf, g_gBuf, g_bcBuf;
+static std::unordered_map<std::string, WeightInfo> g_weights;
+static bool g_init = false;
+static bool g_skip_attn_precord = false;
+
+// Per-block output capture (for debugging: host-visible copies)
+static uint16_t* g_block_out[28] = {};
+static size_t g_block_out_size = 0;
+
+// Block 0 sub-module capture: after self-attn, cross-attn, MLP
+static uint16_t* g_b0_sa = nullptr;  // after self-attn residual
+static uint16_t* g_b0_cx = nullptr;  // after cross-attn residual
+static uint16_t* g_b0_mlp = nullptr; // after MLP (final output)
+
+// Block 0 attention internals (captured during self-attn segment)
+static uint16_t* g_b0_q = nullptr;  // Q after RMSNorm [MS*H, head_dim]
+static uint16_t* g_b0_k = nullptr;  // K after RMSNorm
+static uint16_t* g_b0_v = nullptr;  // V [MS*H, head_dim]  (raw V, before attention)
+static uint16_t* g_b0_scores = nullptr;  // attention scores [per-batch max]
+static uint16_t* g_b0_attn_o = nullptr;  // attention output [MS*H, head_dim]
+static uint16_t* g_b0_q_roped = nullptr; // Q after RMSNorm + RoPE [MS*H, head_dim]
+static uint16_t* g_b0_k_roped = nullptr; // K after RMSNorm + RoPE [MS*H, head_dim]
+static uint16_t* g_b0_o_proj = nullptr;  // O_proj GEMM output [MS, D] (after attn, before gate)
+static uint16_t* g_b0_ln = nullptr;      // LN output [MS, D] (before AdaLN modulate)
+static uint16_t* g_b0_mod = nullptr;     // AdaLN modulated [MS, D] (after scale_shift)
+static uint16_t* g_b0_q_raw = nullptr;   // Q before RMSNorm [MS, D] (raw GEMM output)
+static uint16_t* g_b0_shifts = nullptr;  // AdaLN shift/scale/gate [M*3, D] (pre-bcast)
+
+// RoPE frequency buffer (pre-computed once per spatial position, replicated per head)
+static std::vector<uint16_t> g_ropeFreqsHost;  // host-side freqs (survives killall)
+static size_t g_ropeFreqsSize = 0;
+static Buffer g_ropeFreqs;  // temp GPU buffer, allocated per-step
+
+// Debug: h1 (after SiLU, before w2 matmul) for lora comparison
+static std::vector<float> g_debug_h1;  // [M*D] fp32
+
+// ============================================================
+// Public C API
+// ============================================================
+// ============================================================
+// RoPE frequency computation (replicates VideoRopePosition3DEmb)
+// ============================================================
+static bool compute_rope_freqs(uint32_t S, uint32_t H, uint32_t W, uint32_t head_dim) {
+    // Anima RoPE: 3D position embedding (T=1, H=16, W=16 by default)
+    // Splits head_dim=128 into: dim_h=42, dim_w=42, dim_t=44
+    uint32_t T = 1;
+    uint32_t dim_h = head_dim / 6 * 2;  // 42
+    uint32_t dim_w = dim_h;              // 42
+    uint32_t dim_t = head_dim - 2 * dim_h; // 44
+
+    float h_ntk_factor = powf(4.0f, (float)dim_h / (float)(dim_h - 2));  // h_extrapolation_ratio^(dim_h/(dim_h-2))
+    float w_ntk_factor = powf(4.0f, (float)dim_w / (float)(dim_w - 2));
+    float t_ntk_factor = powf(1.0f, (float)dim_t / (float)(dim_t - 2));
+
+    float h_theta = 10000.0f * h_ntk_factor;
+    float w_theta = 10000.0f * w_ntk_factor;
+    float t_theta = 10000.0f * t_ntk_factor;
+
+    // Per-position freqs: [S, half_dim, 4] fp16 for one M-batch
+    // For each of M batches, replicate to [S*H, half_dim, 4]
+    uint32_t half_dim = head_dim / 2;  // 64
+
+    // Allocate temp host buffer for [S, half_dim, 4]
+    size_t per_pos_bytes = (size_t)S * half_dim * 4 * 2;  // fp16
+    std::vector<uint16_t> pos_freqs(S * half_dim * 4);
+
+    for (uint32_t p = 0; p < S; p++) {
+        uint32_t h_idx = p / W;  // row in spatial grid
+        uint32_t w_idx = p % W;  // col
+        uint32_t t_idx = 0;      // T=1 for image
+
+        for (uint32_t j = 0; j < half_dim; j++) {
+            float cos_val, sin_val;
+
+            if (j < dim_t / 2) {
+                // Temporal component: pos 0 always (T=1)
+                float freq = 1.0f / powf(t_theta, (float)(2 * j) / (float)dim_t);
+                float angle = (float)t_idx * freq;
+                cos_val = cosf(angle);
+                sin_val = sinf(angle);
+            } else if (j < dim_t / 2 + dim_h / 2) {
+                // Height component
+                uint32_t jh = j - dim_t / 2;
+                float freq = 1.0f / powf(h_theta, (float)(2 * jh) / (float)dim_h);
+                float angle = (float)h_idx * freq;
+                cos_val = cosf(angle);
+                sin_val = sinf(angle);
+            } else {
+                // Width component
+                uint32_t jw = j - dim_t / 2 - dim_h / 2;
+                float freq = 1.0f / powf(w_theta, (float)(2 * jw) / (float)dim_w);
+                float angle = (float)w_idx * freq;
+                cos_val = cosf(angle);
+                sin_val = sinf(angle);
+            }
+
+            // Store [cos, -sin, sin, cos] per pair
+            uint32_t base = (p * half_dim + j) * 4;
+            auto f2h = [](float v) -> uint16_t {
+                uint32_t bits = *(uint32_t*)&v;
+                return (uint16_t)((bits >> 16) & 0x8000) | (((bits >> 23) & 0xff) > 112 ?
+                       ((bits >> 13) & 0x3ff) | ((((bits >> 23) & 0xff) - 112) << 10) : 0);
+                // Approximate fp32→fp16; correct for most values
+            };
+            // Simpler: use the standard conversion
+            auto fp32_to_fp16 = [](float v) -> uint16_t {
+                uint32_t x = *(uint32_t*)&v;
+                uint32_t sign = (x >> 16) & 0x8000;
+                int32_t exp = ((x >> 23) & 0xff) - 127;
+                uint32_t mant = (x >> 13) & 0x3ff;
+                if (exp > 15) return sign | 0x7c00;  // inf
+                if (exp < -14) return sign;  // zero/subnormal
+                return (uint16_t)(sign | ((exp + 15) << 10) | mant);
+            };
+
+            pos_freqs[base + 0] = fp32_to_fp16(cos_val);
+            pos_freqs[base + 1] = fp32_to_fp16(-sin_val);
+            pos_freqs[base + 2] = fp32_to_fp16(sin_val);
+            pos_freqs[base + 3] = fp32_to_fp16(cos_val);
+        }
+    }
+
+    // Replicate per-head: [S, half_dim, 4] → [S*H, half_dim, 4]
+    // Then replicate per-batch: → [M*S*H, half_dim, 4]
+    uint32_t n_rows = M * S * H;  // total rows in [MS*H, head_dim] layout
+    g_ropeFreqsSize = (size_t)n_rows * half_dim * 4 * 2;  // fp16 bytes
+    std::vector<uint16_t> all_freqs(n_rows * half_dim * 4);
+
+    for (uint32_t mb = 0; mb < M; mb++) {
+        for (uint32_t p = 0; p < S; p++) {
+            for (uint32_t h = 0; h < H; h++) {
+                uint32_t dst_row = mb * S * H + p * H + h;
+                uint32_t src_row = p;  // same freqs for all heads at this position
+                // Copy freqs for this position
+                memcpy(&all_freqs[dst_row * half_dim * 4],
+                       &pos_freqs[src_row * half_dim * 4],
+                       half_dim * 4 * 2);
+            }
+        }
+    }
+
+    // Store in host memory (GPU buffer created per-step to avoid killall leaks)
+    g_ropeFreqsHost = std::move(all_freqs);
+    LOGI("RoPE freqs computed (host): %u rows × %u pairs, %zu bytes", n_rows, half_dim, g_ropeFreqsSize);
+    return true;
+}
+
+extern "C" {
+
+bool dit_init(const char* weight_path, const char* spv_dir) {
+    if (g_init) return true;
+    LOGI("dit_init: weights=%s spv=%s", weight_path ? weight_path : "(none)", spv_dir);
+
+    if (!init_vulkan(g_vk)) { LOGE("Vulkan init failed"); return false; }
+    if (!create_all_pipelines(g_vk, spv_dir)) { LOGE("Pipeline creation failed"); return false; }
+    if (!create_descriptor_pool(g_vk)) { LOGE("Descriptor pool failed"); return false; }
+
+    if (weight_path && weight_path[0]) {
+        if (!load_weights(g_vk, weight_path, g_weights)) {
+            LOGE("Weight loading failed"); return false;
+        }
+    } else {
+        LOGI("No weight path — weightless init");
+    }
+
+    // Allocate I/O buffers
+    VkBufferUsageFlags u = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    size_t bSz = MS * D * 2;
+    size_t bigSz = MS * MLP_HIDDEN * 2;
+    size_t attSz = MS * N_HEADS * HEAD_DIM * 2;
+    size_t ropeSz = MS * N_HEADS * (HEAD_DIM/2) * 4 * 2;
+    size_t adalnSz = M * D3 * 2;
+    size_t bcastSz = 9 * MS * D * 2;  // 9 AdaLN components × [MS,D] fp16 (shared per-block)
+
+    if (!create_buffer(g_vk, bSz, u, g_xBuf)) return false;
+    if (!create_buffer(g_vk, M * D * 2, u, g_tEmbBuf)) return false;
+    if (!create_buffer(g_vk, M * Nctx * CtxD * 2, u, g_ctxBuf)) return false;
+    if (!create_buffer(g_vk, bSz, u, g_outBuf)) return false;
+    if (!create_buffer(g_vk, bigSz, u, g_t1)) return false;
+    if (!create_buffer(g_vk, attSz, u, g_tQ)) return false;
+    if (!create_buffer(g_vk, attSz, u, g_tK)) return false;
+    if (!create_buffer(g_vk, attSz, u, g_tV)) return false;
+    if (!create_buffer(g_vk, attSz, u, g_tO)) return false;
+    if (!create_buffer(g_vk, ropeSz, u, g_rBuf)) return false;
+    if (!create_buffer(g_vk, adalnSz, u, g_aBuf)) return false;
+    if (!create_buffer(g_vk, bSz, u, g_nBuf)) return false;
+    if (!create_buffer(g_vk, bSz, u, g_gBuf)) return false;
+    if (!create_buffer(g_vk, bcastSz, u, g_bcBuf)) return false;
+
+    // Lora buffer: [3, M, D] fp16 (pre-computed per sigma, CPU→GPU upload)
+    if (!create_buffer(g_vk, 3 * M * D * 2, u, g_loraBuf)) return false;
+
+    // Ones buffer: filled with fp16(1.0)
+    if (!create_buffer(g_vk, 4096, u, g_onesBuf)) return false;
+    uint16_t* ones = (uint16_t*)g_onesBuf.mapped;
+    for (int i = 0; i < 2048; i++) ones[i] = 0x3C00;  // fp16 1.0
+
+    LOGI("dit_init OK — %u buffers allocated", 15);
+    g_init = true;
+    return true;
+}
+
+// Forward declaration for pre-recording AdaLN blocks
+static bool record_adaln_block(int blockIdx, int cmdIdx);
+static void record_one_block(RC& rc, int b, Buffer& inBuf, Buffer& outBuf,
+                              bool real_attn = false);
+static bool submit_segment(void);
+static void begin_step_recording(RC& rc);
+static void end_step_recording(void);
+static void record_segment_adaln(RC& rc, int b);
+static void record_segment_self_attn(RC& rc, int b, Buffer& inBuf);
+static void record_segment_cross_pre(RC& rc, int b);
+static void record_segment_cross_attn(RC& rc, int b);
+static void record_segment_mlp(RC& rc, int b);
+bool dit_record_all_adaln_blocks(void);
+
+// Lightweight init: AdaLN weights only (~340KB), no GEMM/attention weights.
+bool dit_init_adaln_only(const char* weight_path, const char* spv_dir) {
+    if (g_init) return true;
+    LOGI("dit_init_adaln_only: weights=%s spv=%s", weight_path, spv_dir);
+
+    if (!init_vulkan(g_vk)) { LOGE("Vulkan init failed"); return false; }
+    if (!create_adaln_pipelines(g_vk, spv_dir)) { LOGE("Pipeline creation failed"); return false; }
+    if (!create_descriptor_pool(g_vk)) { LOGE("Descriptor pool failed"); return false; }
+
+    // Per-step fence (separate from AdaLN fence)
+    {
+        VkFenceCreateInfo fi = {};
+        fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        if (vkCreateFence(g_vk.device, &fi, nullptr, &g_vk.stepFence) != VK_SUCCESS) {
+            LOGE("stepFence failed"); return false;
+        }
+    }
+
+    // Second pool for per-step ops — reset each step to avoid fragmentation
+    {
+        VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 12000};
+        VkDescriptorPoolCreateInfo dp = {};
+        dp.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        dp.maxSets = 3000;
+        dp.poolSizeCount = 1;
+        dp.pPoolSizes = &ps;
+        if (vkCreateDescriptorPool(g_vk.device, &dp, nullptr, &g_vk.stepPool) != VK_SUCCESS) {
+            LOGE("Step pool failed"); return false;
+        }
+    }
+
+    if (weight_path && weight_path[0]) {
+        if (!load_weights(g_vk, weight_path, g_weights)) {
+            LOGE("Weight loading failed"); return false;
+        }
+    }
+
+    VkBufferUsageFlags u = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    size_t bSz = MS * D * 2;
+    size_t adalnSz = M * D3 * 2;
+    size_t bcastSz = 9 * MS * D * 2;
+
+    if (!create_buffer(g_vk, M * D * 2, u, g_tEmbBuf)) return false;
+    if (!create_buffer(g_vk, adalnSz, u, g_aBuf)) return false;
+    // Sized for full block recording (MS rows), not just AdaLN (M rows)
+    size_t bigSz = MS * MLP_HIDDEN * 2;  // 8MB — MLP fc1 output
+    size_t attSz = MS * N_HEADS * HEAD_DIM * 2;  // 2MB — Q/K/V output
+    if (!create_buffer(g_vk, bigSz, u, g_t1)) return false;
+    if (!create_buffer(g_vk, attSz, u, g_tQ)) return false;
+    if (!create_buffer(g_vk, attSz, u, g_tK)) return false;
+    if (!create_buffer(g_vk, attSz, u, g_tV)) return false;
+    if (!create_buffer(g_vk, bcastSz, u, g_bcBuf)) return false;
+
+    if (!create_buffer(g_vk, 3 * M * D * 2, u, g_loraBuf)) return false;
+
+    // FP32 LayerNorm I/O buffers (M_max=MS=512, D=2048 → 4MB each)
+    if (!create_buffer(g_vk, MS * D * 4, u, g_lnInBuf)) return false;
+    if (!create_buffer(g_vk, MS * D * 4, u, g_lnOutBuf)) return false;
+
+    // FP16 RMSNorm I/O buffers (cross-attn K norm: M=16384, D=128 → 4.2MB)
+    size_t rmsMaxSz = MS * N_HEADS * D * 2;  // 512*16*2048*2 = 32MB, way oversized; double head_dim*Nctx=32768*128*2=8MB
+    size_t rmsSz = 5 * 1024 * 1024;  // 5MB — enough for 16384×128 fp16
+    if (!create_buffer(g_vk, rmsSz, u, g_rmsInBuf)) return false;
+    if (!create_buffer(g_vk, rmsSz, u, g_rmsOutBuf)) return false;
+
+    // FP16 RMSNorm weight buffer (max D=2048 → 4KB)
+    if (!create_buffer(g_vk, D * 2, u, g_rmsWgtBuf)) return false;
+
+    // FP16 GELU I/O buffers (M=512, MLP_HIDDEN=8192 → 8.4MB each)
+    size_t geluSz = MS * MLP_HIDDEN * 2;
+    if (!create_buffer(g_vk, geluSz, u, g_geluInBuf)) return false;
+    if (!create_buffer(g_vk, geluSz, u, g_geluOutBuf)) return false;
+
+    // Attention FP16 buffers (sized for cross-attn: M_q=512, M_kv=1024, H=16, D=128)
+    // Q: M_q*H*D*2=2MB, K: M_kv*H*D*2=4MB, V: 4MB, A: M_q*H*M_kv*2=16.8MB, O: 2MB
+    if (!create_buffer(g_vk, MS * N_HEADS * HEAD_DIM * 2, u, g_attnQ)) return false;
+    if (!create_buffer(g_vk, M * Nctx * N_HEADS * HEAD_DIM * 2, u, g_attnK)) return false;
+    if (!create_buffer(g_vk, M * Nctx * N_HEADS * HEAD_DIM * 2, u, g_attnV)) return false;
+    if (!create_buffer(g_vk, MS * N_HEADS * (M * Nctx) * 2, u, g_attnA)) return false;
+    if (!create_buffer(g_vk, MS * N_HEADS * HEAD_DIM * 2, u, g_attnO)) return false;
+
+    if (!create_buffer(g_vk, 4096, u, g_onesBuf)) return false;
+    uint16_t* ones = (uint16_t*)g_onesBuf.mapped;
+    for (int i = 0; i < 2048; i++) ones[i] = 0x3C00;
+
+    // Dummy buffers for xBuf/ctxBuf/outBuf (RC references them, not used by adaln_gpu)
+    if (!create_buffer(g_vk, bSz, u, g_xBuf)) return false;
+    if (!create_buffer(g_vk, bSz, u, g_outBuf)) return false;
+    if (!create_buffer(g_vk, M * Nctx * CtxD * 2, u, g_ctxBuf)) return false;
+
+    // Missing buffers for record_one_block (step 2a)
+    if (!create_buffer(g_vk, bSz, u, g_nBuf)) return false;
+    if (!create_buffer(g_vk, bSz, u, g_gBuf)) return false;
+    if (!create_buffer(g_vk, bSz, u, g_tO)) return false;
+    size_t rSz = M * Nctx * D * 2;  // cross-attn V [1024,2048] fp16 = 4MB
+    if (!create_buffer(g_vk, rSz, u, g_rBuf)) return false;
+
+    // Allocate dedicated LN command buffer (avoid overwriting AdaLN cmd[i])
+    VkCommandBufferAllocateInfo lnCbInfo = {};
+    lnCbInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    lnCbInfo.commandPool = g_vk.cmdPool;
+    lnCbInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    lnCbInfo.commandBufferCount = 1;
+    if (vkAllocateCommandBuffers(g_vk.device, &lnCbInfo, &g_lnCmdBuf) != VK_SUCCESS) {
+        LOGE("LN cmd buffer alloc failed"); return false;
+    }
+
+    // Per-block output capture buffers (host memory, read via dit_get_block_output)
+    g_block_out_size = MS * D * 2;
+    for (int i = 0; i < 28; i++) {
+        g_block_out[i] = (uint16_t*)malloc(g_block_out_size);
+        if (!g_block_out[i]) { LOGE("block_out[%d] alloc failed", i); return false; }
+        memset(g_block_out[i], 0, g_block_out_size);
+    }
+    // Block 0 sub-module capture
+    g_b0_sa  = (uint16_t*)malloc(g_block_out_size);
+    g_b0_cx  = (uint16_t*)malloc(g_block_out_size);
+    g_b0_mlp = (uint16_t*)malloc(g_block_out_size);
+    size_t qkv_sz = MS * N_HEADS * HEAD_DIM * 2;
+    size_t score_sz = (MS/M) * N_HEADS * (MS/M) * 2;  // S*H*S*2 for first batch
+    g_b0_q = (uint16_t*)malloc(qkv_sz);
+    g_b0_k = (uint16_t*)malloc(qkv_sz);
+    g_b0_v = (uint16_t*)malloc(qkv_sz);
+    g_b0_scores = (uint16_t*)malloc(score_sz);
+    g_b0_attn_o = (uint16_t*)malloc(qkv_sz);
+    g_b0_q_roped = (uint16_t*)malloc(qkv_sz);
+    g_b0_k_roped = (uint16_t*)malloc(qkv_sz);
+    g_b0_o_proj = (uint16_t*)malloc(g_block_out_size);
+    g_b0_ln    = (uint16_t*)malloc(g_block_out_size);
+    g_b0_mod   = (uint16_t*)malloc(g_block_out_size);
+    g_b0_q_raw = (uint16_t*)malloc(g_block_out_size);
+    g_b0_shifts = (uint16_t*)malloc(M * 3u * D * 2);  // [M*3, D] shift/scale/gate
+    if (!g_b0_sa || !g_b0_cx || !g_b0_mlp ||
+        !g_b0_q || !g_b0_k || !g_b0_v || !g_b0_scores || !g_b0_attn_o ||
+        !g_b0_q_roped || !g_b0_k_roped || !g_b0_o_proj ||
+        !g_b0_ln || !g_b0_mod || !g_b0_q_raw || !g_b0_shifts) {
+        LOGE("b0 capture alloc failed"); return false;
+    }
+
+    // ── Step 0: allocate 32MB dummy buffer (single-instance merge test) ──
+    if (!create_buffer(g_vk, 32 * 1024 * 1024, u, g_gemmDummy)) {
+        LOGE("gemmDummy alloc failed"); return false;
+    }
+    memset(g_gemmDummy.mapped, 0, 32 * 1024 * 1024);
+
+    // Gate scaling buffer: [MLP(1/8), zero, SA(1/2), CX(1/2)] — 8 bytes
+    if (!create_buffer(g_vk, 8, u, g_gateScales)) {
+        LOGE("gateScales alloc failed"); return false;
+    }
+    uint16_t sc_vals[4] = {0x3000, 0x0000, 0x3400, 0x3400};  // MLP=1/8, zero, SA=1/4, CX=1/4
+    memcpy(g_gateScales.mapped, sc_vals, 8);
+
+    // fp32 scratch for SA gate residual (4MB)
+    if (!create_buffer(g_vk, MS * D * 4, u, g_fp32_tmp)) {
+        LOGE("fp32_tmp alloc failed"); return false;
+    }
+
+    LOGI("dit_init_adaln_only OK — %u buffers", 20);
+
+    // ── Pre-record all 28 full blocks (skip-attn mode, 63 dispatches each) ──
+    for (int i = 0; i < 28; i++) {
+        VkCommandBufferBeginInfo bi = {};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        if (vkBeginCommandBuffer(g_vk.cmd[i], &bi) != VK_SUCCESS) {
+            LOGE("Begin cmd[%d] failed", i); return false;
+        }
+        RC rc; memset(&rc, 0, sizeof(rc));
+        rc.vk = &g_vk; rc.cmd = g_vk.cmd[i]; rc.weights = &g_weights;
+        rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
+        rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
+        rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf;
+        rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
+
+        record_one_block(rc, i, *rc.xBuf, *rc.outBuf);
+
+        if (vkEndCommandBuffer(g_vk.cmd[i]) != VK_SUCCESS) {
+            LOGE("End cmd[%d] failed", i); return false;
+        }
+    }
+    LOGI("All 28 full blocks pre-recorded (28×63 dispatches)");
+
+    // Pre-compute RoPE frequencies (position-dependent, fixed across steps)
+    uint32_t HP = (uint32_t)sqrtf((float)S);  // 16 for S=256
+    if (!compute_rope_freqs(S, N_HEADS, HP, HEAD_DIM)) {
+        LOGE("RoPE freq computation failed"); return false;
+    }
+
+    if (!g_skip_attn_precord) {
+        // Pre-record attention using descPool2 (separate from block descPool)
+        float attn_scale = 1.0f / sqrtf(128.0f);
+        auto savedPool = g_vk.descPool;
+        g_vk.descPool = g_vk.descPool2;
+        for (int i = 0; i < 28; i++) {
+            VkCommandBufferBeginInfo bi = {};
+            bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            vkBeginCommandBuffer(g_vk.cmd_attn[i], &bi);
+
+            RC rc; memset(&rc, 0, sizeof(rc));
+            rc.vk = &g_vk; rc.cmd = g_vk.cmd_attn[i]; rc.weights = &g_weights;
+            rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
+            rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
+            rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf;
+            rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
+
+            // Cross-attn: Q from g_tQ, K from g_t1 (ctx K proj), V from g_rBuf (ctx V proj)
+            // Data written by cmd[i] at submit time, read by cmd_attn[i] at its submit time
+            rc.record_attn_3pass(g_tQ, g_t1, g_rBuf, g_attnA, g_attnO,
+                                 512, 1024, 16, 128, attn_scale);
+
+            vkEndCommandBuffer(g_vk.cmd_attn[i]);
+        }
+        g_vk.descPool = savedPool;
+        LOGI("All 28 cmd_attn pre-recorded with cross-attention (28×24 dispatches, descPool2)");
+    }
+
+    // ── Step 1: GEMM smoke test ──
+    // Verify gemm_fp16 pipeline (already loaded by create_adaln_pipelines)
+    // can dispatch without breaking subsequent attention calls.
+    {
+        const char* test_w = "blocks.0.adaln_modulation_self_attn.1.weight";
+        auto w_it = g_weights.find(test_w);
+        if (w_it == g_weights.end()) {
+            LOGE("GEMM smoke: weight '%s' not found", test_w);
+            return false;
+        }
+        uint32_t test_N = w_it->second.dims[0];  // 256
+        uint32_t test_K = w_it->second.dims[1];  // 2048
+        uint32_t test_M = 1;
+
+        VkCommandBufferBeginInfo bi = {};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        if (vkBeginCommandBuffer(g_lnCmdBuf, &bi) != VK_SUCCESS) {
+            LOGE("GEMM smoke: begin cmdBuf failed"); return false;
+        }
+
+        VkDescriptorSetAllocateInfo dsInfo = {};
+        dsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dsInfo.descriptorPool = g_vk.descPool;
+        dsInfo.descriptorSetCount = 1;
+        dsInfo.pSetLayouts = &g_vk.gemm.dsl;
+        VkDescriptorSet ds;
+        if (vkAllocateDescriptorSets(g_vk.device, &dsInfo, &ds) != VK_SUCCESS) {
+            LOGE("GEMM smoke: alloc ds failed"); return false;
+        }
+
+        VkDeviceSize aBytes = test_M * test_K * 2;
+        VkDeviceSize cBytes = test_M * test_N * 2;
+        VkDescriptorBufferInfo bA = { g_onesBuf.buf, 0, aBytes };
+        VkDescriptorBufferInfo bW = { w_it->second.buf.buf, 0, w_it->second.buf.size };
+        VkDescriptorBufferInfo bC = { g_gemmDummy.buf, 0, cBytes };
+
+        VkWriteDescriptorSet w[3] = {};
+        for (int i = 0; i < 3; i++) {
+            w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[i].dstSet = ds; w[i].dstBinding = (uint32_t)i;
+            w[i].descriptorCount = 1;
+            w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        }
+        w[0].pBufferInfo = &bA; w[1].pBufferInfo = &bW; w[2].pBufferInfo = &bC;
+        vkUpdateDescriptorSets(g_vk.device, 3, w, 0, nullptr);
+
+        vkCmdBindPipeline(g_lnCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk.gemm.pipeline);
+        vkCmdBindDescriptorSets(g_lnCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk.gemm.layout, 0, 1, &ds, 0, nullptr);
+        PC_Gemm pc = { test_M, test_N, test_K, 1, 1.0f };
+        vkCmdPushConstants(g_lnCmdBuf, g_vk.gemm.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(g_lnCmdBuf, (test_N + 7) / 8, (test_M + 7) / 8, 1);
+
+        VkMemoryBarrier mb = {};
+        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(g_lnCmdBuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+
+        if (vkEndCommandBuffer(g_lnCmdBuf) != VK_SUCCESS) {
+            LOGE("GEMM smoke: end cmdBuf failed"); return false;
+        }
+
+        vkResetFences(g_vk.device, 1, &g_vk.stepFence);
+        VkSubmitInfo submit = {};
+        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &g_lnCmdBuf;
+        if (vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.stepFence) != VK_SUCCESS) {
+            LOGE("GEMM smoke: submit failed"); return false;
+        }
+        vkWaitForFences(g_vk.device, 1, &g_vk.stepFence, VK_TRUE, UINT64_MAX);
+
+        uint16_t r0 = ((uint16_t*)g_gemmDummy.mapped)[0];
+        LOGI("GEMM smoke test PASS — M=%u N=%u K=%u  result[0]=0x%04x",
+             test_M, test_N, test_K, r0);
+    }
+
+    // ── Step 3b-iv: DISABLED (causes cmd submit to fail) ──
+#if 0
+    {
+    // ── Step 3b-iv: self+cross 8-batch 3-pass attention (48 dispatches) ──
+        uint32_t test_Mq = 512, test_Mkv = 512, test_H = 16, test_D = 128;
+        float test_scale = 1.0f / sqrtf((float)test_D);  // 0.0884
+        uint32_t bq = 64;  // batch_q: 64 tokens per batch (64*16=1024 WG)
+        size_t qPerBatchBytes = bq * test_H * test_D * 2;    // 64*16*128*2 = 256KB
+        size_t aPerBatchBytes = bq * test_H * test_Mkv * 2;  // 64*16*512*2 = 1MB
+        size_t kvBytes = test_Mkv * test_H * test_D * 2;     // full K/V = 2MB
+        size_t qTotalBytes = test_Mq * test_H * test_D * 2;  // full Q = 2MB
+
+        // Fill Q, K, V with all 1.0
+        uint16_t* q = (uint16_t*)g_attnQ.mapped;
+        uint16_t* k = (uint16_t*)g_attnK.mapped;
+        uint16_t* v = (uint16_t*)g_attnV.mapped;
+        for (uint32_t i = 0; i < test_Mq * test_H * test_D; i++) q[i] = 0x3C00;
+        for (uint32_t i = 0; i < test_Mkv * test_H * test_D; i++) k[i] = v[i] = 0x3C00;
+
+        VkCommandBufferBeginInfo bi = {};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        if (vkBeginCommandBuffer(g_lnCmdBuf, &bi) != VK_SUCCESS) {
+            LOGE("3b-iii: begin failed"); return false;
+        }
+
+        VkDescriptorSetAllocateInfo dsInfo = {};
+        dsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dsInfo.descriptorPool = g_vk.descPool;
+        dsInfo.descriptorSetCount = 1;
+
+        for (uint32_t batch = 0; batch < 8; batch++) {
+            uint32_t qOff = batch * bq;
+            VkDeviceSize qByteOff = (VkDeviceSize)batch * qPerBatchBytes;
+            VkDeviceSize aByteOff = (VkDeviceSize)batch * aPerBatchBytes;
+
+            // ── Pass 1: QK^T (this batch's Q × full K) ──
+            VkDescriptorSet ds1;
+            dsInfo.pSetLayouts = &g_vk.attn_qkt.dsl;
+            vkAllocateDescriptorSets(g_vk.device, &dsInfo, &ds1);
+            {
+                VkDescriptorBufferInfo bQ = { g_attnQ.buf, qByteOff, qPerBatchBytes };
+                VkDescriptorBufferInfo bK = { g_attnK.buf, 0, kvBytes };
+                VkDescriptorBufferInfo bA = { g_attnA.buf, aByteOff, aPerBatchBytes };
+                VkWriteDescriptorSet w[3] = {};
+                for (int i=0;i<3;i++){w[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;w[i].dstSet=ds1;w[i].dstBinding=(uint32_t)i;w[i].descriptorCount=1;w[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;}
+                w[0].pBufferInfo=&bQ; w[1].pBufferInfo=&bK; w[2].pBufferInfo=&bA;
+                vkUpdateDescriptorSets(g_vk.device,3,w,0,nullptr);
+            }
+            vkCmdBindPipeline(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_qkt.pipeline);
+            vkCmdBindDescriptorSets(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_qkt.layout,0,1,&ds1,0,nullptr);
+            PC_AttnQKT pc1={bq, test_Mkv, test_H, test_D, test_scale};
+            vkCmdPushConstants(g_lnCmdBuf,g_vk.attn_qkt.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pc1),&pc1);
+            vkCmdDispatch(g_lnCmdBuf, bq * test_H, 1, 1);
+            { VkMemoryBarrier mb={};mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;vkCmdPipelineBarrier(g_lnCmdBuf,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,nullptr,0,nullptr); }
+
+            // ── Pass 2: softmax in-place (this batch's A region) ──
+            VkDescriptorSet ds2;
+            dsInfo.pSetLayouts=&g_vk.attn_softmax.dsl;
+            vkAllocateDescriptorSets(g_vk.device,&dsInfo,&ds2);
+            { VkDescriptorBufferInfo bA={g_attnA.buf,aByteOff,aPerBatchBytes}; VkWriteDescriptorSet w={};w.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;w.dstSet=ds2;w.dstBinding=0;w.descriptorCount=1;w.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;w.pBufferInfo=&bA;vkUpdateDescriptorSets(g_vk.device,1,&w,0,nullptr); }
+            vkCmdBindPipeline(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_softmax.pipeline);
+            vkCmdBindDescriptorSets(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_softmax.layout,0,1,&ds2,0,nullptr);
+            PC_AttnSoftmax pc2={bq, test_Mkv, test_H};
+            vkCmdPushConstants(g_lnCmdBuf,g_vk.attn_softmax.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pc2),&pc2);
+            vkCmdDispatch(g_lnCmdBuf, bq * test_H, 1, 1);
+            { VkMemoryBarrier mb={};mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;vkCmdPipelineBarrier(g_lnCmdBuf,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,nullptr,0,nullptr); }
+
+            // ── Pass 3: AV (this batch's A × full V → this batch's O) ──
+            VkDescriptorSet ds3;
+            dsInfo.pSetLayouts=&g_vk.attn_out.dsl;
+            vkAllocateDescriptorSets(g_vk.device,&dsInfo,&ds3);
+            {
+                VkDescriptorBufferInfo bA={g_attnA.buf,aByteOff,aPerBatchBytes}, bV={g_attnV.buf,0,kvBytes}, bO={g_attnO.buf,qByteOff,qPerBatchBytes};
+                VkWriteDescriptorSet w[3]={};
+                for (int i=0;i<3;i++){w[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;w[i].dstSet=ds3;w[i].dstBinding=(uint32_t)i;w[i].descriptorCount=1;w[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;}
+                w[0].pBufferInfo=&bA;w[1].pBufferInfo=&bV;w[2].pBufferInfo=&bO;
+                vkUpdateDescriptorSets(g_vk.device,3,w,0,nullptr);
+            }
+            vkCmdBindPipeline(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_out.pipeline);
+            vkCmdBindDescriptorSets(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_out.layout,0,1,&ds3,0,nullptr);
+            PC_AttnOut pc3={bq, test_Mkv, test_H, test_D};
+            vkCmdPushConstants(g_lnCmdBuf,g_vk.attn_out.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pc3),&pc3);
+            vkCmdDispatch(g_lnCmdBuf, bq * test_H, 1, 1);
+            if (batch < 7) {
+                VkMemoryBarrier mb={};mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;vkCmdPipelineBarrier(g_lnCmdBuf,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,nullptr,0,nullptr);
+            }
+        }
+        // ── Cross-attention: 8 batches, M_kv=1024 ──
+        {
+            uint32_t cx_Mkv = 1024;
+            size_t cxKvBytes = cx_Mkv * test_H * test_D * 2;  // 4MB
+            size_t cxAPerBatch = bq * test_H * cx_Mkv * 2;    // 2MB per batch
+            // Fill cross K/V with all 1.0
+            for (uint32_t i = 0; i < cx_Mkv * test_H * test_D; i++) {
+                k[i] = v[i] = 0x3C00;
+            }
+            for (uint32_t batch = 0; batch < 8; batch++) {
+                VkDeviceSize qByteOff = (VkDeviceSize)batch * qPerBatchBytes;
+                VkDeviceSize aByteOff = (VkDeviceSize)batch * cxAPerBatch;
+
+                // QK^T
+                VkDescriptorSet ds1;
+                dsInfo.pSetLayouts = &g_vk.attn_qkt.dsl;
+                vkAllocateDescriptorSets(g_vk.device, &dsInfo, &ds1);
+                { VkDescriptorBufferInfo bQ={g_attnQ.buf,qByteOff,qPerBatchBytes}, bK={g_attnK.buf,0,cxKvBytes}, bA={g_attnA.buf,aByteOff,cxAPerBatch};
+                  VkWriteDescriptorSet w[3]={};for(int i=0;i<3;i++){w[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;w[i].dstSet=ds1;w[i].dstBinding=(uint32_t)i;w[i].descriptorCount=1;w[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;}
+                  w[0].pBufferInfo=&bQ;w[1].pBufferInfo=&bK;w[2].pBufferInfo=&bA;vkUpdateDescriptorSets(g_vk.device,3,w,0,nullptr); }
+                vkCmdBindPipeline(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_qkt.pipeline);
+                vkCmdBindDescriptorSets(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_qkt.layout,0,1,&ds1,0,nullptr);
+                PC_AttnQKT pc1={bq,cx_Mkv,test_H,test_D,test_scale};
+                vkCmdPushConstants(g_lnCmdBuf,g_vk.attn_qkt.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pc1),&pc1);
+                vkCmdDispatch(g_lnCmdBuf,bq*test_H,1,1);
+                { VkMemoryBarrier mb={};mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;vkCmdPipelineBarrier(g_lnCmdBuf,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,nullptr,0,nullptr); }
+
+                // softmax
+                VkDescriptorSet ds2; dsInfo.pSetLayouts=&g_vk.attn_softmax.dsl;
+                vkAllocateDescriptorSets(g_vk.device,&dsInfo,&ds2);
+                { VkDescriptorBufferInfo bA={g_attnA.buf,aByteOff,cxAPerBatch};VkWriteDescriptorSet w={};w.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;w.dstSet=ds2;w.dstBinding=0;w.descriptorCount=1;w.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;w.pBufferInfo=&bA;vkUpdateDescriptorSets(g_vk.device,1,&w,0,nullptr); }
+                vkCmdBindPipeline(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_softmax.pipeline);
+                vkCmdBindDescriptorSets(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_softmax.layout,0,1,&ds2,0,nullptr);
+                PC_AttnSoftmax pc2={bq,cx_Mkv,test_H};
+                vkCmdPushConstants(g_lnCmdBuf,g_vk.attn_softmax.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pc2),&pc2);
+                vkCmdDispatch(g_lnCmdBuf,bq*test_H,1,1);
+                { VkMemoryBarrier mb={};mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;vkCmdPipelineBarrier(g_lnCmdBuf,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,nullptr,0,nullptr); }
+
+                // AV
+                VkDescriptorSet ds3; dsInfo.pSetLayouts=&g_vk.attn_out.dsl;
+                vkAllocateDescriptorSets(g_vk.device,&dsInfo,&ds3);
+                { VkDescriptorBufferInfo bA={g_attnA.buf,aByteOff,cxAPerBatch},bV={g_attnV.buf,0,cxKvBytes},bO={g_attnO.buf,qByteOff,qPerBatchBytes};
+                  VkWriteDescriptorSet w[3]={};for(int i=0;i<3;i++){w[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;w[i].dstSet=ds3;w[i].dstBinding=(uint32_t)i;w[i].descriptorCount=1;w[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;}
+                  w[0].pBufferInfo=&bA;w[1].pBufferInfo=&bV;w[2].pBufferInfo=&bO;vkUpdateDescriptorSets(g_vk.device,3,w,0,nullptr); }
+                vkCmdBindPipeline(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_out.pipeline);
+                vkCmdBindDescriptorSets(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_out.layout,0,1,&ds3,0,nullptr);
+                PC_AttnOut pc3={bq,cx_Mkv,test_H,test_D};
+                vkCmdPushConstants(g_lnCmdBuf,g_vk.attn_out.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pc3),&pc3);
+                vkCmdDispatch(g_lnCmdBuf,bq*test_H,1,1);
+                if (batch < 7) {
+                    VkMemoryBarrier mb={};mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;vkCmdPipelineBarrier(g_lnCmdBuf,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,nullptr,0,nullptr);
+                }
+            }
+        }
+        // Final host-read barrier
+        { VkMemoryBarrier mb={};mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;mb.dstAccessMask=VK_ACCESS_HOST_READ_BIT;vkCmdPipelineBarrier(g_lnCmdBuf,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&mb,0,nullptr,0,nullptr); }
+
+        if (vkEndCommandBuffer(g_lnCmdBuf) != VK_SUCCESS) {
+            LOGE("3b-iii: end failed"); return false;
+        }
+        vkResetFences(g_vk.device, 1, &g_vk.stepFence);
+        VkSubmitInfo submit = {};
+        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &g_lnCmdBuf;
+        if (vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.stepFence) != VK_SUCCESS) {
+            LOGE("3b-iii: submit failed"); return false;
+        }
+        vkWaitForFences(g_vk.device, 1, &g_vk.stepFence, VK_TRUE, UINT64_MAX);
+
+        // Check batch 0 and batch 7 output
+        uint16_t o0 = ((uint16_t*)g_attnO.mapped)[0];
+        uint16_t o7 = ((uint16_t*)g_attnO.mapped)[7 * bq * test_H * test_D];
+        bool has_nan = false;
+        for (uint32_t i = 0; i < test_Mq * test_H * test_D; i++) {
+            uint16_t h = ((uint16_t*)g_attnO.mapped)[i];
+            if ((h & 0x7C00) == 0x7C00 && (h & 0x3FF)) { has_nan = true; break; }
+        }
+        LOGI("3b-iv self+cross 2×8-batch PASS — O[0]=0x%04x O[448]=0x%04x has_nan=%d (48 dispatches)",
+             o0, o7, (int)has_nan);
+    }
+#endif
+    g_init = true;
+    return true;
+}
+
+// Set flag to skip attention pre-recording during init (for bisect testing).
+void dit_set_skip_attn_precord(void) { g_skip_attn_precord = true; }
+
+// Bisect helper: pre-record N attention blocks into cmd_attn[0..N-1] via descPool2,
+// then submit cmd[0] to check if GPU descriptor binding state is still valid.
+// Returns true if cmd[0] submit succeeds, false if it fails.
+bool dit_test_attn_precord(int n_blocks) {
+    if (!g_init || n_blocks < 1 || n_blocks > 28) {
+        LOGE("bisect: bad args (init=%d n=%d)", (int)g_init, n_blocks);
+        return false;
+    }
+
+    // Free any previously allocated descPool2 sets from prior bisect iteration
+    vkResetDescriptorPool(g_vk.device, g_vk.descPool2, 0);
+    LOGI("bisect: descPool2 reset, pre-recording %d attention blocks...", n_blocks);
+
+    float attn_scale = 1.0f / sqrtf(128.0f);
+    auto savedPool = g_vk.descPool;
+    g_vk.descPool = g_vk.descPool2;
+
+    for (int i = 0; i < n_blocks; i++) {
+        VkCommandBufferBeginInfo bi = {};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        if (vkBeginCommandBuffer(g_vk.cmd_attn[i], &bi) != VK_SUCCESS) {
+            LOGE("bisect: Begin cmd_attn[%d] failed", i);
+            g_vk.descPool = savedPool;
+            return false;
+        }
+
+        RC rc; memset(&rc, 0, sizeof(rc));
+        rc.vk = &g_vk; rc.cmd = g_vk.cmd_attn[i]; rc.weights = &g_weights;
+        rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
+        rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
+        rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf;
+        rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
+
+        rc.record_attn_3pass(g_tQ, g_t1, g_rBuf, g_attnA, g_attnO,
+                             512, 1024, 16, 128, attn_scale);
+
+        if (vkEndCommandBuffer(g_vk.cmd_attn[i]) != VK_SUCCESS) {
+            LOGE("bisect: End cmd_attn[%d] failed", i);
+            g_vk.descPool = savedPool;
+            return false;
+        }
+    }
+    g_vk.descPool = savedPool;
+    LOGI("bisect: %d attention blocks pre-recorded (%d descriptor sets from descPool2)",
+         n_blocks, n_blocks * 24);
+
+    // ── Test: submit cmd[0] with dummy input, check if GPU accepts it ──
+    // Fill xBuf with fp16(1.0) as safe test input
+    uint16_t* x = (uint16_t*)g_xBuf.mapped;
+    for (uint32_t j = 0; j < MS * D; j++) x[j] = 0x3C00;
+
+    vkResetFences(g_vk.device, 1, &g_vk.stepFence);
+    VkSubmitInfo submit = {};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &g_vk.cmd[0];
+
+    VkResult sr = vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.stepFence);
+    if (sr != VK_SUCCESS) {
+        LOGE("bisect: cmd[0] submit FAILED with %d attention blocks (VkResult=%d)",
+             n_blocks, (int)sr);
+        return false;
+    }
+
+    vkWaitForFences(g_vk.device, 1, &g_vk.stepFence, VK_TRUE, UINT64_MAX);
+
+    // Quick scan for NaN in output
+    uint16_t* out = (uint16_t*)g_outBuf.mapped;
+    int nan_cnt = 0;
+    for (uint32_t j = 0; j < MS * D; j++) {
+        uint16_t h = out[j];
+        if ((h & 0x7C00) == 0x7C00 && (h & 0x3FF)) nan_cnt++;
+    }
+    LOGI("bisect: cmd[0] submit OK with %d attention blocks, output nan=%d",
+         n_blocks, nan_cnt);
+    return true;
+}
+
+// ── Merged attention test: re-record n_blocks with real attention in cmd[i] ──
+// Overwrites the skip-attn pre-recorded cmd buffers.
+// Returns true if all n_blocks recorded successfully.
+bool dit_record_blocks_with_attn(int n_blocks) {
+    if (!g_init || n_blocks < 1 || n_blocks > 28) {
+        LOGE("record_blocks_attn: bad arg n=%d init=%d", n_blocks, (int)g_init);
+        return false;
+    }
+    LOGI("Re-recording %d blocks with real attention (merged into cmd[i])...", n_blocks);
+
+    for (int i = 0; i < n_blocks; i++) {
+        VkCommandBufferBeginInfo bi = {};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        if (vkBeginCommandBuffer(g_vk.cmd[i], &bi) != VK_SUCCESS) {
+            LOGE("Begin cmd[%d] failed", i); return false;
+        }
+
+        RC rc; memset(&rc, 0, sizeof(rc));
+        rc.vk = &g_vk; rc.cmd = g_vk.cmd[i]; rc.weights = &g_weights;
+        rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
+        rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
+        rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf;
+        rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
+
+        record_one_block(rc, i, *rc.xBuf, *rc.outBuf, true);
+
+        if (vkEndCommandBuffer(g_vk.cmd[i]) != VK_SUCCESS) {
+            LOGE("End cmd[%d] failed", i); return false;
+        }
+    }
+    LOGI("All %d blocks re-recorded with merged attention", n_blocks);
+    return true;
+}
+
+// Forward: submit only cmd[i] (attention already merged in, no separate cmd_attn).
+// Otherwise identical to dit_forward_nblocks.
+bool dit_forward_merged(void* x_data, void* t_emb_data, void* ctx_data, void* out_data,
+                         int _MS, int _D, int _M, int _Nctx, int _CtxD, int _nblocks) {
+    if (!g_init) return false;
+    int nblocks = _nblocks;
+    if (nblocks <= 0 || nblocks > 28) nblocks = 28;
+    MS = (uint32_t)_MS; M = (uint32_t)_M; S = MS / M;
+    size_t xBytes = MS * D * 2;
+    size_t tBytes = M * D * 2;
+    size_t ctxBytes = M * (uint32_t)_Nctx * (uint32_t)_CtxD * 2;
+
+    memcpy(g_xBuf.mapped, x_data, xBytes);
+    if (t_emb_data) memcpy(g_tEmbBuf.mapped, t_emb_data, tBytes);
+    if (ctx_data) memcpy(g_ctxBuf.mapped, ctx_data, ctxBytes);
+
+    LOGI("Forward merged: min=%.1f max=%.1f",
+         ((float*)((uint16_t*)g_xBuf.mapped))[0],  // approximate first value
+         ((float*)((uint16_t*)g_xBuf.mapped))[MS*D-1]);
+
+    for (int i = 0; i < nblocks; i++) {
+        vkResetFences(g_vk.device, 1, &g_vk.fence);
+        VkSubmitInfo submit = {};
+        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &g_vk.cmd[i];
+        VkResult sr = vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.fence);
+        if (sr != VK_SUCCESS) {
+            LOGE("Submit cmd[%d] failed (VkResult=%d)", i, (int)sr);
+            return false;
+        }
+        vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+
+        // Diagnostic: scan block output
+        uint16_t* out = (uint16_t*)g_outBuf.mapped;
+        float fmin = 1e30f, fmax = -1e30f;
+        int nan_cnt = 0;
+        for (uint32_t j = 0; j < MS * D; j++) {
+            uint16_t h = out[j];
+            uint32_t exp  = (h >> 10) & 0x1f;
+            uint32_t mant = h & 0x3ff;
+            float val;
+            if (exp == 0) { val = 0.0f; if (mant != 0) val = ldexpf((float)mant, -24); }
+            else if (exp == 31) { if (mant != 0) { nan_cnt++; continue; } else continue; }
+            else { val = ldexpf((float)(mant | 0x400), (int)exp - 25); }
+            if (h & 0x8000) val = -val;
+            if (val < fmin) fmin = val;
+            if (val > fmax) fmax = val;
+        }
+        LOGI("Block %d/%d: min=%.1f max=%.1f nan=%d", i, nblocks, fmin, fmax, nan_cnt);
+        memcpy(g_xBuf.mapped, g_outBuf.mapped, xBytes);
+    }
+
+    memcpy(out_data, g_outBuf.mapped, xBytes);
+    return true;
+}
+
+// Compute t_emb and lora on CPU from sigma, replace PC pre-compute entirely.
+// Reads t_embedder weights from loaded weight buffers, writes results to
+// g_tEmbBuf (t_emb) and g_loraBuf (lora [3,M,D]). ~0.5ms on Adreno A710.
+bool dit_compute_timestep(float sigma) {
+    if (!g_init) return false;
+
+    // ---- 1. sinusoidal embedding: [M, D] ----
+    auto ws = g_weights.find("t_embedder.1.linear_2.weight");
+    if (ws == g_weights.end()) { LOGE("t_embedder weights not found"); return false; }
+    auto w_ln_it = g_weights.find("t_embedding_norm.weight");
+    if (w_ln_it == g_weights.end()) { LOGE("t_embedding_norm not found"); return false; }
+
+    uint32_t halfD = D / 2u;  // 1024
+    uint32_t D3 = 3u * D;     // 6144
+
+    // Read t_embedder weights from GPU mapped buffers (fp16 → fp32)
+    auto load_f32 = [](const Buffer& buf, size_t n) {
+        std::vector<float> out(n);
+        const uint16_t* src = (const uint16_t*)buf.mapped;
+        for (size_t i = 0; i < n; i++) {
+            // fp16 to fp32 manually
+            uint32_t h = src[i];
+            uint32_t sign = (h >> 15) & 1;
+            uint32_t exp  = (h >> 10) & 0x1f;
+            uint32_t mant = h & 0x3ff;
+            uint32_t f32;
+            if (exp == 0) {
+                if (mant == 0) f32 = sign << 31;
+                else { /* subnormal — approximate to zero */ f32 = sign << 31; }
+            } else if (exp == 31) {
+                f32 = (sign << 31) | 0x7f800000 | (mant << 13);  // NaN/Inf
+            } else {
+                f32 = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+            }
+            out[i] = *(float*)&f32;
+        }
+        return out;
+    };
+
+    // Weight shapes: w1 = [D, D] = [2048, 2048], w2 = [3*D, D] = [6144, 2048]
+    size_t w1_n = (size_t)D * D;
+    size_t w2_n = (size_t)D3 * D;
+    size_t w_ln_n = D;
+
+    // Get weights — need linear_1 too
+    auto w1_it = g_weights.find("t_embedder.1.linear_1.weight");
+    auto w2_it = g_weights.find("t_embedder.1.linear_2.weight");
+    if (w1_it == g_weights.end() || w2_it == g_weights.end()) {
+        LOGE("t_embedder weights missing"); return false;
+    }
+
+    std::vector<float> w1 = load_f32(w1_it->second.buf, w1_n);
+    std::vector<float> w2 = load_f32(w2_it->second.buf, w2_n);
+    std::vector<float> w_ln = load_f32(w_ln_it->second.buf, w_ln_n);
+
+    // ---- 2. sinusoidal embedding [M, D] ----
+    std::vector<float> sin_emb(M * D);
+    double log10000 = log(10000.0);
+    for (uint32_t b = 0; b < M; b++) {
+        float* row = &sin_emb[b * D];
+        for (uint32_t j = 0; j < halfD; j++) {
+            double freq = sigma * exp(-log10000 * (double)j / (double)halfD);
+            row[j] = (float)cos(freq);
+            row[halfD + j] = (float)sin(freq);
+        }
+    }
+
+    // ---- 3. t_emb = RMSNorm(sinusoidal, w_ln, eps=1e-6) ----
+    for (uint32_t b = 0; b < M; b++) {
+        float* row = &sin_emb[b * D];
+        double sq_sum = 0.0;
+        for (uint32_t i = 0; i < D; i++) sq_sum += (double)row[i] * row[i];
+        double rms = sqrt(sq_sum / (double)D + 1e-6);
+        uint16_t* out = (uint16_t*)g_tEmbBuf.mapped + b * D;
+        for (uint32_t i = 0; i < D; i++) {
+            float val = (float)((double)row[i] * (double)w_ln[i] / rms);
+            // fp32 → fp16 (simple rounding)
+            uint32_t bits = *(uint32_t*)&val;
+            uint32_t sign16 = (bits >> 16) & 0x8000;
+            uint32_t exp32 = (bits >> 23) & 0xff;
+            uint32_t mant32 = bits & 0x7fffff;
+            uint32_t half;
+            if (exp32 == 0) { half = sign16; }
+            else if (exp32 >= 143) { half = sign16 | 0x7c00; }  // overflow → inf
+            else if (exp32 <= 112) { half = sign16; }
+            else {
+                uint32_t exp16 = exp32 - 112;
+                half = sign16 | (exp16 << 10) | ((mant32 + 0x1000) >> 13);
+            }
+            out[i] = (uint16_t)half;
+        }
+    }
+
+    // ---- 4. h = SiLU(sin_emb @ w1^T) ----
+    std::vector<float> h1(M * D);
+    for (uint32_t b = 0; b < M; b++) {
+        for (uint32_t o = 0; o < D; o++) {
+            double sum = 0.0;
+            const float* w1_row = &w1[o * D];
+            const float* in_row = &sin_emb[b * D];
+            for (uint32_t k = 0; k < D; k++) sum += (double)in_row[k] * w1_row[k];
+            float x = (float)sum;
+            h1[b * D + o] = x / (1.0f + expf(-x));  // SiLU
+        }
+    }
+    // Save h1 for debug comparison
+    g_debug_h1 = h1;  // copy to global
+
+    // ---- 5. lora = h1 @ w2^T → [M, 3D] → chunk → [3, M, D] ----
+    // Diagnostic: log first 5 w2 values at rows 0, 2048, 4096
+    LOGI("w2 diag: row0[0]=%.6f row0[2047]=%.6f row2048[0]=%.6f row2048[2047]=%.6f row4096[0]=%.6f",
+         w2[0], w2[2047], w2[2048*D], w2[2048*D+2047], w2[4096*D]);
+    LOGI("w2 sizes: w2_n=%zu buf.size=%zu", w2_n, w2_it->second.buf.size);
+    uint16_t* lora_out = (uint16_t*)g_loraBuf.mapped;
+    for (uint32_t b = 0; b < M; b++) {
+        for (uint32_t o = 0; o < D3; o++) {
+            double sum = 0.0;
+            const float* w2_row = &w2[o * D];
+            const float* in_row = &h1[b * D];
+            for (uint32_t k = 0; k < D; k++) sum += (double)in_row[k] * w2_row[k];
+            // Diag: check specific rows
+            if (b == 0 && (o == 0 || o == 2048 || o == 4096)) {
+                double partial = 0.0;
+                for (uint32_t k = 0; k < 5; k++) partial += (double)in_row[k] * w2_row[k];
+                LOGI("lora b=%u o=%u: h1[0..4]=[%.4f,%.4f,%.4f,%.4f,%.4f] w2[0..4]=[%.4f,%.4f,%.4f,%.4f,%.4f] partial=%.6f total=%.6f",
+                     b, o, in_row[0], in_row[1], in_row[2], in_row[3], in_row[4],
+                     w2_row[0], w2_row[1], w2_row[2], w2_row[3], w2_row[4], partial, sum);
+            }
+            float val = (float)sum;
+            // fp32 → fp16
+            uint32_t bits = *(uint32_t*)&val;
+            uint32_t sign16 = (bits >> 16) & 0x8000;
+            uint32_t exp32 = (bits >> 23) & 0xff;
+            uint32_t mant32 = bits & 0x7fffff;
+            uint32_t half;
+            if (exp32 == 0) { half = sign16; }
+            else if (exp32 >= 143) { half = sign16 | 0x7c00; }
+            else if (exp32 <= 112) { half = sign16; }
+            else {
+                uint32_t exp16 = exp32 - 112;
+                half = sign16 | (exp16 << 10) | ((mant32 + 0x1000) >> 13);
+            }
+            // Layout: [3, M, D] — component-major (shift/scale/gate each [M,D] contiguous)
+            // AdaLN shader reads shift@0, scale@M*D*2, gate@2*M*D*2
+            uint32_t comp = o / D;  // 0=shift, 1=scale, 2=gate
+            uint32_t col  = o % D;
+            lora_out[comp * M * D + b * D + col] = (uint16_t)half;
+        }
+    }
+
+    return true;
+}
+
+void dit_write_lora(void* data) {
+    if (!g_init) return;
+    memcpy(g_loraBuf.mapped, data, 3 * M * D * 2);
+}
+
+bool dit_forward(void* x_data, void* t_emb_data, void* ctx_data, void* out_data,
+                  int _MS, int _D, int _M, int _Nctx, int _CtxD) {
+    if (!g_init) return false;
+    S = (uint32_t)_MS / (uint32_t)_M;
+    MS = (uint32_t)_MS; M = (uint32_t)_M;
+
+    size_t xBytes = MS * _D * 2;
+    size_t tBytes = M * _D * 2;
+    size_t ctxBytes = M * (uint32_t)_Nctx * (uint32_t)_CtxD * 2;
+    size_t outBytes = MS * _D * 2;
+
+    memcpy(g_xBuf.mapped, x_data, xBytes);
+    memcpy(g_tEmbBuf.mapped, t_emb_data, tBytes);
+    memcpy(g_ctxBuf.mapped, ctx_data, ctxBytes);
+
+    vkResetFences(g_vk.device, 1, &g_vk.fence);
+
+    VkSubmitInfo submit = {};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &g_vk.cmd[0];
+
+    if (vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.fence) != VK_SUCCESS) {
+        LOGE("Queue submit failed"); return false;
+    }
+    vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+
+    memcpy(out_data, g_outBuf.mapped, outBytes);
+    return true;
+}
+
+bool dit_record_gemm_test(const char* weight_name, uint32_t Mv, uint32_t Nv, uint32_t Kv) {
+    if (!g_init) { LOGE("Not initialized"); return false; }
+    if (g_weights.find(weight_name) == g_weights.end()) {
+        LOGE("Weight not found: %s", weight_name); return false;
+    }
+    LOGI("GEMM test: %s M=%u N=%u K=%u", weight_name, Mv, Nv, Kv);
+
+    VkCommandBufferBeginInfo begin = {};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(g_vk.cmd[0], &begin) != VK_SUCCESS) return false;
+
+    RC rc; memset(&rc, 0, sizeof(rc));
+    rc.vk = &g_vk; rc.cmd = g_vk.cmd[0]; rc.weights = &g_weights;
+    rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
+    rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
+    rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf; rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
+
+    rc.dispatch_gemm(*rc.xBuf, weight_name, Mv, Nv, Kv, *rc.outBuf);
+
+    if (vkEndCommandBuffer(g_vk.cmd[0]) != VK_SUCCESS) return false;
+    LOGI("GEMM test recorded");
+    return true;
+}
+
+bool dit_record_oneshot(void) {
+    if (!g_init) { LOGE("dit_record_oneshot: not initialized"); return false; }
+
+    VkCommandBufferBeginInfo begin = {};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(g_vk.cmd[0], &begin) != VK_SUCCESS) return false;
+
+    RC rc; memset(&rc, 0, sizeof(rc));
+    rc.vk = &g_vk; rc.cmd = g_vk.cmd[0]; rc.weights = &g_weights;
+    rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
+    rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
+    rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf; rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
+
+    rc.dispatch_layernorm(*rc.xBuf, *rc.outBuf, MS, D, 1e-6f);
+
+    if (vkEndCommandBuffer(g_vk.cmd[0]) != VK_SUCCESS) return false;
+    LOGI("Command buffer recorded (layernorm test, %u rows)", MS);
+    return true;
+}
+
+bool dit_record_self_attn(int blockIdx) {
+    // Record a simplified self-attention path for one block:
+    // LN → Q_proj → K_proj → V_proj → Q_norm → K_norm → RoPE_Q → RoPE_K → Attn → O_proj
+    if (!g_init) { LOGE("Not initialized"); return false; }
+    char q_w[128], k_w[128], v_w[128], o_w[128];
+    snprintf(q_w, sizeof(q_w), "blocks.%d.self_attn.q_proj.weight", blockIdx);
+    snprintf(k_w, sizeof(k_w), "blocks.%d.self_attn.k_proj.weight", blockIdx);
+    snprintf(v_w, sizeof(v_w), "blocks.%d.self_attn.v_proj.weight", blockIdx);
+    snprintf(o_w, sizeof(o_w), "blocks.%d.self_attn.output_proj.weight", blockIdx);
+
+    VkCommandBufferBeginInfo begin = {};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(g_vk.cmd[0], &begin) != VK_SUCCESS) return false;
+
+    RC rc; memset(&rc, 0, sizeof(rc));
+    rc.vk = &g_vk; rc.cmd = g_vk.cmd[0]; rc.weights = &g_weights;
+    rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
+    rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
+    rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf; rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
+
+    rc.dispatch_layernorm(*rc.xBuf, *rc.nBuf, MS, D, 1e-6f);
+    rc.dispatch_gemm(*rc.nBuf, q_w, MS, D, D, *rc.tQ);
+    rc.dispatch_gemm(*rc.nBuf, k_w, MS, D, D, *rc.tK);
+    rc.dispatch_gemm(*rc.nBuf, v_w, MS, D, D, *rc.tV);
+
+    // Q/K norms: RMSNorm per head (n_rows=MS*16=8192, n_elems=head_dim=128)
+    char qn_w[128], kn_w[128];
+    snprintf(qn_w, sizeof(qn_w), "blocks.%d.self_attn.q_norm.weight", blockIdx);
+    snprintf(kn_w, sizeof(kn_w), "blocks.%d.self_attn.k_norm.weight", blockIdx);
+    uint32_t ph = MS * N_HEADS;  // per_head_rows = 512*16 = 8192
+    rc.dispatch_rmsnorm(*rc.tQ, qn_w, *rc.tQ, ph, HEAD_DIM, 1e-6f);
+    rc.dispatch_rmsnorm(*rc.tK, kn_w, *rc.tK, ph, HEAD_DIM, 1e-6f);
+
+    // O proj: skip attention for now, just project V as a test
+    // V is already [MS, D] flat, treat as "attention output"
+    rc.dispatch_gemm(*rc.tV, o_w, MS, D, D, *rc.outBuf);
+
+    if (vkEndCommandBuffer(g_vk.cmd[0]) != VK_SUCCESS) return false;
+    LOGI("Self-attn (Q/K/V/O+norms) block %d recorded", blockIdx);
+    return true;
+}
+
+// Buffer upload helpers for pre-computed CPU data
+// buf_id: 0=xBuf, 1=tEmbBuf, 2=ctxBuf, 3=outBuf, 4=bcastScale, 5=bcastShift, 6=bcastGate
+bool dit_write_buf(int buf_id, void* data, size_t size) {
+    if (!g_init) return false;
+    Buffer* bufs[] = { &g_xBuf, &g_tEmbBuf, &g_ctxBuf, &g_outBuf,
+                       &g_bcBuf /*scale*/, &g_aBuf /*shift*/, &g_gBuf /*gate*/, &g_nBuf };
+    if (buf_id < 0 || buf_id >= 8) return false;
+    Buffer* b = bufs[buf_id];
+    if (size > b->size) size = b->size;
+    memcpy(b->mapped, data, size);
+    return true;
+}
+
+bool dit_read_buf(int buf_id, void* out, size_t size) {
+    if (!g_init) return false;
+    Buffer* bufs[] = { &g_xBuf, &g_tEmbBuf, &g_ctxBuf, &g_outBuf,
+                       &g_bcBuf, &g_aBuf, &g_gBuf, &g_nBuf, &g_loraBuf };
+    if (buf_id < 0 || buf_id >= 9) return false;
+    Buffer* b = bufs[buf_id];
+    if (size > b->size) size = b->size;
+    memcpy(out, b->mapped, size);
+    return true;
+}
+
+// GPU adaln test: record just self-attn adaln into cmd[0], writes to bcBuf[0..2]
+bool dit_record_adaln_gpu_test(int blockIdx) {
+    if (!g_init) { LOGE("Not initialized"); return false; }
+    char w0[128], w2[128];
+    snprintf(w0, sizeof(w0), "blocks.%d.adaln_modulation_self_attn.1.weight", blockIdx);
+    snprintf(w2, sizeof(w2), "blocks.%d.adaln_modulation_self_attn.2.weight", blockIdx);
+
+    VkCommandBufferBeginInfo begin = {};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(g_vk.cmd[0], &begin) != VK_SUCCESS) return false;
+
+    RC rc; memset(&rc, 0, sizeof(rc));
+    rc.vk = &g_vk; rc.cmd = g_vk.cmd[0]; rc.weights = &g_weights;
+    rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
+    rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
+    rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf;
+    rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
+
+    rc.adaln_gpu(w0, w2, 0);  // writes to bcBuf[0,1,2]
+
+    if (vkEndCommandBuffer(g_vk.cmd[0]) != VK_SUCCESS) return false;
+    LOGI("GPU adaln recorded for block %d", blockIdx);
+    return true;
+}
+
+bool dit_record_mlp(int blockIdx) {
+    // MLP: LN → fc1(2048→8192) → SiLU → fc2(8192→2048)
+    if (!g_init) { LOGE("Not initialized"); return false; }
+    char l1_w[128], l2_w[128];
+    snprintf(l1_w, sizeof(l1_w), "blocks.%d.mlp.layer1.weight", blockIdx);
+    snprintf(l2_w, sizeof(l2_w), "blocks.%d.mlp.layer2.weight", blockIdx);
+
+    VkCommandBufferBeginInfo begin = {};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(g_vk.cmd[0], &begin) != VK_SUCCESS) return false;
+
+    RC rc; memset(&rc, 0, sizeof(rc));
+    rc.vk = &g_vk; rc.cmd = g_vk.cmd[0]; rc.weights = &g_weights;
+    rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
+    rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
+    rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf; rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
+
+    rc.dispatch_layernorm(*rc.xBuf, *rc.nBuf, MS, D, 1e-6f);
+    rc.dispatch_gemm(*rc.nBuf, l1_w, MS, MLP_HIDDEN, D, *rc.t1);
+    rc.dispatch_silu(*rc.t1, *rc.t1, MS * MLP_HIDDEN);
+    rc.dispatch_gemm(*rc.t1, l2_w, MS, D, MLP_HIDDEN, *rc.outBuf);
+
+    if (vkEndCommandBuffer(g_vk.cmd[0]) != VK_SUCCESS) return false;
+    LOGI("MLP block %d recorded (LN+fc1+SiLU+fc2)", blockIdx);
+    return true;
+}
+
+bool dit_record_self_attn_full(int blockIdx) {
+    // Self-attention with pre-uploaded AdaLN data (scale in bcBuf, shift in aBuf, gate in gBuf)
+    // Path: LN → AdaLN apply → Q/K/V proj → Q/K norms → V→O proj → gate+residual
+    if (!g_init) { LOGE("Not initialized"); return false; }
+    char qw[128], kw[128], vw[128], ow[128], qnw[128], knw[128];
+    snprintf(qw, sizeof(qw), "blocks.%d.self_attn.q_proj.weight", blockIdx);
+    snprintf(kw, sizeof(kw), "blocks.%d.self_attn.k_proj.weight", blockIdx);
+    snprintf(vw, sizeof(vw), "blocks.%d.self_attn.v_proj.weight", blockIdx);
+    snprintf(ow, sizeof(ow), "blocks.%d.self_attn.output_proj.weight", blockIdx);
+    snprintf(qnw, sizeof(qnw), "blocks.%d.self_attn.q_norm.weight", blockIdx);
+    snprintf(knw, sizeof(knw), "blocks.%d.self_attn.k_norm.weight", blockIdx);
+
+    VkCommandBufferBeginInfo begin = {};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(g_vk.cmd[0], &begin) != VK_SUCCESS) return false;
+
+    RC rc; memset(&rc, 0, sizeof(rc));
+    rc.vk = &g_vk; rc.cmd = g_vk.cmd[0]; rc.weights = &g_weights;
+    rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
+    rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
+    rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf; rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
+
+    // 1. LayerNorm(x) → nBuf
+    rc.dispatch_layernorm(*rc.xBuf, *rc.nBuf, MS, D, 1e-6f);
+
+    // 2. AdaLN apply: nBuf * scale + shift → nBuf
+    //    bcBuf layout: [scale_bcast (MS*D) | shift_bcast (MS*D) | gate_bcast (MS*D)]
+    size_t scaleOff = 0;
+    size_t shiftOff = MS * D * 2;       // after scale
+    size_t gateOff  = MS * D * 2 * 2;   // after scale+shift
+    rc.dispatch_scale_shift(*rc.nBuf, *rc.bcBuf, scaleOff, *rc.bcBuf, shiftOff,
+                            *rc.nBuf, MS * D, 1, 1);
+
+    // 3. Q/K/V proj from nBuf
+    rc.dispatch_gemm(*rc.nBuf, qw, MS, D, D, *rc.tQ);
+    rc.dispatch_gemm(*rc.nBuf, kw, MS, D, D, *rc.tK);
+    rc.dispatch_gemm(*rc.nBuf, vw, MS, D, D, *rc.tV);
+
+    // 4. Q/K norms
+    uint32_t ph = MS * N_HEADS;
+    rc.dispatch_rmsnorm(*rc.tQ, qnw, *rc.tQ, ph, HEAD_DIM, 1e-6f);
+    rc.dispatch_rmsnorm(*rc.tK, knw, *rc.tK, ph, HEAD_DIM, 1e-6f);
+
+    // 5. Skip attention — use V directly as "attention output"
+    //    O_proj: V → [MS, D]
+    rc.dispatch_gemm(*rc.tV, ow, MS, D, D, *rc.tO);
+
+    // 6. Gate + residual → outBuf: out = x + gate * attn_out
+    //    ScaleShift: tO * gate(bcBuf[gateOff:]) + xBuf → outBuf
+    rc.dispatch_scale_shift(*rc.tO, *rc.bcBuf, gateOff, *rc.xBuf, 0, *rc.outBuf, MS * D, 1, 1);
+
+    if (vkEndCommandBuffer(g_vk.cmd[0]) != VK_SUCCESS) return false;
+    LOGI("Self-attn full block %d recorded (LN+AdaLN+QKV+norms+V→O+gate)", blockIdx);
+    return true;
+}
+
+bool dit_record_adaln_only(void) {
+    // Minimal test: LN → AdaLN apply (no QKV, no norms)
+    // bcBuf layout: [scale_bcast (MS*D) | shift_bcast (MS*D)]
+    if (!g_init) { LOGE("Not initialized"); return false; }
+    size_t scaleOff = 0, shiftOff = MS * D * 2;
+
+    VkCommandBufferBeginInfo begin = {};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(g_vk.cmd[0], &begin) != VK_SUCCESS) return false;
+
+    RC rc; memset(&rc, 0, sizeof(rc));
+    rc.vk = &g_vk; rc.cmd = g_vk.cmd[0]; rc.weights = &g_weights;
+    rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
+    rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
+    rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf; rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
+
+    rc.dispatch_layernorm(*rc.xBuf, *rc.nBuf, MS, D, 1e-6f);
+    rc.dispatch_scale_shift(*rc.nBuf, *rc.bcBuf, scaleOff, *rc.bcBuf, shiftOff,
+                            *rc.outBuf, MS * D, 1, 1);
+
+    if (vkEndCommandBuffer(g_vk.cmd[0]) != VK_SUCCESS) return false;
+    LOGI("AdaLN-only recorded (LN+ScaleShift)");
+    return true;
+}
+
+bool dit_record_adaln_gemm(int blockIdx) {
+    // LN + AdaLN apply + Q_proj only
+    // bcBuf: [scale_bcast (MS*D) | shift_bcast (MS*D)]
+    if (!g_init) return false;
+    size_t scaleOff = 0, shiftOff = MS * D * 2;
+    char qw[128]; snprintf(qw, sizeof(qw), "blocks.%d.self_attn.q_proj.weight", blockIdx);
+
+    VkCommandBufferBeginInfo begin = {};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(g_vk.cmd[0], &begin) != VK_SUCCESS) return false;
+
+    RC rc; memset(&rc, 0, sizeof(rc));
+    rc.vk = &g_vk; rc.cmd = g_vk.cmd[0]; rc.weights = &g_weights;
+    rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
+    rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
+    rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf; rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
+
+    rc.dispatch_layernorm(*rc.xBuf, *rc.nBuf, MS, D, 1e-6f);
+    rc.dispatch_scale_shift(*rc.nBuf, *rc.bcBuf, scaleOff, *rc.bcBuf, shiftOff,
+                            *rc.nBuf, MS * D, 1, 1);
+    rc.dispatch_gemm(*rc.nBuf, qw, MS, D, D, *rc.outBuf);
+
+    if (vkEndCommandBuffer(g_vk.cmd[0]) != VK_SUCCESS) return false;
+    LOGI("AdaLN+GEMM recorded");
+    return true;
+}
+
+bool dit_record_block_full(int blockIdx) {
+    // Full block: self-attn → MLP (skip cross-attn for now)
+    // Buffer pipeline: nBuf=scratch, tQ/K/V=QKV, tO=attn_out, t1=residual_x, then tQ=fc1_out
+    // bcBuf layout: [0]scale_self [1]shift_self [2]gate_self [3]scale_mlp [4]shift_mlp [5]gate_mlp
+    if (!g_init) return false;
+    auto adaln_off = [](int section, int comp) -> size_t {
+        return (size_t)(section * 3 + comp) * MS * D * 2;
+    };
+    int b = blockIdx;
+    char qw[128],kw[128],vw[128],ow[128],qnw[128],knw[128],l1w[128],l2w[128];
+    snprintf(qw,sizeof(qw),"blocks.%d.self_attn.q_proj.weight",b);
+    snprintf(kw,sizeof(kw),"blocks.%d.self_attn.k_proj.weight",b);
+    snprintf(vw,sizeof(vw),"blocks.%d.self_attn.v_proj.weight",b);
+    snprintf(ow,sizeof(ow),"blocks.%d.self_attn.output_proj.weight",b);
+    snprintf(qnw,sizeof(qnw),"blocks.%d.self_attn.q_norm.weight",b);
+    snprintf(knw,sizeof(knw),"blocks.%d.self_attn.k_norm.weight",b);
+    snprintf(l1w,sizeof(l1w),"blocks.%d.mlp.layer1.weight",b);
+    snprintf(l2w,sizeof(l2w),"blocks.%d.mlp.layer2.weight",b);
+
+    VkCommandBufferBeginInfo bi = {};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(g_vk.cmd[0], &bi) != VK_SUCCESS) return false;
+
+    RC rc; memset(&rc,0,sizeof(rc));
+    rc.vk=&g_vk; rc.cmd=g_vk.cmd[0]; rc.weights=&g_weights;
+    rc.xBuf=&g_xBuf; rc.tEmbBuf=&g_tEmbBuf; rc.ctxBuf=&g_ctxBuf; rc.outBuf=&g_outBuf;
+    rc.t1=&g_t1; rc.tQ=&g_tQ; rc.tK=&g_tK; rc.tV=&g_tV; rc.tO=&g_tO;
+    rc.rBuf=&g_rBuf; rc.aBuf=&g_aBuf; rc.nBuf=&g_nBuf; rc.gBuf=&g_gBuf; rc.bcBuf=&g_bcBuf; rc.onesBuf=&g_onesBuf;
+
+    uint32_t ph = MS * N_HEADS;
+
+    // === Self-Attention ===
+    rc.dispatch_layernorm(*rc.xBuf, *rc.nBuf, MS, D, 1e-6f);
+    rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,adaln_off(0,0),*rc.bcBuf,adaln_off(0,1),
+                            *rc.nBuf, MS*D,1,1);
+    rc.dispatch_gemm(*rc.nBuf,qw,MS,D,D,*rc.tQ);
+    rc.dispatch_gemm(*rc.nBuf,kw,MS,D,D,*rc.tK);
+    rc.dispatch_gemm(*rc.nBuf,vw,MS,D,D,*rc.tV);
+    rc.dispatch_rmsnorm(*rc.tQ,qnw,*rc.tQ,ph,HEAD_DIM,1e-6f);
+    rc.dispatch_rmsnorm(*rc.tK,knw,*rc.tK,ph,HEAD_DIM,1e-6f);
+    rc.dispatch_gemm(*rc.tV,ow,MS,D,D,*rc.tO);        // tO = V @ Wo
+    // Self-attn residual → tV (reuse V buffer, no longer needed after O_proj)
+    rc.dispatch_scale_shift(*rc.tO,*rc.bcBuf,adaln_off(0,2),*rc.xBuf,0,
+                            *rc.tV, MS*D,1,1);         // tV = x + gate*attn_out
+
+    // === MLP ===
+    rc.dispatch_layernorm(*rc.tV,*rc.nBuf,MS,D,1e-6f);
+    rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,adaln_off(1,0),*rc.bcBuf,adaln_off(1,1),
+                            *rc.nBuf, MS*D,1,1);
+    rc.dispatch_gemm(*rc.nBuf,l1w,MS,MLP_HIDDEN,D,*rc.t1);     // t1(8MB) = fc1
+    rc.dispatch_gelu(*rc.t1,*rc.t1,MS*MLP_HIDDEN);  // GELU, not SiLU! (predict2 GPT2FeedForward uses nn.GELU)
+    rc.dispatch_gemm(*rc.t1,l2w,MS,D,MLP_HIDDEN,*rc.nBuf);    // nBuf = fc2
+    rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,adaln_off(1,2),*rc.tV,0,
+                            *rc.outBuf, MS*D,1,1);             // out = fc2*gate + residual(tV)
+
+    if (vkEndCommandBuffer(g_vk.cmd[0]) != VK_SUCCESS) return false;
+    LOGI("Full block %d recorded (16 dispatches)", blockIdx);
+    return true;
+}
+
+static void record_one_block(RC& rc, int b, Buffer& inBuf, Buffer& outBuf,
+                              bool real_attn) {
+    // Shared bcBuf layout: 9 components at comp * MS*D*2 (no per-block offset)
+    //   [0]=scale_self [1]=shift_self [2]=gate_self
+    //   [3]=scale_cross [4]=shift_cross [5]=gate_cross
+    //   [6]=scale_mlp [7]=shift_mlp [8]=gate_mlp
+    auto off = [&](int comp) -> size_t {
+        return (size_t)comp * MS * D * 2;
+    };
+    uint32_t ph = MS * N_HEADS;       // per-head rows for self-attn
+    uint32_t ph_cross = M * Nctx * N_HEADS;  // per-head rows for cross-attn (1024*16=16384)
+    uint32_t MS_kv = M * Nctx;        // KV tokens for cross-attn (1024)
+
+    char qw[128],kw[128],vw[128],ow[128],qnw[128],knw[128];
+    char cx_kw[128],cx_vw[128],cx_ow[128],cx_knw[128];
+    char l1w[128],l2w[128];
+    snprintf(qw,sizeof(qw),"blocks.%d.self_attn.q_proj.weight",b);
+    snprintf(kw,sizeof(kw),"blocks.%d.self_attn.k_proj.weight",b);
+    snprintf(vw,sizeof(vw),"blocks.%d.self_attn.v_proj.weight",b);
+    snprintf(ow,sizeof(ow),"blocks.%d.self_attn.output_proj.weight",b);
+    snprintf(qnw,sizeof(qnw),"blocks.%d.self_attn.q_norm.weight",b);
+    snprintf(knw,sizeof(knw),"blocks.%d.self_attn.k_norm.weight",b);
+    snprintf(cx_kw,sizeof(cx_kw),"blocks.%d.cross_attn.k_proj.weight",b);
+    snprintf(cx_vw,sizeof(cx_vw),"blocks.%d.cross_attn.v_proj.weight",b);
+    snprintf(cx_ow,sizeof(cx_ow),"blocks.%d.cross_attn.output_proj.weight",b);
+    snprintf(cx_knw,sizeof(cx_knw),"blocks.%d.cross_attn.k_norm.weight",b);
+    snprintf(l1w,sizeof(l1w),"blocks.%d.mlp.layer1.weight",b);
+    snprintf(l2w,sizeof(l2w),"blocks.%d.mlp.layer2.weight",b);
+
+    // GPU-side AdaLN for all three channels (writes to bcBuf[0..8])
+    // Weight names for block b's AdaLN modules
+    char adaln_s0[128], adaln_s2[128], adaln_c0[128], adaln_c2[128], adaln_m0[128], adaln_m2[128];
+    snprintf(adaln_s0,sizeof(adaln_s0),"blocks.%d.adaln_modulation_self_attn.1.weight",b);
+    snprintf(adaln_s2,sizeof(adaln_s2),"blocks.%d.adaln_modulation_self_attn.2.weight",b);
+    snprintf(adaln_c0,sizeof(adaln_c0),"blocks.%d.adaln_modulation_cross_attn.1.weight",b);
+    snprintf(adaln_c2,sizeof(adaln_c2),"blocks.%d.adaln_modulation_cross_attn.2.weight",b);
+    snprintf(adaln_m0,sizeof(adaln_m0),"blocks.%d.adaln_modulation_mlp.1.weight",b);
+    snprintf(adaln_m2,sizeof(adaln_m2),"blocks.%d.adaln_modulation_mlp.2.weight",b);
+
+    // Self-attn AdaLN → bcBuf[0,1,2]
+    rc.adaln_gpu(adaln_s0, adaln_s2, 0);
+    // ===== Self-attn: LN→AdaLN→QKV→norms→V→O→gate+residual → tV =====
+    rc.dispatch_layernorm(inBuf, *rc.nBuf, MS, D, 1e-6f);
+    rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,off(0),*rc.bcBuf,off(1),*rc.nBuf, MS*D,1,1);
+    rc.dispatch_gemm(*rc.nBuf,qw,MS,D,D,*rc.tQ);
+    rc.dispatch_gemm(*rc.nBuf,kw,MS,D,D,*rc.tK);
+    rc.dispatch_gemm(*rc.nBuf,vw,MS,D,D,*rc.tV);
+    rc.dispatch_rmsnorm(*rc.tQ,qnw,*rc.tQ,ph,HEAD_DIM,1e-6f);
+    rc.dispatch_rmsnorm(*rc.tK,knw,*rc.tK,ph,HEAD_DIM,1e-6f);
+    if (real_attn) {
+        // Real self-attention: QK^T + softmax + A@V (3-pass)
+        float scl = 1.0f / sqrtf((float)HEAD_DIM);
+        rc.record_attn_3pass(*rc.tQ, *rc.tK, *rc.tV, g_attnA, g_attnO,
+                             MS, MS, N_HEADS, HEAD_DIM, scl);
+        rc.dispatch_gemm(g_attnO, ow, MS, D, D, *rc.tO);
+    } else {
+        rc.dispatch_gemm(*rc.tV, ow, MS, D, D, *rc.tO);  // V→O skip
+    }
+    rc.dispatch_scale_shift(*rc.tO,*rc.bcBuf,off(2),inBuf,0,
+                            *rc.tV, MS*D,1,1);                    // tV = x + gate*self_attn
+
+    // Cross-attn AdaLN → bcBuf[3,4,5]
+    rc.adaln_gpu(adaln_c0, adaln_c2, 3);
+    // ===== Cross-attn: LN→AdaLN→Q(from x)→K/V(from ctx)→norms→O→gate+residual =====
+    rc.dispatch_layernorm(*rc.tV, *rc.nBuf, MS, D, 1e-6f);
+    rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,off(3),*rc.bcBuf,off(4),*rc.nBuf, MS*D,1,1);
+    rc.dispatch_gemm(*rc.nBuf,qw,MS,D,D,*rc.tQ);
+    rc.dispatch_gemm(*rc.ctxBuf,cx_kw,MS_kv,D,CtxD,*rc.t1);
+    rc.dispatch_gemm(*rc.ctxBuf,cx_vw,MS_kv,D,CtxD,*rc.rBuf);
+    rc.dispatch_rmsnorm(*rc.tQ,qnw,*rc.tQ,ph,HEAD_DIM,1e-6f);
+    rc.dispatch_rmsnorm(*rc.t1,cx_knw,*rc.t1,ph_cross,HEAD_DIM,1e-6f);
+    if (real_attn) {
+        // Real cross-attention: QK^T + softmax + A@V (3-pass)
+        float scl = 1.0f / sqrtf((float)HEAD_DIM);
+        rc.record_attn_3pass(*rc.tQ, *rc.t1, *rc.rBuf, g_attnA, g_attnO,
+                             MS, MS_kv, N_HEADS, HEAD_DIM, scl);
+        rc.dispatch_gemm(g_attnO, cx_ow, MS, D, D, *rc.tO);
+    } else {
+        rc.dispatch_gemm(*rc.rBuf, cx_ow, MS, D, D, *rc.tO);  // V→O skip
+    }
+    rc.dispatch_scale_shift(*rc.tO,*rc.bcBuf,off(5),*rc.tV,0,
+                            *rc.gBuf, MS*D,1,1);
+
+    // MLP AdaLN → bcBuf[6,7,8]
+    rc.adaln_gpu(adaln_m0, adaln_m2, 6);
+    // ===== MLP: LN→AdaLN→fc1→SiLU→fc2→gate+residual =====
+    rc.dispatch_layernorm(*rc.gBuf,*rc.nBuf,MS,D,1e-6f);
+    rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,off(6),*rc.bcBuf,off(7),*rc.nBuf, MS*D,1,1);
+    rc.dispatch_gemm(*rc.nBuf,l1w,MS,MLP_HIDDEN,D,*rc.t1);
+    rc.dispatch_gelu(*rc.t1,*rc.t1,MS*MLP_HIDDEN);  // GELU, not SiLU! (predict2 GPT2FeedForward uses nn.GELU)
+    rc.dispatch_gemm(*rc.t1,l2w,MS,D,MLP_HIDDEN,*rc.nBuf);
+    rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,off(8),*rc.gBuf,0,
+                            outBuf, MS*D,1,1);
+}
+
+// ============================================================
+// Per-step recording helpers (g_lnCmdBuf + stepPool, no pre-record)
+// ============================================================
+
+// Submit g_lnCmdBuf and wait. Returns true on success.
+static bool submit_segment(void) {
+    vkResetFences(g_vk.device, 1, &g_vk.stepFence);
+    VkSubmitInfo si = {};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &g_lnCmdBuf;
+    VkResult sr = vkQueueSubmit(g_vk.queue, 1, &si, g_vk.stepFence);
+    if (sr != VK_SUCCESS) {
+        LOGE("submit_segment: vkQueueSubmit failed (VkResult=%d)", (int)sr);
+        return false;
+    }
+    vkWaitForFences(g_vk.device, 1, &g_vk.stepFence, VK_TRUE, UINT64_MAX);
+    return true;
+}
+
+static VkDescriptorPool g_savedPool = VK_NULL_HANDLE;
+
+// Begin recording into g_lnCmdBuf using stepPool.
+static void begin_step_recording(RC& rc) {
+    vkResetDescriptorPool(g_vk.device, g_vk.stepPool, 0);
+    g_savedPool = g_vk.descPool;       // save
+    g_vk.descPool = g_vk.stepPool;      // swap → RC::alloc_set uses stepPool
+    VkCommandBufferBeginInfo bi = {};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    vkBeginCommandBuffer(g_lnCmdBuf, &bi);
+    rc.cmd = g_lnCmdBuf;
+}
+
+// End recording and restore descPool.
+static void end_step_recording(void) {
+    vkEndCommandBuffer(g_lnCmdBuf);
+    g_vk.descPool = g_savedPool;       // restore
+}
+
+// ── Segment A: AdaLN for all 3 channels → bcBuf[0..8] (36 dispatch) ──
+static void record_segment_adaln(RC& rc, int b) {
+    char adaln_s0[128],adaln_s2[128],adaln_c0[128],adaln_c2[128],adaln_m0[128],adaln_m2[128];
+    snprintf(adaln_s0,sizeof(adaln_s0),"blocks.%d.adaln_modulation_self_attn.1.weight",b);
+    snprintf(adaln_s2,sizeof(adaln_s2),"blocks.%d.adaln_modulation_self_attn.2.weight",b);
+    snprintf(adaln_c0,sizeof(adaln_c0),"blocks.%d.adaln_modulation_cross_attn.1.weight",b);
+    snprintf(adaln_c2,sizeof(adaln_c2),"blocks.%d.adaln_modulation_cross_attn.2.weight",b);
+    snprintf(adaln_m0,sizeof(adaln_m0),"blocks.%d.adaln_modulation_mlp.1.weight",b);
+    snprintf(adaln_m2,sizeof(adaln_m2),"blocks.%d.adaln_modulation_mlp.2.weight",b);
+
+    begin_step_recording(rc);
+    rc.adaln_gpu(adaln_s0, adaln_s2, 0);  // self  → bcBuf[0,1,2]
+    rc.adaln_gpu(adaln_c0, adaln_c2, 3);  // cross → bcBuf[3,4,5]
+    rc.adaln_gpu(adaln_m0, adaln_m2, 6);  // mlp   → bcBuf[6,7,8]
+    end_step_recording();
+}
+
+// ── Segment B1a: Self-attn pre-A (LN→AdaLN→QKV GEMM, 5 dispatch) ──
+// After submit: nBuf=modulated, tQ=Q_raw, tK=K_raw, tV=V_raw
+static void record_segment_self_pre_a(RC& rc, int b, Buffer& inBuf) {
+    auto off=[&](int c)->size_t{return (size_t)c*MS*D*2;};
+    char qw[128],kw[128],vw[128];
+    snprintf(qw,sizeof(qw),"blocks.%d.self_attn.q_proj.weight",b);
+    snprintf(kw,sizeof(kw),"blocks.%d.self_attn.k_proj.weight",b);
+    snprintf(vw,sizeof(vw),"blocks.%d.self_attn.v_proj.weight",b);
+    begin_step_recording(rc);
+    rc.dispatch_layernorm(inBuf, *rc.nBuf, MS, D, 1e-6f);
+    rc.dispatch_scale_shift(*rc.nBuf, *rc.bcBuf, off(0), *rc.bcBuf, off(1), *rc.nBuf, MS*D, 1, 1);
+    rc.dispatch_gemm(*rc.nBuf, qw, MS, D, D, *rc.tQ);
+    rc.dispatch_gemm(*rc.nBuf, kw, MS, D, D, *rc.tK);
+    rc.dispatch_gemm(*rc.nBuf, vw, MS, D, D, *rc.tV);
+    end_step_recording();
+}
+
+// ── Segment B1b: Self-attn pre-B (RMSNorm→RoPE, 4 dispatch) ──
+// After submit: tQ=Q_norm, tK=K_norm, rBuf=Q_roped, g_attnO=K_roped
+static void record_segment_self_pre_b(RC& rc, int b) {
+    uint32_t ph=MS*N_HEADS;
+    char qnw[128],knw[128];
+    snprintf(qnw,sizeof(qnw),"blocks.%d.self_attn.q_norm.weight",b);
+    snprintf(knw,sizeof(knw),"blocks.%d.self_attn.k_norm.weight",b);
+    begin_step_recording(rc);
+    rc.dispatch_rmsnorm(*rc.tQ, qnw, *rc.tQ, ph, HEAD_DIM, 1e-6f);
+    rc.dispatch_rmsnorm(*rc.tK, knw, *rc.tK, ph, HEAD_DIM, 1e-6f);
+    rc.dispatch_rope(*rc.tQ, g_ropeFreqs, *rc.rBuf, ph, HEAD_DIM);
+    rc.dispatch_rope(*rc.tK, g_ropeFreqs, g_attnO, ph, HEAD_DIM);
+    end_step_recording();
+}
+
+// ── Segment B1 (old): kept for reference, now split into B1a+B1b ──
+static void record_segment_self_pre(RC& rc, int b, Buffer& inBuf) {
+    auto off=[&](int c)->size_t{return (size_t)c*MS*D*2;};
+    uint32_t ph=MS*N_HEADS;
+
+    char qw[128],kw[128],vw[128],qnw[128],knw[128];
+    snprintf(qw,sizeof(qw),"blocks.%d.self_attn.q_proj.weight",b);
+    snprintf(kw,sizeof(kw),"blocks.%d.self_attn.k_proj.weight",b);
+    snprintf(vw,sizeof(vw),"blocks.%d.self_attn.v_proj.weight",b);
+    snprintf(qnw,sizeof(qnw),"blocks.%d.self_attn.q_norm.weight",b);
+    snprintf(knw,sizeof(knw),"blocks.%d.self_attn.k_norm.weight",b);
+
+    begin_step_recording(rc);
+    rc.dispatch_layernorm(inBuf, *rc.nBuf, MS, D, 1e-6f);
+    rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,off(0),*rc.bcBuf,off(1),*rc.nBuf,MS*D,1,1);
+    rc.dispatch_gemm(*rc.nBuf,qw,MS,D,D,*rc.tQ);
+    rc.dispatch_gemm(*rc.nBuf,kw,MS,D,D,*rc.tK);
+    rc.dispatch_gemm(*rc.nBuf,vw,MS,D,D,*rc.tV);
+    rc.dispatch_rmsnorm(*rc.tQ,qnw,*rc.tQ,ph,HEAD_DIM,1e-6f);
+    rc.dispatch_rmsnorm(*rc.tK,knw,*rc.tK,ph,HEAD_DIM,1e-6f);
+    rc.dispatch_rope(*rc.tQ, g_ropeFreqs, *rc.rBuf, ph, HEAD_DIM);
+    rc.dispatch_rope(*rc.tK, g_ropeFreqs, g_attnO, ph, HEAD_DIM);
+    end_step_recording();
+}
+
+// ── Segment B2: Self-attn attention + O_proj + gate (~11 dispatch) ──
+// Reads: rBuf=Q_roped, g_attnO=K_roped, tV=V_raw
+// Result: tV = inBuf + gate_self * self_attn_out
+// ── Segment B2: Self-attn attention + O_proj + gate (~11 dispatch) ──
+// Reads: rBuf=Q_roped, g_attnO=K_roped, tV=V_raw (must be submitted after Segment B1)
+// Result: tV = inBuf + gate_self * self_attn_out
+static void record_segment_self_attn_v2(RC& rc, int b, Buffer& inBuf) {
+    auto off=[&](int c)->size_t{return (size_t)c*MS*D*2;};
+    float scl=1.0f/sqrtf((float)HEAD_DIM);
+    uint32_t S_per = MS / M;  // 256
+
+    char ow[128];
+    snprintf(ow,sizeof(ow),"blocks.%d.self_attn.output_proj.weight",b);
+
+    begin_step_recording(rc);
+    // Per-batch self-attention with roped Q (rBuf) and K (g_attnO)
+    for (uint32_t mb = 0; mb < M; mb++) {
+        size_t q_off = mb * S_per * N_HEADS * HEAD_DIM * 2;
+        size_t kv_off = mb * S_per * N_HEADS * HEAD_DIM * 2;
+        size_t a_off = mb * S_per * N_HEADS * S_per * 2;
+        rc.record_attn_3pass(*rc.rBuf, g_attnO, *rc.tV, g_attnA, g_attnO,
+                             S_per,S_per,N_HEADS,HEAD_DIM,scl,
+                             q_off, kv_off, a_off, q_off);
+    }
+    rc.dispatch_gemm_f32out(g_attnO, ow, MS, D, D, g_fp32_tmp);  // O_proj → fp32
+    // SA gate+residual: fp32 O_proj * gate fp16 + inBuf fp16 → tV fp16
+    {
+        auto& sp = rc.vk->gate_fp32;
+        auto ds = rc.alloc_set(sp.dsl);
+        rc.bind_buf(ds, 0, g_fp32_tmp, 0, VK_WHOLE_SIZE);        // O_proj (fp32)
+        rc.bind_buf(ds, 1, *rc.bcBuf, off(2), VK_WHOLE_SIZE);    // gate (fp16)
+        rc.bind_buf(ds, 2, inBuf, 0, VK_WHOLE_SIZE);             // inBuf (fp16)
+        rc.bind_buf(ds, 3, *rc.tV, 0, VK_WHOLE_SIZE);            // out → tV (fp16)
+        vkCmdBindPipeline(rc.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.pipeline);
+        vkCmdBindDescriptorSets(rc.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sp.layout, 0, 1, &ds, 0, nullptr);
+        uint32_t n = MS * D;
+        vkCmdPushConstants(rc.cmd, sp.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(n), &n);
+        vkCmdDispatch(rc.cmd, (n + 255) / 256, 1, 1);
+        rc.barrier();
+    }
+    end_step_recording();
+}
+
+// ── Segment C1: Cross-attn pre (LN→AdaLN→Q/K/V→norms, 8 dispatch) ──
+static void record_segment_cross_pre(RC& rc, int b) {
+    auto off=[&](int c)->size_t{return (size_t)c*MS*D*2;};
+    uint32_t ph=MS*N_HEADS, ph_cross=M*Nctx*N_HEADS, MS_kv=M*Nctx;
+
+    char cx_qw[128],cx_kw[128],cx_vw[128],cx_knw[128],cx_qnw[128];
+    snprintf(cx_qw,sizeof(cx_qw),"blocks.%d.cross_attn.q_proj.weight",b);
+    snprintf(cx_knw,sizeof(cx_knw),"blocks.%d.cross_attn.k_norm.weight",b);
+    snprintf(cx_qnw,sizeof(cx_qnw),"blocks.%d.cross_attn.q_norm.weight",b);
+    snprintf(cx_kw,sizeof(cx_kw),"blocks.%d.cross_attn.k_proj.weight",b);
+    snprintf(cx_vw,sizeof(cx_vw),"blocks.%d.cross_attn.v_proj.weight",b);
+
+    begin_step_recording(rc);
+    rc.dispatch_layernorm(*rc.tV,*rc.nBuf,MS,D,1e-6f);
+    rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,off(3),*rc.bcBuf,off(4),*rc.nBuf,MS*D,1,1);
+    rc.dispatch_gemm(*rc.nBuf,cx_qw,MS,D,D,*rc.tQ);
+    rc.dispatch_gemm(*rc.ctxBuf,cx_kw,MS_kv,D,CtxD,*rc.t1);
+    rc.dispatch_gemm(*rc.ctxBuf,cx_vw,MS_kv,D,CtxD,*rc.rBuf);
+    rc.dispatch_rmsnorm(*rc.tQ,cx_qnw,*rc.tQ,ph,HEAD_DIM,1e-6f);
+    rc.dispatch_rmsnorm(*rc.t1,cx_knw,*rc.t1,ph_cross,HEAD_DIM,1e-6f);
+    end_step_recording();
+}
+
+// ── Segment C2: Cross-attn attention + O_proj + gate (~14 dispatch) ──
+static void record_segment_cross_attn(RC& rc, int b) {
+    auto off=[&](int c)->size_t{return (size_t)c*MS*D*2;};
+    uint32_t S_per = MS / M;
+    uint32_t MS_kv=M*Nctx;
+    float scl=1.0f/sqrtf((float)HEAD_DIM);
+
+    char cx_ow[128];
+    snprintf(cx_ow,sizeof(cx_ow),"blocks.%d.cross_attn.output_proj.weight",b);
+
+    begin_step_recording(rc);
+    // Per-batch cross-attention
+    for (uint32_t mb = 0; mb < M; mb++) {
+        size_t q_off = mb * S_per * N_HEADS * HEAD_DIM * 2;
+        size_t kv_off = mb * Nctx * N_HEADS * HEAD_DIM * 2;
+        size_t a_off = mb * S_per * N_HEADS * Nctx * 2;
+        rc.record_attn_3pass(*rc.tQ,*rc.t1,*rc.rBuf,g_attnA,g_attnO,
+                             S_per,Nctx,N_HEADS,HEAD_DIM,scl,
+                             q_off, kv_off, a_off, q_off);
+    }
+    rc.dispatch_gemm(g_attnO,cx_ow,MS,D,D,*rc.tO);
+    rc.dispatch_scale_shift(*rc.tO, g_gateScales, 6, g_gateScales, 2,
+                            *rc.tO, MS*D, 0, 0);  // CX O_proj *= 1/4
+    rc.dispatch_scale_shift(*rc.tO,*rc.bcBuf,off(5),*rc.tV,0,
+                            *rc.gBuf,MS*D,1,1);  // gBuf = tV + gate * attn_out
+    end_step_recording();
+}
+
+// ── Segment D: MLP (LN→AdaLN→fc1→SiLU→fc2→gate, 6 dispatch) ──
+// gBuf: cross-attn residual (input to MLP LN)
+// Result: outBuf = gBuf + gate_mlp * fc2_out
+static void record_segment_mlp(RC& rc, int b) {
+    auto off=[&](int c)->size_t{return (size_t)c*MS*D*2;};
+    char l1w[128],l2w[128];
+    snprintf(l1w,sizeof(l1w),"blocks.%d.mlp.layer1.weight",b);
+    snprintf(l2w,sizeof(l2w),"blocks.%d.mlp.layer2.weight",b);
+
+    begin_step_recording(rc);
+    rc.dispatch_layernorm(*rc.gBuf,*rc.nBuf,MS,D,1e-6f);
+    rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,off(6),*rc.bcBuf,off(7),*rc.nBuf,MS*D,1,1);
+    rc.dispatch_gemm(*rc.nBuf,l1w,MS,MLP_HIDDEN,D,*rc.t1);
+    rc.dispatch_gelu(*rc.t1,*rc.t1,MS*MLP_HIDDEN);  // GELU, not SiLU! (predict2 GPT2FeedForward uses nn.GELU)
+    rc.dispatch_gemm(*rc.t1,l2w,MS,D,MLP_HIDDEN,*rc.nBuf);
+    rc.dispatch_scale_shift(*rc.nBuf, g_gateScales, 0, g_gateScales, 2,
+                            *rc.nBuf, MS*D, 0, 0);  // MLP fc2 *= 1/8
+    rc.dispatch_scale_shift(*rc.nBuf,*rc.bcBuf,off(8),*rc.gBuf,0,
+                            *rc.outBuf,MS*D,1,1);
+    end_step_recording();
+}
+
+bool dit_record_n_blocks(int n) {
+    if (!g_init || n < 1 || n > 28) return false;
+    VkCommandBufferBeginInfo bi = {};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(g_vk.cmd[0], &bi) != VK_SUCCESS) return false;
+
+    RC rc; memset(&rc,0,sizeof(rc));
+    rc.vk=&g_vk; rc.cmd=g_vk.cmd[0]; rc.weights=&g_weights;
+    rc.xBuf=&g_xBuf; rc.tEmbBuf=&g_tEmbBuf; rc.ctxBuf=&g_ctxBuf; rc.outBuf=&g_outBuf;
+    rc.t1=&g_t1; rc.tQ=&g_tQ; rc.tK=&g_tK; rc.tV=&g_tV; rc.tO=&g_tO;
+    rc.rBuf=&g_rBuf; rc.aBuf=&g_aBuf; rc.nBuf=&g_nBuf; rc.gBuf=&g_gBuf; rc.bcBuf=&g_bcBuf; rc.onesBuf=&g_onesBuf;
+
+    for (int i = 0; i < n; i++) {
+        Buffer* out, *in;
+        if (i == 0) in = rc.xBuf;
+        else if (i % 2 == 0) in = rc.xBuf;
+        else in = rc.tV;
+
+        if (i == n-1) out = rc.outBuf;
+        else if (i % 2 == 0) out = rc.tV;
+        else out = rc.xBuf;
+
+        record_one_block(rc, i, *in, *out);
+    }
+
+    if (vkEndCommandBuffer(g_vk.cmd[0]) != VK_SUCCESS) return false;
+    LOGI("%d blocks recorded (%d dispatches)", n, n*16);
+    return true;
+}
+
+bool dit_record_block_to(int blockIdx, int cmdIdx) {
+    // Record one block into cmd[cmdIdx], using shared bcBuf offsets
+    if (!g_init || cmdIdx < 0 || cmdIdx >= 28) return false;
+    VkCommandBufferBeginInfo bi = {};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(g_vk.cmd[cmdIdx], &bi) != VK_SUCCESS) return false;
+
+    RC rc; memset(&rc,0,sizeof(rc));
+    rc.vk=&g_vk; rc.cmd=g_vk.cmd[cmdIdx]; rc.weights=&g_weights;
+    rc.xBuf=&g_xBuf; rc.tEmbBuf=&g_tEmbBuf; rc.ctxBuf=&g_ctxBuf; rc.outBuf=&g_outBuf;
+    rc.t1=&g_t1; rc.tQ=&g_tQ; rc.tK=&g_tK; rc.tV=&g_tV; rc.tO=&g_tO;
+    rc.rBuf=&g_rBuf; rc.aBuf=&g_aBuf; rc.nBuf=&g_nBuf; rc.gBuf=&g_gBuf; rc.bcBuf=&g_bcBuf; rc.onesBuf=&g_onesBuf;
+
+    // Block reads from xBuf, writes to outBuf (caller copies outBuf→xBuf between blocks)
+    record_one_block(rc, blockIdx, *rc.xBuf, *rc.outBuf);
+
+    if (vkEndCommandBuffer(g_vk.cmd[cmdIdx]) != VK_SUCCESS) return false;
+    return true;
+}
+
+bool dit_init_all_blocks(void) {
+    if (!g_init) return false;
+    for (int i = 0; i < 28; i++) {
+        if (!dit_record_block_to(i, i)) { LOGE("Failed to record block %d", i); return false; }
+    }
+    LOGI("All 28 blocks recorded (1 per cmd buffer)");
+    return true;
+}
+
+bool dit_forward_nblocks(void* x_data, void* t_emb_data, void* ctx_data, void* out_data,
+                          int _MS, int _D, int _M, int _Nctx, int _CtxD, int _nblocks) {
+    if (!g_init) return false;
+    int nblocks = _nblocks;
+    if (nblocks <= 0 || nblocks > 28) nblocks = 28;
+    MS = (uint32_t)_MS; M = (uint32_t)_M; S = MS / M;
+    size_t xBytes = MS * D * 2;
+    size_t tBytes = M * D * 2;
+    size_t ctxBytes = M * (uint32_t)_Nctx * (uint32_t)_CtxD * 2;
+
+    // Upload inputs (t_emb and ctx stay constant across blocks)
+    memcpy(g_xBuf.mapped, x_data, xBytes);
+    if (t_emb_data) memcpy(g_tEmbBuf.mapped, t_emb_data, tBytes);
+    if (ctx_data) memcpy(g_ctxBuf.mapped, ctx_data, ctxBytes);
+
+    // Diagnostic: scan input before blocks
+    {
+        uint16_t* in = (uint16_t*)g_xBuf.mapped;
+        float fmin = 1e30f, fmax = -1e30f; int nan_cnt = 0;
+        for (uint32_t j = 0; j < MS * D; j++) {
+            uint16_t h = in[j];
+            uint32_t exp = (h >> 10) & 0x1f, mant = h & 0x3ff;
+            if (exp == 31) { if (mant) nan_cnt++; }
+            else { float val; if (exp == 0) val = 0.0f; else { uint32_t bits = ((exp + 112) << 23) | (mant << 13); val = *(float*)&bits; } if (h & 0x8000) val = -val; if (val < fmin) fmin = val; if (val > fmax) fmax = val; }
+        }
+        LOGI("Forward input: min=%.1f max=%.1f nan=%d/%u", fmin, fmax, nan_cnt, MS*D);
+        // Also check t_emb
+        uint16_t* te = (uint16_t*)g_tEmbBuf.mapped;
+        float tmin = 1e30f, tmax = -1e30f;
+        for (uint32_t j = 0; j < M * D; j++) {
+            uint16_t h = te[j]; if (h == 0x7e00) continue; // NaN sentinel
+            uint32_t exp = (h >> 10) & 0x1f;
+            if (exp == 31) continue;
+            float val; if (exp == 0) val = 0.0f; else { uint32_t bits = ((exp + 112) << 23) | ((h & 0x3ff) << 13); val = *(float*)&bits; } if (h & 0x8000) val = -val;
+            if (val < tmin) tmin = val; if (val > tmax) tmax = val;
+        }
+        LOGI("Forward t_emb:  min=%.3f max=%.3f", tmin, tmax);
+    }
+
+    for (int i = 0; i < nblocks; i++) {
+        vkResetFences(g_vk.device, 1, &g_vk.fence);
+        VkSubmitInfo submit = {};
+        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &g_vk.cmd[i];
+        VkResult sr = vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.fence);
+        if (sr != VK_SUCCESS) {
+            LOGE("Submit cmd[%d] FAILED (VkResult=%d)", i, (int)sr); return false;
+        }
+        vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+
+        // Submit pre-recorded attention (descPool2, permanent)
+        vkResetFences(g_vk.device, 1, &g_vk.fence);
+        submit.pCommandBuffers = &g_vk.cmd_attn[i];
+        sr = vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.fence);
+        if (sr != VK_SUCCESS) {
+            LOGE("Submit cmd_attn[%d] FAILED (VkResult=%d)", i, (int)sr); return false;
+        }
+        vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+
+        // Diagnostic: scan block output for NaN/Inf
+        uint16_t* out = (uint16_t*)g_outBuf.mapped;
+        float fmin = 1e30f, fmax = -1e30f;
+        int nan_cnt = 0, inf_cnt = 0;
+        for (uint32_t j = 0; j < MS * D; j++) {
+            uint16_t h = out[j];
+            // fp16 → fp32
+            uint32_t sign = (h >> 15) & 1;
+            uint32_t exp  = (h >> 10) & 0x1f;
+            uint32_t mant = h & 0x3ff;
+            float val;
+            if (exp == 0) { val = 0.0f; if (mant != 0) val = ldexpf((float)mant, -24); }
+            else if (exp == 31) { if (mant == 0) { inf_cnt++; continue; } else { nan_cnt++; continue; } }
+            else { val = ldexpf((float)(mant | 0x400), (int)exp - 25); }
+            if (sign) val = -val;
+            if (val < fmin) fmin = val;
+            if (val > fmax) fmax = val;
+        }
+        LOGI("Block %d/%d output: min=%.1f max=%.1f nan=%d inf=%d",
+             i, nblocks, fmin, fmax, nan_cnt, inf_cnt);
+        memcpy(g_xBuf.mapped, g_outBuf.mapped, xBytes);
+    }
+
+    memcpy(out_data, g_outBuf.mapped, xBytes);
+    return true;
+}
+
+// ── Per-step recording forward: 28 blocks × 4 segments = 112 submit/step ──
+// Each segment recorded fresh into g_lnCmdBuf using stepPool.
+// TDR-safe at all GPU frequencies (each segment <1s even at 515MHz).
+// mode: 0=full, 1=skip all attn, 2=self only, 3=cross only
+bool dit_forward_step(void* x_data, void* t_emb_data, void* ctx_data, void* out_data,
+                       int _MS, int _D, int _M, int _Nctx, int _CtxD, int mode) {
+    if (!g_init) return false;
+    MS = (uint32_t)_MS; M = (uint32_t)_M; S = MS / M;
+    size_t xBytes = MS * D * 2;
+    size_t tBytes = M * D * 2;
+    size_t ctxBytes = M * (uint32_t)_Nctx * (uint32_t)_CtxD * 2;
+
+    // Upload inputs
+    memcpy(g_xBuf.mapped, x_data, xBytes);
+    if (t_emb_data) memcpy(g_tEmbBuf.mapped, t_emb_data, tBytes);
+    if (ctx_data) memcpy(g_ctxBuf.mapped, ctx_data, ctxBytes);
+
+    LOGI("Forward step start: MS=%u D=%u t_emb=%s ctx=%s",
+         MS, D, t_emb_data?"yes":"no", ctx_data?"yes":"no");
+
+    // Upload RoPE freqs to temp GPU buffer (created per-step to survive killall)
+    if (!g_ropeFreqsHost.empty()) {
+        if (g_ropeFreqs.buf == VK_NULL_HANDLE) {
+            VkBufferUsageFlags u = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+            if (!create_buffer(g_vk, g_ropeFreqsSize, u, g_ropeFreqs)) {
+                LOGE("RoPE temp buffer creation failed");
+            } else {
+                memcpy(g_ropeFreqs.mapped, g_ropeFreqsHost.data(), g_ropeFreqsSize);
+            }
+        }
+    }
+
+    // Setup RC for per-step recording
+    RC rc; memset(&rc, 0, sizeof(rc));
+    rc.vk = &g_vk; rc.weights = &g_weights;
+    rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
+    rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
+    rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf;
+    rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
+
+    for (int b = 0; b < 28; b++) {
+        Buffer& inBuf = (b == 0) ? g_xBuf : g_xBuf;  // always xBuf (chained from prev block)
+
+        // Segment A: AdaLN (36 dispatch)
+        record_segment_adaln(rc, b);
+        if (!submit_segment()) { LOGE("SegA[%d] submit failed", b); return false; }
+        if (b == 0 && g_b0_shifts) {
+            // Capture shift/scale/gate from bcBuf (pre-broadcast, first M*D of each component)
+            size_t adaln_sz = M * D * 2;
+            memcpy(g_b0_shifts + 0, (uint8_t*)g_bcBuf.mapped + 1*MS*D*2, adaln_sz);  // shift
+            memcpy(g_b0_shifts + M*D, (uint8_t*)g_bcBuf.mapped + 0*MS*D*2, adaln_sz);  // scale
+            memcpy(g_b0_shifts + 2*M*D, (uint8_t*)g_bcBuf.mapped + 2*MS*D*2, adaln_sz);  // gate
+            // Diagnostic: read back first 3 fp16 values from bcBuf scale slot
+            uint16_t* sc = (uint16_t*)((uint8_t*)g_bcBuf.mapped + 0*MS*D*2);
+            LOGI("AdaLN diag: bcBuf[0..2]=0x%04x 0x%04x 0x%04x  aBuf[0]=0x%04x",
+                 sc[0], sc[1], sc[2],
+                 ((uint16_t*)g_aBuf.mapped)[0]);
+        }
+
+        if (mode == 0 || mode == 2) {  // full or self-only
+            // Segment B1: LN→AdaLN→QKV→RMSNorm→RoPE (pre-attention)
+            record_segment_self_pre_a(rc, b, inBuf);
+            if (!submit_segment()) { LOGE("SegB1a[%d] submit failed", b); return false; }
+            // B1a done: nBuf=modulated, tQ=Q_raw, tK=K_raw, tV=V_raw
+            if (b == 0) {
+                if (g_b0_mod)   memcpy(g_b0_mod,   g_nBuf.mapped, g_block_out_size);
+                if (g_b0_q_raw) memcpy(g_b0_q_raw, g_tQ.mapped, g_block_out_size);
+                if (g_b0_v)     memcpy(g_b0_v,     g_tV.mapped, MS * N_HEADS * HEAD_DIM * 2);
+            }
+            // Segment B1b: RMSNorm Q/K -> RoPE
+            record_segment_self_pre_b(rc, b);
+            if (!submit_segment()) { LOGE("SegB1b[%d] submit failed", b); return false; }
+            if (b == 0) {
+                size_t qkv_sz = MS * N_HEADS * HEAD_DIM * 2;
+                if (g_b0_q)        memcpy(g_b0_q,        g_tQ.mapped, qkv_sz);
+                if (g_b0_k)        memcpy(g_b0_k,        g_tK.mapped, qkv_sz);
+                if (g_b0_q_roped)  memcpy(g_b0_q_roped,  g_rBuf.mapped, qkv_sz);
+                if (g_b0_k_roped)  memcpy(g_b0_k_roped,  g_attnO.mapped, qkv_sz);
+            }
+            // Segment B2: attention→O_proj→gate
+            record_segment_self_attn_v2(rc, b, inBuf);
+            if (!submit_segment()) { LOGE("SegB2[%d] submit failed", b); return false; }
+            if (b == 0) {
+                uint32_t S_batch = MS / M;
+                size_t score_sz = S_batch * N_HEADS * S_batch * 2;
+                if (g_b0_scores) memcpy(g_b0_scores, g_attnA.mapped, score_sz);
+                if (g_b0_attn_o) memcpy(g_b0_attn_o, g_attnO.mapped, MS * N_HEADS * HEAD_DIM * 2);
+                if (g_b0_o_proj) memcpy(g_b0_o_proj, g_tO.mapped, g_block_out_size);  // O_proj GEMM output
+                if (g_b0_sa) memcpy(g_b0_sa, g_tV.mapped, g_block_out_size);  // SA residual = inBuf + gate * O_proj
+            }
+        }
+        if (mode == 0 || mode == 3) {  // full or cross-only
+            record_segment_cross_pre(rc, b);
+            if (!submit_segment()) { LOGE("SegC1[%d] submit failed", b); return false; }
+            record_segment_cross_attn(rc, b);
+            if (!submit_segment()) { LOGE("SegC2[%d] submit failed", b); return false; }
+            if (b == 0 && g_b0_cx) memcpy(g_b0_cx, g_gBuf.mapped, g_block_out_size);
+        }
+
+        // Segment D: MLP (6 dispatch)
+        record_segment_mlp(rc, b);
+        if (!submit_segment()) { LOGE("SegD[%d] submit failed", b); return false; }
+        if (b == 0 && g_b0_mlp) memcpy(g_b0_mlp, g_outBuf.mapped, g_block_out_size);
+
+        // Chain: copy output to input buffer for next block
+        memcpy(g_xBuf.mapped, g_outBuf.mapped, xBytes);
+
+        // Diagnostic
+        uint16_t* out = (uint16_t*)g_outBuf.mapped;
+        int nan_cnt = 0;
+        for (uint32_t j = 0; j < MS * D; j++) {
+            uint16_t h = out[j];
+            if ((h & 0x7C00) == 0x7C00 && (h & 0x3FF)) nan_cnt++;
+        }
+        LOGI("Block %d/28 done, nan=%d", b, nan_cnt);
+
+        // Capture block output for debugging (copy host-side mapped buffer)
+        if (g_block_out[b]) memcpy(g_block_out[b], g_outBuf.mapped, g_block_out_size);
+    }
+
+    // Free all descriptor sets from this step
+    vkResetDescriptorPool(g_vk.device, g_vk.stepPool, 0);
+
+    // Free temp RoPE buffer (so killall won't leave stale GPU resources)
+    if (g_ropeFreqs.buf != VK_NULL_HANDLE) {
+        vkDestroyBuffer(g_vk.device, g_ropeFreqs.buf, nullptr);
+        vkFreeMemory(g_vk.device, g_ropeFreqs.mem, nullptr);
+        g_ropeFreqs.buf = VK_NULL_HANDLE;
+        g_ropeFreqs.mem = VK_NULL_HANDLE;
+        g_ropeFreqs.mapped = nullptr;
+    }
+
+    memcpy(out_data, g_outBuf.mapped, xBytes);
+    LOGI("Forward step complete");
+    return true;
+}
+
+static bool record_adaln_block(int blockIdx, int cmdIdx) {
+    char w0_s[128], w2_s[128], w0_c[128], w2_c[128], w0_m[128], w2_m[128];
+    snprintf(w0_s, sizeof(w0_s), "blocks.%d.adaln_modulation_self_attn.1.weight", blockIdx);
+    snprintf(w2_s, sizeof(w2_s), "blocks.%d.adaln_modulation_self_attn.2.weight", blockIdx);
+    snprintf(w0_c, sizeof(w0_c), "blocks.%d.adaln_modulation_cross_attn.1.weight", blockIdx);
+    snprintf(w2_c, sizeof(w2_c), "blocks.%d.adaln_modulation_cross_attn.2.weight", blockIdx);
+    snprintf(w0_m, sizeof(w0_m), "blocks.%d.adaln_modulation_mlp.1.weight", blockIdx);
+    snprintf(w2_m, sizeof(w2_m), "blocks.%d.adaln_modulation_mlp.2.weight", blockIdx);
+
+    VkCommandBufferBeginInfo bi = {};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(g_vk.cmd[cmdIdx], &bi) != VK_SUCCESS) return false;
+
+    RC rc; memset(&rc, 0, sizeof(rc));
+    rc.vk = &g_vk; rc.cmd = g_vk.cmd[cmdIdx]; rc.weights = &g_weights;
+    rc.xBuf = &g_xBuf; rc.tEmbBuf = &g_tEmbBuf; rc.ctxBuf = &g_ctxBuf; rc.outBuf = &g_outBuf;
+    rc.t1 = &g_t1; rc.tQ = &g_tQ; rc.tK = &g_tK; rc.tV = &g_tV; rc.tO = &g_tO;
+    rc.rBuf = &g_rBuf; rc.aBuf = &g_aBuf; rc.nBuf = &g_nBuf; rc.gBuf = &g_gBuf;
+    rc.bcBuf = &g_bcBuf; rc.onesBuf = &g_onesBuf;
+
+    rc.adaln_gpu(w0_s, w2_s, 0);  // self:  bcBuf[0,1,2]
+    rc.adaln_gpu(w0_c, w2_c, 3);  // cross: bcBuf[3,4,5]
+    rc.adaln_gpu(w0_m, w2_m, 6);  // mlp:   bcBuf[6,7,8]
+
+    return vkEndCommandBuffer(g_vk.cmd[cmdIdx]) == VK_SUCCESS;
+}
+
+bool dit_record_all_adaln_blocks(void) {
+    // Called during init before g_init is set, so no g_init check here.
+    for (int i = 0; i < 28; i++) {
+        if (!record_adaln_block(i, i)) {
+            LOGE("Failed to record adaln block %d", i);
+            return false;
+        }
+    }
+    LOGI("All 28 AdaLN blocks pre-recorded");
+    return true;
+}
+
+bool dit_reset_step_pool(void) {
+    if (!g_init) return false;
+    vkResetDescriptorPool(g_vk.device, g_vk.stepPool, 0);
+    LOGI("stepPool reset OK");
+    return true;
+}
+
+bool dit_adaln_one_block(int blockIdx, void* out_9MD) {
+    if (!g_init) { LOGE("adaln_one_block: not initialized"); return false; }
+    if (blockIdx < 0 || blockIdx >= 28) { LOGE("adaln_one_block: bad idx %d", blockIdx); return false; }
+
+    // Re-record into cmd[0] using stepPool (then reset stepPool between steps)
+    // Swap descPool → stepPool so RC methods use the per-step pool
+    auto savedPool = g_vk.descPool;
+    g_vk.descPool = g_vk.stepPool;
+    bool ok = record_adaln_block(blockIdx, blockIdx);
+    g_vk.descPool = savedPool;
+    if (!ok) {
+        LOGE("adaln_one_block(%d): re-record failed", blockIdx); return false;
+    }
+
+    vkResetFences(g_vk.device, 1, &g_vk.stepFence);
+    VkSubmitInfo submit = {};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &g_vk.cmd[blockIdx];
+    VkResult sr = vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.stepFence);
+    if (sr != VK_SUCCESS) {
+        LOGE("adaln_one_block(%d): submit failed (VkResult=%d)", blockIdx, (int)sr); return false;
+    }
+    vkWaitForFences(g_vk.device, 1, &g_vk.stepFence, VK_TRUE, UINT64_MAX);
+
+    // Read first M rows from each bcBuf component
+    // bcBuf stores [scale+1, shift, gate] per channel; reorder to [shift, scale, gate]
+    // Reorder map: out[0]=bc[1] out[1]=bc[0] out[2]=bc[2] out[3]=bc[4] out[4]=bc[3] out[5]=bc[5] out[6]=bc[7] out[7]=bc[6] out[8]=bc[8]
+    static const int reorder[9] = {1, 0, 2, 4, 3, 5, 7, 6, 8};
+    // Scale components after reorder are at indices 1, 4, 7 (need -1 undo)
+    static const bool is_scale[9] = {false, true, false, false, true, false, false, true, false};
+
+    size_t mBytes = (size_t)M * D * 2;
+    uint16_t* out = (uint16_t*)out_9MD;
+    uint16_t* bc = (uint16_t*)g_bcBuf.mapped;
+
+    for (int c = 0; c < 9; c++) {
+        int src = reorder[c];
+        memcpy(out + c * M * D, bc + src * MS * D, mBytes);
+    }
+
+    // Undo scale+1 on components 1, 4, 7
+    for (int c = 0; c < 9; c++) {
+        if (!is_scale[c]) continue;
+        uint16_t* row = out + c * M * D;
+        for (size_t i = 0; i < (size_t)M * D; i++) {
+            // fp16 → fp32, subtract 1, fp32 → fp16
+            uint32_t h = row[i];
+            uint32_t sign = (h >> 15) & 1;
+            uint32_t exp  = (h >> 10) & 0x1f;
+            uint32_t mant = h & 0x3ff;
+            float val;
+            if (exp == 0) {
+                val = 0.0f;  // subnormals → 0 (scale values ~0-2, never subnormal)
+            } else if (exp == 31) {
+                continue;  // NaN/Inf, leave as-is
+            } else {
+                uint32_t f32 = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+                val = *(float*)&f32;
+            }
+            val -= 1.0f;
+            // fp32 → fp16
+            uint32_t bits = *(uint32_t*)&val;
+            uint32_t s16 = (bits >> 16) & 0x8000;
+            uint32_t e32 = (bits >> 23) & 0xff;
+            uint32_t m32 = bits & 0x7fffff;
+            if (e32 == 0) { row[i] = (uint16_t)s16; }
+            else if (e32 >= 143) { row[i] = (uint16_t)(s16 | 0x7c00); }
+            else if (e32 <= 112) { row[i] = (uint16_t)s16; }
+            else { row[i] = (uint16_t)(s16 | ((e32 - 112) << 10) | ((m32 + 0x1000) >> 13)); }
+        }
+    }
+
+    return true;
+}
+
+bool dit_run_layernorm(void* in_fp32, void* out_fp32, int _M, int _D, float eps) {
+    // Single LayerNorm dispatch: upload FP32 input, run shader, download FP32 output.
+    // Uses cmd[0] — one-shot recording, submit, wait, read back.
+    if (!g_init) return false;
+
+    uint32_t Mv = (uint32_t)_M;
+    uint32_t Dv = (uint32_t)_D;
+    size_t dataBytes = Mv * Dv * 4;  // float32 = 4 bytes
+
+    // Upload input to g_lnInBuf
+    memcpy(g_lnInBuf.mapped, in_fp32, dataBytes);
+
+    // Record into dedicated LN command buffer
+    VkCommandBufferBeginInfo bi = {};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(g_lnCmdBuf, &bi) != VK_SUCCESS) { LOGE("LN: begin cmd failed"); return false; }
+
+    // Allocate descriptor set for LN
+    VkDescriptorSetAllocateInfo dsInfo = {};
+    dsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsInfo.descriptorPool = g_vk.stepPool;
+    dsInfo.descriptorSetCount = 1;
+    dsInfo.pSetLayouts = &g_vk.layer_norm.dsl;
+    VkDescriptorSet ds;
+    if (vkAllocateDescriptorSets(g_vk.device, &dsInfo, &ds) != VK_SUCCESS) {
+        LOGE("LN: descriptor set alloc failed");
+        return false;
+    }
+
+    // Bind input buffer
+    VkDescriptorBufferInfo inInfo = { g_lnInBuf.buf, 0, dataBytes };
+    VkWriteDescriptorSet wIn = {};
+    wIn.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    wIn.dstSet = ds;
+    wIn.dstBinding = 0;
+    wIn.descriptorCount = 1;
+    wIn.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    wIn.pBufferInfo = &inInfo;
+
+    // Bind output buffer
+    VkDescriptorBufferInfo outInfo = { g_lnOutBuf.buf, 0, dataBytes };
+    VkWriteDescriptorSet wOut = {};
+    wOut.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    wOut.dstSet = ds;
+    wOut.dstBinding = 1;
+    wOut.descriptorCount = 1;
+    wOut.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    wOut.pBufferInfo = &outInfo;
+
+    VkWriteDescriptorSet writes[] = { wIn, wOut };
+    vkUpdateDescriptorSets(g_vk.device, 2, writes, 0, nullptr);
+
+    // Record dispatch
+    vkCmdBindPipeline(g_lnCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk.layer_norm.pipeline);
+    vkCmdBindDescriptorSets(g_lnCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+        g_vk.layer_norm.layout, 0, 1, &ds, 0, nullptr);
+
+    PC_LayerNorm pc = { Mv, Dv, eps };
+    vkCmdPushConstants(g_lnCmdBuf, g_vk.layer_norm.layout,
+        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(g_lnCmdBuf, Mv, 1, 1);
+
+    // Barrier: shader write → host read
+    VkMemoryBarrier mb = {};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(g_lnCmdBuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+
+    if (vkEndCommandBuffer(g_lnCmdBuf) != VK_SUCCESS) return false;
+
+    // Submit and wait
+    vkResetFences(g_vk.device, 1, &g_vk.fence);
+    VkSubmitInfo submit = {};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &g_lnCmdBuf;
+    if (vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.fence) != VK_SUCCESS) return false;
+    vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+
+    // Download result
+    memcpy(out_fp32, g_lnOutBuf.mapped, dataBytes);
+
+    // Free descriptor set
+    // descPool reset between steps — no per-call free
+
+    return true;
+}
+
+// ── Single-pass attention debug functions ──
+// Each records one dispatch into g_lnCmdBuf, submits, waits, downloads result.
+
+static bool record_one_attn_dispatch(VkPipeline pipeline, VkPipelineLayout layout,
+    VkDescriptorSetLayout dsl, VkDescriptorSet* ds_out, int nBindings,
+    VkDescriptorBufferInfo* bindInfos, const void* pushData, size_t pushSize,
+    uint32_t dx, uint32_t dy, uint32_t dz) {
+    VkCommandBufferBeginInfo bi = {};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(g_lnCmdBuf, &bi) != VK_SUCCESS) return false;
+
+    VkDescriptorSetAllocateInfo dsa = {};
+    dsa.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsa.descriptorPool = g_vk.stepPool;
+    dsa.descriptorSetCount = 1;
+    dsa.pSetLayouts = &dsl;
+    VkDescriptorSet ds;
+    if (vkAllocateDescriptorSets(g_vk.device, &dsa, &ds) != VK_SUCCESS) return false;
+
+    for (int i = 0; i < nBindings; i++) {
+        VkWriteDescriptorSet w = {};
+        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstSet = ds;
+        w.dstBinding = (uint32_t)i;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w.pBufferInfo = &bindInfos[i];
+        vkUpdateDescriptorSets(g_vk.device, 1, &w, 0, nullptr);
+    }
+
+    vkCmdBindPipeline(g_lnCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdBindDescriptorSets(g_lnCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &ds, 0, nullptr);
+    if (pushSize > 0)
+        vkCmdPushConstants(g_lnCmdBuf, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, (uint32_t)pushSize, pushData);
+    vkCmdDispatch(g_lnCmdBuf, dx, dy, dz);
+
+    VkMemoryBarrier mb = {};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(g_lnCmdBuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+        0, 1, &mb, 0, nullptr, 0, nullptr);
+
+    if (vkEndCommandBuffer(g_lnCmdBuf) != VK_SUCCESS) return false;
+
+    vkResetFences(g_vk.device, 1, &g_vk.fence);
+    VkSubmitInfo si = {};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &g_lnCmdBuf;
+    VkResult sr = vkQueueSubmit(g_vk.queue, 1, &si, g_vk.fence);
+    if (sr != VK_SUCCESS) { LOGE("attn debug dispatch submit failed VkResult=%d", (int)sr); return false; }
+    vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+
+    if (ds_out) *ds_out = ds;
+    return true;
+}
+
+bool dit_run_qkt(void* Q_fp16, void* K_fp16, void* A_fp16, int _M_q, int _M_kv, int _H, int _D, float scale) {
+    if (!g_init) return false;
+    uint32_t M_q=(uint32_t)_M_q, M_kv=(uint32_t)_M_kv, H=(uint32_t)_H, D=(uint32_t)_D;
+    size_t qBytes=M_q*H*D*2, kvBytes=M_kv*H*D*2, aBytes=M_q*H*M_kv*2;
+    memcpy(g_attnQ.mapped,Q_fp16,qBytes);
+    memcpy(g_attnK.mapped,K_fp16,kvBytes);
+
+    VkDescriptorBufferInfo bi[3] = {
+        {g_attnQ.buf,0,qBytes}, {g_attnK.buf,0,kvBytes}, {g_attnA.buf,0,aBytes}
+    };
+    PC_AttnQKT pc={M_q,M_kv,H,D,scale};
+    if (!record_one_attn_dispatch(g_vk.attn_qkt.pipeline, g_vk.attn_qkt.layout,
+        g_vk.attn_qkt.dsl, nullptr, 3, bi, &pc, sizeof(pc), M_q*H, 1, 1)) return false;
+
+    memcpy(A_fp16,g_attnA.mapped,aBytes);
+    return true;
+}
+
+bool dit_run_softmax(void* A_fp16, int _M_q, int _M_kv, int _H) {
+    if (!g_init) return false;
+    uint32_t M_q=(uint32_t)_M_q, M_kv=(uint32_t)_M_kv, H=(uint32_t)_H;
+    size_t aBytes=M_q*H*M_kv*2;
+    memcpy(g_attnA.mapped,A_fp16,aBytes);
+
+    VkDescriptorBufferInfo bi = {g_attnA.buf,0,aBytes};
+    PC_AttnSoftmax pc={M_q,M_kv,H};
+    if (!record_one_attn_dispatch(g_vk.attn_softmax.pipeline, g_vk.attn_softmax.layout,
+        g_vk.attn_softmax.dsl, nullptr, 1, &bi, &pc, sizeof(pc), M_q*H, 1, 1)) return false;
+
+    memcpy(A_fp16,g_attnA.mapped,aBytes);
+    return true;
+}
+
+bool dit_run_av(void* A_fp16, void* V_fp16, void* O_fp16, int _M_q, int _M_kv, int _H, int _D) {
+    if (!g_init) return false;
+    uint32_t M_q=(uint32_t)_M_q, M_kv=(uint32_t)_M_kv, H=(uint32_t)_H, D=(uint32_t)_D;
+    size_t aBytes=M_q*H*M_kv*2, kvBytes=M_kv*H*D*2, oBytes=M_q*H*D*2;
+    memcpy(g_attnA.mapped,A_fp16,aBytes);
+    memcpy(g_attnV.mapped,V_fp16,kvBytes);
+
+    VkDescriptorBufferInfo bi[3] = {
+        {g_attnA.buf,0,aBytes}, {g_attnV.buf,0,kvBytes}, {g_attnO.buf,0,oBytes}
+    };
+    PC_AttnOut pc={M_q,M_kv,H,D};
+    if (!record_one_attn_dispatch(g_vk.attn_out.pipeline, g_vk.attn_out.layout,
+        g_vk.attn_out.dsl, nullptr, 3, bi, &pc, sizeof(pc), M_q*H, 1, 1)) return false;
+
+    memcpy(O_fp16,g_attnO.mapped,oBytes);
+    return true;
+}
+
+static int _attn_call_count = 0;
+
+// Record 3-pass attention (QK^T + softmax + A@V) into g_lnCmdBuf, submit, wait.
+// Q must already be uploaded to g_attnQ (batch_q * H * D elements).
+// K must already be uploaded to g_attnK (M_kv * H * D elements).
+// V must already be uploaded to g_attnV.
+// Result lands in g_attnO.mapped (batch_q * H * D elements).
+static bool submit_attn_3pass(uint32_t batch_q, uint32_t M_kv, uint32_t H, uint32_t D, float scale) {
+    size_t b_qBytes = batch_q * H * D * 2;
+    size_t b_kvBytes = M_kv * H * D * 2;
+    size_t b_aBytes = batch_q * H * M_kv * 2;
+    size_t b_oBytes = batch_q * H * D * 2;
+
+    VkCommandBufferBeginInfo bi = {};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(g_lnCmdBuf, &bi) != VK_SUCCESS) return false;
+
+    VkDescriptorSetAllocateInfo dsa = {};
+    dsa.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsa.descriptorPool = g_vk.stepPool;
+    dsa.descriptorSetCount = 1;
+
+    // ── Pass 1: QK^T ──
+    VkDescriptorSet ds1;
+    dsa.pSetLayouts = &g_vk.attn_qkt.dsl;
+    vkAllocateDescriptorSets(g_vk.device, &dsa, &ds1);
+    VkDescriptorBufferInfo bQ = {g_attnQ.buf, 0, b_qBytes};
+    VkDescriptorBufferInfo bK = {g_attnK.buf, 0, b_kvBytes};
+    VkDescriptorBufferInfo bA = {g_attnA.buf, 0, b_aBytes};
+    VkWriteDescriptorSet w1[3] = {};
+    for (int i=0;i<3;i++){w1[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;w1[i].dstSet=ds1;w1[i].dstBinding=(uint32_t)i;w1[i].descriptorCount=1;w1[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;}
+    w1[0].pBufferInfo=&bQ; w1[1].pBufferInfo=&bK; w1[2].pBufferInfo=&bA;
+    vkUpdateDescriptorSets(g_vk.device,3,w1,0,nullptr);
+    vkCmdBindPipeline(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_qkt.pipeline);
+    vkCmdBindDescriptorSets(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_qkt.layout,0,1,&ds1,0,nullptr);
+    PC_AttnQKT pc1={batch_q,M_kv,H,D,scale};
+    vkCmdPushConstants(g_lnCmdBuf,g_vk.attn_qkt.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pc1),&pc1);
+    vkCmdDispatch(g_lnCmdBuf, batch_q*H, 1, 1);
+    {
+        VkMemoryBarrier mb={};
+        mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(g_lnCmdBuf,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,nullptr,0,nullptr);
+    }
+
+    // ── Pass 2: softmax in-place ──
+    VkDescriptorSet ds2;
+    dsa.pSetLayouts=&g_vk.attn_softmax.dsl;
+    vkAllocateDescriptorSets(g_vk.device,&dsa,&ds2);
+    {
+        VkWriteDescriptorSet w2={};
+        w2.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w2.dstSet=ds2; w2.dstBinding=0; w2.descriptorCount=1;
+        w2.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w2.pBufferInfo=&bA;
+        vkUpdateDescriptorSets(g_vk.device,1,&w2,0,nullptr);
+    }
+    vkCmdBindPipeline(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_softmax.pipeline);
+    vkCmdBindDescriptorSets(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_softmax.layout,0,1,&ds2,0,nullptr);
+    PC_AttnSoftmax pc2={batch_q,M_kv,H};
+    vkCmdPushConstants(g_lnCmdBuf,g_vk.attn_softmax.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pc2),&pc2);
+    vkCmdDispatch(g_lnCmdBuf, batch_q*H, 1, 1);
+    {
+        VkMemoryBarrier mb={};
+        mb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(g_lnCmdBuf,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,nullptr,0,nullptr);
+    }
+
+    // ── Pass 3: A @ V ──
+    VkDescriptorSet ds3;
+    dsa.pSetLayouts=&g_vk.attn_out.dsl;
+    vkAllocateDescriptorSets(g_vk.device,&dsa,&ds3);
+    VkDescriptorBufferInfo bV={g_attnV.buf,0,b_kvBytes}, bO={g_attnO.buf,0,b_oBytes};
+    VkWriteDescriptorSet w3[3] = {};
+    for (int i=0;i<3;i++){w3[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;w3[i].dstSet=ds3;w3[i].dstBinding=(uint32_t)i;w3[i].descriptorCount=1;w3[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;}
+    w3[0].pBufferInfo=&bA; w3[1].pBufferInfo=&bV; w3[2].pBufferInfo=&bO;
+    vkUpdateDescriptorSets(g_vk.device,3,w3,0,nullptr);
+    vkCmdBindPipeline(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_out.pipeline);
+    vkCmdBindDescriptorSets(g_lnCmdBuf,VK_PIPELINE_BIND_POINT_COMPUTE,g_vk.attn_out.layout,0,1,&ds3,0,nullptr);
+    PC_AttnOut pc3={batch_q,M_kv,H,D};
+    vkCmdPushConstants(g_lnCmdBuf,g_vk.attn_out.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pc3),&pc3);
+    vkCmdDispatch(g_lnCmdBuf, batch_q*H, 1, 1);
+    {
+        VkMemoryBarrier mb2={};
+        mb2.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb2.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;
+        mb2.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(g_lnCmdBuf,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&mb2,0,nullptr,0,nullptr);
+    }
+
+    if (vkEndCommandBuffer(g_lnCmdBuf) != VK_SUCCESS) return false;
+
+    vkResetFences(g_vk.device, 1, &g_vk.fence);
+    VkSubmitInfo submit = {};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &g_lnCmdBuf;
+    if (vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.fence) != VK_SUCCESS) return false;
+    vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+    return true;
+}
+
+bool dit_run_attention(void* Q_fp16, void* K_fp16, void* V_fp16, void* O_fp16,
+                        int _M_q, int _M_kv, int _H, int _D, float scale) {
+    if (!g_init) return false;
+    int call_id = _attn_call_count++;
+    uint32_t M_q = (uint32_t)_M_q, M_kv = (uint32_t)_M_kv, H = (uint32_t)_H, D = (uint32_t)_D;
+
+    const uint32_t MAX_WG = 1024;
+    uint32_t max_batch_q = MAX_WG / H;  // 64 for H=16
+    uint32_t n_batches = (M_q + max_batch_q - 1) / max_batch_q;
+    LOGI("attn #%d: M_q=%d M_kv=%d H=%d D=%d scale=%.4f batches=%d", call_id, _M_q, _M_kv, _H, _D, scale, n_batches);
+
+    size_t kvBytes = M_kv * H * D * 2;
+    size_t elemBytes = H * D * 2;
+
+    // Upload K, V once (same for all batches, persist in HOST_COHERENT memory)
+    memcpy(g_attnK.mapped, K_fp16, kvBytes);
+    memcpy(g_attnV.mapped, V_fp16, kvBytes);
+
+    for (uint32_t b = 0; b < n_batches; b++) {
+        uint32_t q_start = b * max_batch_q;
+        uint32_t batch_q = (q_start + max_batch_q <= M_q) ? max_batch_q : (M_q - q_start);
+
+        // Upload Q batch only (K/V already in place)
+        memcpy(g_attnQ.mapped, (uint8_t*)Q_fp16 + q_start * elemBytes, batch_q * elemBytes);
+
+        if (!submit_attn_3pass(batch_q, M_kv, H, D, scale)) {
+            LOGE("attn #%d batch %d/%d failed", call_id, b, n_batches);
+            return false;
+        }
+
+        memcpy((uint8_t*)O_fp16 + q_start * elemBytes, g_attnO.mapped, batch_q * elemBytes);
+    }
+
+    return true;
+}
+
+bool dit_run_gelu(void* in_fp16, void* out_fp16, int _N) {
+    if (!g_init) return false;
+    uint32_t N = (uint32_t)_N;
+    size_t bytes = N * 2;
+    memcpy(g_geluInBuf.mapped, in_fp16, bytes);
+
+    VkCommandBufferBeginInfo bi = {};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(g_lnCmdBuf, &bi) != VK_SUCCESS) return false;
+
+    VkDescriptorSetAllocateInfo dsInfo = {};
+    dsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsInfo.descriptorPool = g_vk.stepPool;
+    dsInfo.descriptorSetCount = 1;
+    dsInfo.pSetLayouts = &g_vk.gelu.dsl;
+    VkDescriptorSet ds;
+    if (vkAllocateDescriptorSets(g_vk.device, &dsInfo, &ds) != VK_SUCCESS) return false;
+
+    VkDescriptorBufferInfo bIn  = { g_geluInBuf.buf, 0, bytes };
+    VkDescriptorBufferInfo bOut = { g_geluOutBuf.buf, 0, bytes };
+    VkWriteDescriptorSet w[2] = {};
+    w[0].sType = w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[0].dstSet = w[1].dstSet = ds;
+    w[0].dstBinding = 0; w[1].dstBinding = 1;
+    w[0].descriptorCount = w[1].descriptorCount = 1;
+    w[0].descriptorType = w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    w[0].pBufferInfo = &bIn; w[1].pBufferInfo = &bOut;
+    vkUpdateDescriptorSets(g_vk.device, 2, w, 0, nullptr);
+
+    vkCmdBindPipeline(g_lnCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk.gelu.pipeline);
+    vkCmdBindDescriptorSets(g_lnCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk.gelu.layout, 0, 1, &ds, 0, nullptr);
+    PC_Silu pc = { N };
+    vkCmdPushConstants(g_lnCmdBuf, g_vk.gelu.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(g_lnCmdBuf, (N + 255) / 256, 1, 1);
+
+    VkMemoryBarrier mb = {};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(g_lnCmdBuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    if (vkEndCommandBuffer(g_lnCmdBuf) != VK_SUCCESS) return false;
+
+    vkResetFences(g_vk.device, 1, &g_vk.fence);
+    VkSubmitInfo submit = {};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &g_lnCmdBuf;
+    if (vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.fence) != VK_SUCCESS) return false;
+    vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+
+    memcpy(out_fp16, g_geluOutBuf.mapped, bytes);
+    // descPool reset between steps — no per-call free
+    return true;
+}
+
+bool dit_run_rmsnorm(void* in_fp16, void* weight_fp16, int wlen, void* out_fp16, int _M, int _D, float eps) {
+    // Single RMSNorm dispatch: FP16 I/O + weight. Uses g_lnCmdBuf (shared w/ LN, sequential).
+    if (!g_init) return false;
+
+    uint32_t Mv = (uint32_t)_M;
+    uint32_t Dv = (uint32_t)_D;
+    size_t inBytes = Mv * Dv * 2;       // fp16 = 2 bytes
+
+    // Upload to dedicated RMSNorm buffers
+    memcpy(g_rmsInBuf.mapped, in_fp16, inBytes);
+    memcpy(g_rmsWgtBuf.mapped, weight_fp16, (size_t)wlen * 2);
+    memset(g_rmsOutBuf.mapped, 0, inBytes);
+
+    VkCommandBufferBeginInfo bi = {};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(g_lnCmdBuf, &bi) != VK_SUCCESS) return false;
+
+    VkDescriptorSetAllocateInfo dsInfo = {};
+    dsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsInfo.descriptorPool = g_vk.stepPool;
+    dsInfo.descriptorSetCount = 1;
+    dsInfo.pSetLayouts = &g_vk.rms_norm.dsl;
+    VkDescriptorSet ds;
+    if (vkAllocateDescriptorSets(g_vk.device, &dsInfo, &ds) != VK_SUCCESS) return false;
+
+    VkDescriptorBufferInfo bIn  = { g_rmsInBuf.buf, 0, inBytes };
+    VkDescriptorBufferInfo bW   = { g_rmsWgtBuf.buf, 0, (VkDeviceSize)wlen * 2 };
+    VkDescriptorBufferInfo bOut = { g_rmsOutBuf.buf, 0, inBytes };
+
+    VkWriteDescriptorSet w[3] = {};
+    for (int i = 0; i < 3; i++) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = ds; w[i].dstBinding = (uint32_t)i; w[i].descriptorCount = 1; w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; }
+    w[0].pBufferInfo = &bIn; w[1].pBufferInfo = &bW; w[2].pBufferInfo = &bOut;
+    vkUpdateDescriptorSets(g_vk.device, 3, w, 0, nullptr);
+
+    vkCmdBindPipeline(g_lnCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk.rms_norm.pipeline);
+    vkCmdBindDescriptorSets(g_lnCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk.rms_norm.layout, 0, 1, &ds, 0, nullptr);
+    PC_RmsNorm pc = { Mv, Dv, eps };
+    vkCmdPushConstants(g_lnCmdBuf, g_vk.rms_norm.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(g_lnCmdBuf, Mv, 1, 1);
+
+    VkMemoryBarrier mb = {};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(g_lnCmdBuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+
+    if (vkEndCommandBuffer(g_lnCmdBuf) != VK_SUCCESS) return false;
+
+    vkResetFences(g_vk.device, 1, &g_vk.fence);
+    VkSubmitInfo submit = {};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &g_lnCmdBuf;
+    if (vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.fence) != VK_SUCCESS) return false;
+    vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+
+    memcpy(out_fp16, g_rmsOutBuf.mapped, inBytes);
+    // descPool reset between steps — no per-call free
+    return true;
+}
+
+bool dit_get_block_output(int block_idx, void* dst, size_t size) {
+    if (block_idx < 0 || block_idx >= 28) return false;
+    if (!g_block_out[block_idx]) return false;
+    size_t copy_sz = size < g_block_out_size ? size : g_block_out_size;
+    memcpy(dst, g_block_out[block_idx], copy_sz);
+    return true;
+}
+
+// 0=after self-attn, 1=after cross-attn, 2=after MLP (all from block 0)
+// 10=Q_norm, 11=K_norm, 12=V_raw, 13=attn_scores, 14=attn_output
+// 15=Q_roped, 16=K_roped (after RoPE, before attention)
+bool dit_get_b0_intermediate(int stage, void* dst, size_t size) {
+    uint16_t* src = nullptr;
+    size_t src_sz = 0;
+    switch (stage) {
+        case 0: src = g_b0_sa; src_sz = g_block_out_size; break;
+        case 1: src = g_b0_cx; src_sz = g_block_out_size; break;
+        case 2: src = g_b0_mlp; src_sz = g_block_out_size; break;
+        case 10: src = g_b0_q; src_sz = MS * N_HEADS * HEAD_DIM * 2; break;
+        case 11: src = g_b0_k; src_sz = MS * N_HEADS * HEAD_DIM * 2; break;
+        case 12: src = g_b0_v; src_sz = MS * N_HEADS * HEAD_DIM * 2; break;
+        case 13: src = g_b0_scores; src_sz = (MS/M) * N_HEADS * (MS/M) * 2; break;
+        case 14: src = g_b0_attn_o; src_sz = MS * N_HEADS * HEAD_DIM * 2; break;
+        case 15: src = g_b0_q_roped; src_sz = MS * N_HEADS * HEAD_DIM * 2; break;
+        case 16: src = g_b0_k_roped; src_sz = MS * N_HEADS * HEAD_DIM * 2; break;
+        case 17: src = g_b0_o_proj; src_sz = g_block_out_size; break;
+        case 18: src = g_b0_mod; src_sz = g_block_out_size; break;
+        case 19: src = g_b0_q_raw; src_sz = g_block_out_size; break;
+        case 20: src = g_b0_shifts; src_sz = M * 3u * D * 2; break;
+        default: return false;
+    }
+    if (!src) return false;
+    size_t copy_sz = size < src_sz ? size : src_sz;
+    memcpy(dst, src, copy_sz);
+    return true;
+}
+
+bool dit_get_debug_h1(void* dst, size_t size) {
+    if (g_debug_h1.empty()) return false;
+    size_t n_floats = g_debug_h1.size();
+    size_t copy_sz = size < n_floats * 4 ? size : n_floats * 4;
+    memcpy(dst, g_debug_h1.data(), copy_sz);
+    return true;
+}
+
+// Debug: compute lora for a specific output element and return the dot product components
+bool dit_debug_lora_elem(int batch, int out_idx, void* result_12f) {
+    // result_12f: [dot_product_f64, h1_0, w2_0, h1_1, w2_1, ..., h1_5, w2_5] (first 6 terms + total)
+    if (g_debug_h1.empty()) return false;
+    auto w2_it = g_weights.find("t_embedder.1.linear_2.weight");
+    if (w2_it == g_weights.end()) return false;
+
+    const uint16_t* w2_src = (const uint16_t*)w2_it->second.buf.mapped;
+    // Decode w2 row for this output index
+    float* out = (float*)result_12f;
+    const float* h1_row = &g_debug_h1[batch * D];
+
+    double total = 0.0;
+    for (int k = 0; k < 6; k++) {
+        // Decode fp16 w2 element
+        uint32_t h = w2_src[out_idx * D + k];
+        uint32_t sign = (h >> 15) & 1;
+        uint32_t exp  = (h >> 10) & 0x1f;
+        uint32_t mant = h & 0x3ff;
+        float w2_val;
+        if (exp == 0) { w2_val = 0.0f; }
+        else if (exp == 31) { w2_val = NAN; }
+        else {
+            uint32_t f32 = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+            w2_val = *(float*)&f32;
+        }
+        out[1 + k*2] = h1_row[k];
+        out[1 + k*2 + 1] = w2_val;
+        total += (double)h1_row[k] * (double)w2_val;
+    }
+    out[0] = (float)total;
+    return true;
+}
+
+bool dit_get_timestep_output(void* t_emb_dst, size_t t_emb_size, void* lora_dst, size_t lora_size) {
+    if (!g_init) return false;
+    if (t_emb_dst && g_tEmbBuf.mapped) {
+        memcpy(t_emb_dst, g_tEmbBuf.mapped, t_emb_size < M*D*2 ? t_emb_size : M*D*2);
+    }
+    if (lora_dst && g_loraBuf.mapped) {
+        size_t lora_sz = (size_t)M * 3u * D * 2u;
+        memcpy(lora_dst, g_loraBuf.mapped, lora_size < lora_sz ? lora_size : lora_sz);
+    }
+    return true;
+}
+
+void dit_destroy() {
+    auto free_buf = [&](Buffer& b) {
+        if (b.mapped) vkUnmapMemory(g_vk.device, b.mem);
+        if (b.buf) vkDestroyBuffer(g_vk.device, b.buf, nullptr);
+        if (b.mem) vkFreeMemory(g_vk.device, b.mem, nullptr);
+    };
+    auto free_sp = [&](ShaderPipe& sp) {
+        if (sp.pipeline) vkDestroyPipeline(g_vk.device, sp.pipeline, nullptr);
+        if (sp.layout) vkDestroyPipelineLayout(g_vk.device, sp.layout, nullptr);
+        if (sp.dsl) vkDestroyDescriptorSetLayout(g_vk.device, sp.dsl, nullptr);
+        if (sp.shader) vkDestroyShaderModule(g_vk.device, sp.shader, nullptr);
+    };
+    free_sp(g_vk.gemm); free_sp(g_vk.rms_norm); free_sp(g_vk.layer_norm);
+    free_sp(g_vk.silu); free_sp(g_vk.scale_shift); free_sp(g_vk.rope);
+    free_sp(g_vk.attention); free_sp(g_vk.broadcast); free_sp(g_vk.gelu);
+    free_sp(g_vk.attn_qkt); free_sp(g_vk.attn_softmax); free_sp(g_vk.attn_out);
+
+    if (g_vk.stepPool) vkDestroyDescriptorPool(g_vk.device, g_vk.stepPool, nullptr);
+    if (g_vk.descPool)  vkDestroyDescriptorPool(g_vk.device, g_vk.descPool, nullptr);
+    if (g_vk.descPool2) vkDestroyDescriptorPool(g_vk.device, g_vk.descPool2, nullptr);
+    if (g_lnCmdBuf) vkFreeCommandBuffers(g_vk.device, g_vk.cmdPool, 1, &g_lnCmdBuf);
+    if (g_vk.cmd[0])      vkFreeCommandBuffers(g_vk.device, g_vk.cmdPool, 28, g_vk.cmd);
+    if (g_vk.cmd_attn[0]) vkFreeCommandBuffers(g_vk.device, g_vk.cmdPool, 28, g_vk.cmd_attn);
+    if (g_vk.cmd_post[0]) vkFreeCommandBuffers(g_vk.device, g_vk.cmdPool, 28, g_vk.cmd_post);
+    if (g_vk.cmdPool) vkDestroyCommandPool(g_vk.device, g_vk.cmdPool, nullptr);
+    if (g_vk.fence) vkDestroyFence(g_vk.device, g_vk.fence, nullptr);
+
+    // Free per-tensor weight buffers
+    for (auto& kv : g_weights) free_buf(kv.second.buf);
+    g_weights.clear();
+
+    free_buf(g_xBuf); free_buf(g_tEmbBuf); free_buf(g_ctxBuf);
+    free_buf(g_outBuf); free_buf(g_t1); free_buf(g_tQ); free_buf(g_tK);
+    free_buf(g_tV); free_buf(g_tO); free_buf(g_rBuf); free_buf(g_aBuf);
+    free_buf(g_nBuf); free_buf(g_gBuf); free_buf(g_bcBuf);
+    free_buf(g_onesBuf); free_buf(g_loraBuf);
+    free_buf(g_lnInBuf); free_buf(g_lnOutBuf);
+    free_buf(g_geluInBuf); free_buf(g_geluOutBuf);
+    free_buf(g_attnQ); free_buf(g_attnK); free_buf(g_attnV); free_buf(g_attnA); free_buf(g_attnO);
+    free_buf(g_ropeFreqs);
+    free_buf(g_gemmDummy);
+    free_buf(g_gateScales);
+    free_buf(g_fp32_tmp);
+    free_buf(g_rmsInBuf); free_buf(g_rmsOutBuf); free_buf(g_rmsWgtBuf);
+
+    if (g_vk.device) vkDestroyDevice(g_vk.device, nullptr);
+    if (g_vk.instance) vkDestroyInstance(g_vk.instance, nullptr);
+
+    // Free per-block output capture buffers
+    for (int i = 0; i < 28; i++) { free(g_block_out[i]); g_block_out[i] = nullptr; }
+    free(g_b0_sa); free(g_b0_cx); free(g_b0_mlp);
+    free(g_b0_q); free(g_b0_k); free(g_b0_v); free(g_b0_scores); free(g_b0_attn_o);
+    g_b0_sa = g_b0_cx = g_b0_mlp = nullptr;
+    g_b0_q = g_b0_k = g_b0_v = g_b0_scores = g_b0_attn_o = nullptr;
+
+    g_init = false;
+    LOGI("dit_destroy complete");
+}
+
+} // extern "C"
