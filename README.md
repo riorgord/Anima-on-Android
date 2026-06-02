@@ -20,7 +20,7 @@ python -B /sdcard/anima_on_android/scripts/phone_pipeline.py
 ## 管线
 
 ```
-prompt → PC 预计算 context → 手机 DiT 去噪 (FP16 CPU) → WanVAE 解码 → PNG
+prompt → PC 预计算 context → 手机 DiT 去噪 (FP32 CPU/Vulkan) → WanVAE 解码 → PNG
 ```
 
 ## 手机部署步骤
@@ -57,9 +57,7 @@ MSYS_NO_PATHCONV=1 adb push models/context_uncond.pt /sdcard/anima_on_android/mo
 
 ### 4. 转换模型权重
 
-在 PC 上将 DiffSynth 权重导出为 `state_dict`，保存为 FP16 `.pt` 文件，推送到手机 `models/` 目录：
-- `diffusion_weights_fp16.pt` — DiT 权重
-- `vae_weights_fp16.pt` — WanVAE 权重
+手机直接读取 safetensors（BF16 原生格式，零转换），无需 PC 预处理。VAE 权重仍通过 `.pt` 加载。
 
 ### 5. 运行
 
@@ -122,17 +120,27 @@ output/       生成图片输出
 
 ## Vulkan GPU 加速状态
 
-### 管线对比（2026-06-01）
+### 管线对比（2026-06-03）
 
-| 管线 | 精度 | 出图大小 | 速度 | 状态 |
-|------|------|---------|------|------|
-| **v2 fp32** (`libdit_vk_v2.so`) | fp32 全链路 | **75KB** ✅ | ~100s/步 | 全 DiT ops GPU (12 shader) |
-| HybridOps (`libhybrid_engine.so`) | fp16 | 81KB | 47s/步 | GEMM/LN/RMS/GELU GPU, Attn PyTorch |
-| PC 参考 (RTX 3060) | — | 74KB | — | 干净基准 |
+| 管线 | 精度 | 出图大小 | 速度 | torch依赖 | 状态 |
+|------|------|---------|------|-----------|------|
+| **NumpyDiT** (`numpy_dit.py`) | BF16→FP32 | **90KB** ✅ | 80s/步 | **零** (VAE除外) | ✅ 当前主线 |
+| v2 fp32 (`libdit_vk_v2.so`) | fp32 全链路 | 75KB | ~100s/步 | import torch | ❌ 终止 |
+| HybridOps | fp16 | 81KB | 47s/步 | import torch | 归档 |
+| PC 参考 (RTX 3060) | — | 74KB | — | — | 干净基准 |
+
+**NumpyDiT 架构**: BF16 权重存储 + FP32 计算（RTX 20 系风格）
+- 全部 Linear → Vulkan GEMM (516 个)
+- LN/RMSNorm/GELU/SiLU/SDPA → anima_rt CPU kernel
+- RoPE/Timesteps → numpy (PT Python 逐行直译)
+- 验证: NumpyDiT vs PT max_err=3e-6 (FP32 ULP 级别)
+- ComfyUI KSampler 式接口: `PipelineConfig` → `run_ksampler()`
+
+**基准图变更**: 去 torch 后随机数发生器从 torch MT19937 变为 numpy PCG64，同一 seed 产生不同 latent → 出图不同。**PC 参考图 (73,840 bytes) 暂时失效**，新基准为 NumpyDiT 手机出图 **90,155 bytes**。后续可用 PC 预生成 latent.npy 恢复可复现性。
 
 **v2 fp32 管线**：`vulkan/dit_engine_v2.cpp` (~1180行) + `vulkan/head_tail_ops.h` (C++ CPU head/tail)。safetensors 直读 BF16 权重，全 fp32 计算，4 段/block TDR-safe dispatch，3-pass attention shader。**唯一代码修复**：`head_tail_ops.h` sin/cos 顺序（PyTorch `[sin|cos]`，之前错写成 `[cos|sin]`）。全部 12 个 shader 通过 PyTorch 对齐验证。
 
-**HybridOps 管线**：`hybridops/vulkan/hybrid_engine.cpp` (~360行)。BF16→FP16 加载，GEMM/LN/RMSNorm/GELU 走 Vulkan per-call dispatch，Attention 走 PyTorch SDPA。47s/步，出图 81KB。
+**HybridOps 管线**（归档）：`hybridops/vulkan/hybrid_engine.cpp` (~360行)。GEMM/LN/RMSNorm/GELU 走 Vulkan，Attention 走 PyTorch。47s/步，出图 81KB。
 
 **已知 Adreno 730 限制**：加载阶段峰值 ~5.6GB；GPU 底频 515MHz 下 dispatch 可能超 TDR（v2 的 4 段/block TDR-safe 架构已规避）；BLAS bad memory unallocation 警告不阻碍出图。
 

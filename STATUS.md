@@ -1,10 +1,71 @@
-# Anima 项目状态摘要 (2026-06-02 晚间)
+# Anima 项目状态摘要 (2026-06-03 凌晨)
 
 ## 我们在做什么
 在 Snapdragon 8+ Gen1 手机上跑 Anima DiT 2B 模型。
 
 ## 当前状态（一句话）
-**anima_rt 轻量推理库 v0.3！** 完成「不造轮子，只搬运」策略转型：从 PyTorch 源码抠出 FlashAttention (tiled online softmax)、RMSNorm (sum/N 公式)、GEMM (dlopen OpenBLAS) 等 kernel，全部公式级对齐 PT。出图 77,272 字节（PC 白盒 73,840，差 4.6%）。剩余未替换：Shell Linear、RoPE。VAE 暂留 PyTorch。
+**DiT 管线 100% 去 torch！** BF16 存储 + FP32 计算（RTX 20 系风格）。`numpy_dit.py` 替代了 predict2.py，全部算子走 anima_rt (CPU) + Vulkan (GEMM) + numpy (RoPE/Timesteps)。出图 90,155 bytes。VAE decode 仍独立 import torch。ComfyUI KSampler 式接口已暴露（`PipelineConfig` → `run_ksampler()`）。
+
+---
+
+## 2026-06-03 凌晨：Phase 1-5 全部完成 — DiT 管线 100% 去 torch
+
+### 核心成就
+- **Shell Linear → Vulkan**: 516 个 Linear 权重全部进 Vulkan GEMM，0 CPU fallback
+- **RoPE → numpy**: PT Python 逐行直译，bit-exact (max_err=0.0)
+- **Timesteps → numpy**: 同样逐行直译，max_err=6e-8
+- **numpy_dit.py**: fork predict2.py，BF16 存储 + FP32 计算，**零 torch**
+- **sampling.py**: ComfyUI KSampler 式接口（PipelineConfig + Scheduler/Sampler ABC + 注册表 + run_ksampler()）
+- **NumpyDiT vs PT**: DiT 全链路 max_err=3e-6 (FP32 ULP 级别)
+
+### 管线架构 (最终)
+```
+PipelineConfig(H, W, seed, steps, cfg, sampler, scheduler)
+    │
+    ├─ ZImageScheduler.get_sigmas(steps) → sigma 序列
+    ├─ EulerSampler.sample(model, noise, sigmas, ctx, cfg)
+    │   └─ for each step:
+    │       ├─ CFG batch [uncond, cond]
+    │       ├─ NumpyDiT.forward(x, sigma, ctx)
+    │       │   ├─ PatchEmbed (Vulkan GEMM)
+    │       │   ├─ Timesteps (numpy)
+    │       │   ├─ 28 × Block
+    │       │   │   ├─ AdaLN (SiLU→Linear→Linear, Vulkan+anima_rt)
+    │       │   │   ├─ Self-Attn (Vulkan+anima_rt+numpy RoPE)
+    │       │   │   ├─ Cross-Attn (Vulkan+anima_rt)
+    │       │   │   └─ MLP (Vulkan+anima_rt)
+    │       │   └─ FinalLayer (LN→SiLU→Linear, Vulkan+anima_rt)
+    │       └─ Euler step: x + v*(σ_next - σ)
+    └─ VAE.decode(latent) → PNG (torch, 独立步骤)
+```
+
+### 出图演进
+| 版本 | 大小 | 说明 |
+|------|------|------|
+| PC 参考 (RTX 3060) | 73,840 | 干净基准 |
+| Phase 1-3 (PT shell) | 78,886 | Shell Linear→Vulkan, RoPE/Timesteps→numpy |
+| Phase 5 (NumpyDiT) | 90,155 | 全 numpy DiT, BF16→FP32 |
+
+### 暴露接口 — 给未来前端
+```python
+from sampling import PipelineConfig, run_ksampler
+
+cfg = PipelineConfig(H=32, steps=3, cfg=5.0, seed=6666,
+                     sampler="euler", scheduler="z_image")
+latent = run_ksampler(model, cfg, ctx_cond, ctx_uncond)
+```
+
+### 未来加采样器/调度器
+1. 子类化 `Scheduler` (实现 `get_sigmas(steps) → sigma序列`) 或 `Sampler` (实现 `sample(model, noise, sigmas, ctx, cfg, seed) → latent`)
+2. 从 ComfyUI/k-diffusion 源码直译，按 `sampling.py` 头部的 torch→numpy 对照表
+3. 注册到 `SCHEDULERS`/`SAMPLERS` dict
+4. `PipelineConfig` 里改名字即切换
+
+### 关键教训
+- **不造轮子**: 每个 op 要么从 PT 源码抠 (GELU/LN/RMS/SiLU/SDPA)，要么 PT Python 逐行倒模 (RoPE/Timesteps)
+- **BF16 存储 FP32 计算**: 全程不用 fp16，像 RTX 20 系
+- **逐 op 验证**: 单 op err→全链路 err→出图，三步缺一不可
+- **AdaLN Sequential 只有一个 SiLU** 在开头——不要脑补中间的激活函数
 
 ---
 
@@ -290,7 +351,7 @@ emb[m * D + half + i] = cosf(val);
 ### 成果
 - **手机直接读 `.safetensors`**（BF16, 3.9GB），无需桌面端预处理
 - **新 C++ Vulkan 引擎**：`hybridops/vulkan/libhybrid_engine.so`（~500KB）
-  - 加载时一次性 BF16→FP16 转换存入 Vulkan buffer
+  - 加载时一次性 BF16 权重存入 Vulkan buffer，shader 内部 FP32 计算
   - 按名 GEMM: `vk_run_gemm(weight_name, x, out, M, N, K)`
   - 内置 LN (FP32)、RMSNorm (FP16)、GELU (FP16)
 - **PyTorch 不持有 block GEMM 权重**：DummyOps 创建模型（零 weight 内存）→ patch_shell_linear → load_state_dict → patch_block_layers → VulkanGemmLinear

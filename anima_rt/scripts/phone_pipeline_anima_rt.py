@@ -141,6 +141,7 @@ def strip_prefix(k):
     return k[len(PREFIX):] if PREFIX and k.startswith(PREFIX) else k
 
 shell_sd = {}
+norm_weights = {}  # for NumpyDiT: RMSNorm weights (BF16→FP32)
 n_vk = 0; n_shell = 0
 for key in all_keys:
     if key == "__metadata__": continue
@@ -156,17 +157,23 @@ for key in all_keys:
         if ret < 0: print(f"  WARNING: vk_weight_add({clean_key}) failed: {ret}")
         del data; n_vk += 1
     else:
-        # Non-Linear weights: norms, biases, embeddings → PyTorch shell
+        # Non-Linear weights: norms, biases, embeddings
         data = st.get_tensor(key)
         raw_dtype = st.header[key]['dtype']
         if raw_dtype == 'BF16':
             tensor = torch.from_numpy(data.copy()).view(torch.bfloat16).to(torch.float16)
+            # Also store as FP32 for NumpyDiT (BF16→bit-reinterpret→FP32)
+            bits = data.copy().astype(np.uint32) << 16
+            norm_weights[clean_key] = bits.view(np.float32)
         elif raw_dtype == 'F16':
             tensor = torch.from_numpy(data.copy()).view(torch.float16)
+            norm_weights[clean_key] = data.copy().astype(np.float32)
         elif raw_dtype == 'F32':
             tensor = torch.from_numpy(data.copy()).to(torch.float16)
+            norm_weights[clean_key] = data.copy().astype(np.float32)
         else:
             tensor = torch.from_numpy(data.copy()).to(torch.float16)
+            norm_weights[clean_key] = data.copy().astype(np.float32)
         shell_sd[clean_key] = tensor
         del data; n_shell += 1
 

@@ -16,3 +16,4 @@ anima_rt/libanima_rt.so
 anima_rt/libanima_rt_host.so
 anima_rt/models/
 anima_rt/output/
+hybridops/models/
