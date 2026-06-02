@@ -27,9 +27,19 @@ H = 32  # 256×256
 # ── Patch nn.GELU after model creation ──
 _orig_gelu = torch.nn.GELU
 
+def _patch_sequential_anima_rt(seq):
+    """Replace nn.SiLU inside nn.Sequential (named_children won't reach inside)."""
+    import torch.nn as nn
+    for i, child in enumerate(seq):
+        if isinstance(child, nn.SiLU):
+            seq[i] = anima_rt_ops.AnimaRTSiLU()
+        elif isinstance(child, nn.Sequential):
+            _patch_sequential_anima_rt(child)
+
 def _patch_model_anima_rt(model):
     """Replace nn.LayerNorm → AnimaRTLayerNorm, nn.RMSNorm → AnimaRTRMSNorm,
-    nn.GELU → AnimaRTGELU in-place."""
+    nn.GELU → AnimaRTGELU, nn.SiLU → AnimaRTSiLU in-place.
+    Also recurses into nn.Sequential to catch SiLU inside."""
     import torch.nn as nn
     for name, child in list(model.named_children()):
         if isinstance(child, nn.LayerNorm):
@@ -49,6 +59,10 @@ def _patch_model_anima_rt(model):
             setattr(model, name, new)
         elif isinstance(child, nn.GELU):
             setattr(model, name, anima_rt_ops.AnimaRTGELU())
+        elif isinstance(child, nn.SiLU):
+            setattr(model, name, anima_rt_ops.AnimaRTSiLU())
+        elif isinstance(child, nn.Sequential):
+            _patch_sequential_anima_rt(child)
         else:
             _patch_model_anima_rt(child)
 
@@ -191,8 +205,19 @@ print_mem("shell_loaded")
 # Step 4: Patch — block GEMM → Vulkan, norms/GELU → anima_rt
 # ═══════════════════════════════════════════════════════════════
 vk_ops.patch_block_layers(dit)      # block Linear → VulkanGemmLinear
-_patch_model_anima_rt(dit)          # LayerNorm/RMSNorm/GELU → AnimaRT
-print("Patched model: GEMM=Vulkan, norms/GELU=libanima_rt.so")
+_patch_model_anima_rt(dit)          # LayerNorm/RMSNorm/GELU/SiLU → AnimaRT
+print("Patched model: GEMM=Vulkan, norms/GELU/SiLU=libanima_rt.so")
+
+# Patch attention → anima_rt SDPA math backend
+import predict2 as _p2
+_orig_sdpa = _p2._scaled_dot_product_attention
+def _patched_sdpa(q, k, v, heads, skip_reshape=False, transformer_options=None):
+    out = anima_rt_ops.anima_rt_sdpa(q, k, v)
+    if skip_reshape:
+        return out.transpose(1, 2).reshape(q.shape[0], -1, heads * q.shape[-1])
+    return out.reshape(q.shape[0], q.shape[2], heads * q.shape[-1])
+_p2._scaled_dot_product_attention = _patched_sdpa
+print("Patched attention: SDPA=libanima_rt.so")
 
 # ═══════════════════════════════════════════════════════════════
 # Step 5: Load context + scheduler

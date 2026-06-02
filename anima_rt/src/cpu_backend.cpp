@@ -6,12 +6,36 @@
 #include "cpu/softmax_kernel.h"
 #include "cpu/layernorm_kernel.h"
 #include "cpu/rmsnorm_kernel.h"
+#include <cstring>
 
 namespace anima {
 
 // ── CPU backend context (stateless) ────────────────────────────────
 
 struct CPUBackendContext : BackendContext {};
+
+// ── GEMM (declared in gemm_backend.cpp) ────────────────────────────
+extern "C" {
+    bool anima_gemm_init(void);
+    void anima_gemm_destroy(void);
+    bool anima_rt_run_gemm_bf16(const float* A, const uint16_t* W,
+                                float* C, int M, int N, int K);
+}
+
+static bool cpu_gemm_bf16(BackendContext*,
+                          const uint16_t* weight, const float* A,
+                          float* C, int64_t M, int64_t N, int64_t K,
+                          float alpha) {
+    // C_out = alpha * A @ weight^T
+    // Call the low-level GEMM (computes C = A @ weight^T fresh each call)
+    bool ok = anima_rt_run_gemm_bf16(A, weight, C, (int)M, (int)N, (int)K);
+    if (!ok) return false;
+    // Apply alpha if needed
+    if (alpha != 1.0f) {
+        for (int64_t i = 0; i < M * N; i++) C[i] *= alpha;
+    }
+    return true;
+}
 
 // ── Activation ─────────────────────────────────────────────────────
 
@@ -73,7 +97,9 @@ InferenceBackend* InferenceBackend::create_cpu() {
     b->softmax.compute = cpu_softmax;
 
     b->gemm.ctx     = nullptr;
-    b->gemm.compute_bf16 = nullptr;  // GEMM stays in PyTorch for now
+    b->gemm.init       = [](BackendContext*) -> bool { return anima_gemm_init(); };
+    b->gemm.compute_bf16 = cpu_gemm_bf16;
+    b->gemm.destroy    = [](BackendContext*) { anima_gemm_destroy(); };
 
     return b;
 }

@@ -5,7 +5,7 @@ REM Output: libanima_rt.so
 
 set NDK=D:\android-ndk-r27d-windows\android-ndk-r27d
 set TC=%NDK%\toolchains\llvm\prebuilt\windows-x86_64
-set SRC=src/anima_tensor.cpp src/cpu_backend.cpp src/anima_rt.cpp
+set SRC=src/anima_tensor.cpp src/cpu_backend.cpp src/anima_rt.cpp src/gemm_backend.cpp
 set OUT=libanima_rt.so
 set INC=-Iinclude
 
