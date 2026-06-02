@@ -1,87 +1,65 @@
-/* RoPE (Rotary Position Embedding) kernel
+/* RoPE (Rotary Position Embedding) apply kernel
  *
- * Extracted from predict2.py's apply_rotary_pos_emb:
- *
+ * Direct C++ translation of predict2.py:31-38:
  *   t_ = t.reshape(*t.shape[:-1], 2, -1).movedim(-2, -1).unsqueeze(-2).float()
  *   t_out = freqs[..., 0] * t_[..., 0] + freqs[..., 1] * t_[..., 1]
  *   t_out = t_out.movedim(-1, -2).reshape(*t.shape).type_as(t)
  *
- * This is the "rotate_half" RoPE variant (common in HuggingFace models):
- *   For each pair (x_r, x_c) at the input:
- *     out_r = cos * x_r + sin * x_c
- *   Then interleave back to original shape.
+ * CRITICAL: PT's .reshape(*, 2, D/2) groups D elements into TWO HALVES:
+ *   even half = [0..D/2-1], odd half = [D/2..D-1]
+ *   Pairs are (p, D/2+p) — NOT adjacent (2p, 2p+1)!
  *
- * t:    shape [B, S, H, D] or [M, D] where D is divisible by 2
- * freqs: cos/sin values, shape compatible with t's broadcast
- *        For each position, freqs has 2 values: (cos, sin)
+ * Formula for each (head, position, pair p in 0..D/2-1):
+ *   out[p]        = cos * x[p] + (-sin) * x[D/2+p]
+ *   out[D/2+p]    = sin * x[p] + cos * x[D/2+p]
+ *
+ * Freqs layout [S, D/2, 2, 2] row-major flat:
+ *   freqs[s*D*2 + p*4 + 0] = cos
+ *   freqs[s*D*2 + p*4 + 1] = -sin
+ *   freqs[s*D*2 + p*4 + 2] = sin
+ *   freqs[s*D*2 + p*4 + 3] = cos
+ *
+ * All computation in FP32.
  */
 #pragma once
-#include <cmath>
-#include <cstring>
+#include <cstdint>
 
 namespace anima {
 namespace cpu {
 
-/* ── FP32 RoPE, element-wise formula ─────────────────────────────────
- *
- * Loop over all elements, pair-wise.
- * For each pair (x_r, x_c) at position (b, s, h, 2*p):
- *   out_r = freqs_cos * x_r + freqs_sin * x_c
- *
- * The output is interleaved back to original dim order.
- */
 inline void rope_kernel(
-    const float* t,          // [B, S, H, D]
-    const float* freqs,      // cos/sin values, shape compatible
-    float* out,              // [B, S, H, D]
-    int B, int S, int H, int D,
-    int freq_stride          // stride in freqs for each (cos,sin) pair
-) {
-    int half_D = D / 2;
-    int64_t total_pairs = (int64_t)B * S * H * half_D;
+    const float* t,       // [N, S, D]  N=B*H, S=seq_len, D=head_dim (even)
+    const float* freqs,   // [S, D/2, 2, 2] row-major flat (extra singleton dims OK)
+    float* out,           // [N, S, D]
+    int N, int S, int D)
+{
+    const int half_D = D / 2;
 
-    for (int64_t idx = 0; idx < total_pairs; idx++) {
-        // Decompose flat index
-        int64_t tmp = idx;
-        int pair_idx = tmp % half_D;   tmp /= half_D;
-        int h_idx    = tmp % H;        tmp /= H;
-        int s_idx    = tmp % S;        tmp /= S;
-        int b_idx    = tmp;
+    for (int n = 0; n < N; n++) {
+        const float* t_n   = t + n * S * D;
+        float*       out_n = out + n * S * D;
 
-        // Source indices in t: x_r and x_c are adjacent in the reshaped layout
-        // After reshape(*.shape[:-1], 2, -1).movedim(-2, -1):
-        // The pair (x_r, x_c) at position p maps to the original D elements.
-        // x_r = element at flat index * 2 within the pair
-        // x_c = element at flat index * 2 + 1 within the pair
-        int64_t base_t = ((int64_t)b_idx * S * H + (int64_t)s_idx * H + h_idx) * D;
-        float x_r = t[base_t + pair_idx * 2];
-        float x_c = t[base_t + pair_idx * 2 + 1];
+        for (int s = 0; s < S; s++) {
+            const float* t_ns     = t_n + s * D;
+            float*       out_ns   = out_n + s * D;
+            const float* freqs_s  = freqs + s * D * 2;  // stride = D/2*2*2 = D*2
 
-        // freqs: for this position, find cos and sin
-        // freqs has shape [L, D] or compatible — the indexing depends on position
-        int freq_idx = s_idx * freq_stride + pair_idx * 2;
-        float cos_val = freqs[freq_idx];
-        float sin_val = freqs[freq_idx + 1];
+            for (int p = 0; p < half_D; p++) {
+                // PT pairing: element p (even) with element half_D+p (odd)
+                float x_even = t_ns[p];
+                float x_odd  = t_ns[half_D + p];
 
-        // Formula: out_r = cos * x_r + sin * x_c
-        float out_val = cos_val * x_r + sin_val * x_c;
+                float cos_val  = freqs_s[p * 4 + 0];  // cos
+                float nsin_val = freqs_s[p * 4 + 1];  // -sin
+                float sin_val  = freqs_s[p * 4 + 2];  // sin
+                float cos2_val = freqs_s[p * 4 + 3];  // cos
 
-        // Place in output: same position as x_r
-        out[base_t + pair_idx * 2] = out_val;
-        // The x_c position in output — need to compute separately
-        // Actually the output shape matches input, so we need both values.
-        // But the formula only computes ONE value per pair...
-        // Let me re-examine the Python reshape.
+                out_ns[p]          = cos_val * x_even + nsin_val * x_odd;
+                out_ns[half_D + p] = sin_val * x_even + cos2_val * x_odd;
+            }
+        }
     }
 }
-
-/* For now, we keep RoPE as a simple element-wise operation that mirrors
- * the exact Python formula. Since the formula involves reshape/movedim,
- * we implement it directly in Python and call this as a helper.
- *
- * The pure-C version above is INCOMPLETE — it needs the correct interleaving
- * logic that matches predict2.py:31-38. We'll finalize it when testing on phone.
- */
 
 } // namespace cpu
 } // namespace anima

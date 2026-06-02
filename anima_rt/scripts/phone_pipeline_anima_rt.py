@@ -223,6 +223,16 @@ def _patched_sdpa(q, k, v, heads, skip_reshape=False, transformer_options=None):
 _p2._scaled_dot_product_attention = _patched_sdpa
 print("Patched attention: SDPA=libanima_rt.so")
 
+## Phase 2 RoPE patch TEMPORARILY DISABLED for debugging
+# _orig_rope = _p2.apply_rotary_pos_emb
+# def _patched_rope(t, freqs):
+#     t_f32 = t.float().cpu().contiguous().numpy().astype(np.float32)
+#     f_f32 = freqs.float().cpu().contiguous().numpy().astype(np.float32)
+#     out_np = anima_rt_ops.anima_rt_rope(t_f32, f_f32)
+#     return torch.from_numpy(out_np).to(device=t.device, dtype=t.dtype)
+# _p2.apply_rotary_pos_emb = _patched_rope
+# print("Patched RoPE: libanima_rt.so (verified vs PT)")
+
 # ═══════════════════════════════════════════════════════════════
 # Step 5: Load context + scheduler
 # ═══════════════════════════════════════════════════════════════

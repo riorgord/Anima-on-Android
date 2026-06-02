@@ -29,6 +29,9 @@ _lib.anima_rt_run_sdpa.argtypes = [_ct.c_void_p]*4 + [_ct.c_int]*4 + [_ct.c_floa
 _lib.anima_rt_run_sdpa.restype = _ct.c_bool
 _lib.anima_rt_run_sdpa_flash.argtypes = [_ct.c_void_p]*4 + [_ct.c_int]*4 + [_ct.c_float, _ct.c_bool]
 _lib.anima_rt_run_sdpa_flash.restype = _ct.c_bool
+_lib.anima_rt_run_rope.argtypes = [_ct.c_void_p, _ct.c_void_p, _ct.c_void_p,
+                                    _ct.c_int, _ct.c_int, _ct.c_int]
+_lib.anima_rt_run_rope.restype = _ct.c_bool
 
 assert _lib.anima_rt_init(), "anima_rt_init failed"
 
@@ -119,6 +122,25 @@ class AnimaRTSiLU(nn.SiLU):
         result = torch.from_numpy(out_buf).to(device=x.device, dtype=x.dtype)
         return result.reshape(x.shape)
 
+
+# ── RoPE ──────────────────────────────────────────────────────────
+def anima_rt_rope(t_np, freqs_np):
+    """apply_rotary_pos_emb via libanima_rt.so C++ kernel.
+    t: [B, S, H, D] float32  freqs: [S, D/2, 2, 2] float32 (extra dims OK)"""
+    if t_np.ndim == 4:
+        B, S, H, D = t_np.shape
+        N = B * H
+        t_flat = np.ascontiguousarray(t_np.reshape(B * H, S, D), dtype=np.float32)
+    else:
+        N, S, D = t_np.shape
+        t_flat = np.ascontiguousarray(t_np, dtype=np.float32)
+    f_flat = np.ascontiguousarray(freqs_np, dtype=np.float32)
+    out_buf = np.zeros((N, S, D), dtype=np.float32)
+    ok = _lib.anima_rt_run_rope(t_flat.ctypes.data, f_flat.ctypes.data, out_buf.ctypes.data, N, S, D)
+    if not ok: raise RuntimeError("anima_rt_run_rope failed")
+    if t_np.ndim == 4:
+        return out_buf.reshape(B, S, H, D)
+    return out_buf
 
 # ── Linear (GEMM) ─────────────────────────────────────────────────
 class AnimaRTLinear(nn.Module):

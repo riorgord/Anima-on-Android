@@ -2,6 +2,7 @@
 // Mirrors the proven pattern from hybridops/vulkan/hybrid_engine.cpp.
 #include "anima_backend.h"
 #include "cpu/flash_attention.h"
+#include "cpu/rope_kernel.h"
 #include <cstdint>
 #include <cmath>
 
@@ -151,6 +152,14 @@ extern bool anima_rt_run_sdpa_flash(
 {
     anima::cpu::flash_attention(Q, K, V, output,
                                 BH, S_q, S_kv, D, scale, is_causal);
+    return true;
+}
+
+// ── RoPE (Rotary Position Embedding) ─────────────────────────────
+
+bool anima_rt_run_rope(const float* t, const float* freqs, float* out,
+                       int N, int S, int D) {
+    anima::cpu::rope_kernel(t, freqs, out, N, S, D);
     return true;
 }
 
