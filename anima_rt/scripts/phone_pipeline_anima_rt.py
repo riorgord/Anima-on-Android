@@ -245,6 +245,29 @@ def _patched_rope(t, freqs):
 _p2.apply_rotary_pos_emb = _patched_rope
 print("Patched RoPE: numpy (line-by-line PT translation)")
 
+# Phase 3: Timesteps → numpy (line-by-line PT translation, same pattern as RoPE)
+import math, types as _types
+def _patched_timesteps_forward(self, timesteps_B_T):
+    """Numpy translation of PT Timesteps.forward (predict2.py:222-236)."""
+    ts_np = timesteps_B_T.float().cpu().numpy()
+    B = ts_np.shape[0]
+    T = 1 if ts_np.ndim < 2 else ts_np.shape[1]
+    timesteps = ts_np.reshape(-1)
+    half_dim = self.num_channels // 2
+    # PT: exponent = -log(10000) * arange(half_dim) / (half_dim - 0.0)
+    exponent = -math.log(10000) * np.arange(half_dim, dtype=np.float32) / (half_dim - 0.0)
+    # PT: emb = exp(exponent); emb = timesteps[:,None] * emb[None,:]
+    emb = np.exp(exponent)
+    emb = timesteps[:, None] * emb[None, :]
+    # PT: sin/cos/cat
+    sin_emb = np.sin(emb); cos_emb = np.cos(emb)
+    emb = np.concatenate([cos_emb, sin_emb], axis=-1)
+    # PT: rearrange("(b t) d -> b t d", b=B, t=T)
+    emb = emb.reshape(B, T, -1)
+    return torch.from_numpy(emb).to(device=timesteps_B_T.device, dtype=timesteps_B_T.dtype)
+dit.t_embedder[0].forward = _types.MethodType(_patched_timesteps_forward, dit.t_embedder[0])
+print("Patched Timesteps: numpy (verified vs PT)")
+
 ## Phase 2 RoPE patch TEMPORARILY DISABLED for debugging
 # _orig_rope = _p2.apply_rotary_pos_emb
 # def _patched_rope(t, freqs):
