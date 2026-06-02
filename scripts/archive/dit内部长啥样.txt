@@ -1,0 +1,122 @@
+Anima DiT 内部结构 (MiniTrainDIT / Cosmos Predict2)
+
+一、输入
+  x       [2, 2048]  (CFG batch, 256 spatial tokens × 2048 dims, patch embedded)
+  t_emb   [2, 2048]  (sigma → Timesteps 正弦嵌入 → TimestepEmbedding → RMSNorm)
+  lora    [2, 6144]  (t_embedder 的第二输出, 3×D per batch: shift/scale/gate 各 2048)
+  ctx     [2, 512, 1024]  (LLMAdapter 输出, 512 个 context token)
+
+二、x_embedder (输入 Patch Embedding)
+  输入 latent [1, 16, H, W] → 2D conv patchify → [B*S, 2048]
+  patch_spatial=2, H=W=32 → 16×16=256 tokens/batch, S=256, MS=512
+
+三、t_embedder (时间步嵌入)
+  [0] Timesteps:           sigma → 正弦/余弦嵌入 [B,1,2048]
+  [1] TimestepEmbedding:
+        linear_1 [2048,2048] + SiLU → [B,1,2048]
+        linear_2 [2048,6144] → lora [B,1,6144]
+        返回: (正弦嵌入, lora)
+  t_embedding_norm:        RMSNorm(正弦嵌入) → t_emb [B,1,2048]
+
+四、28 个 Block（核心结构）
+
+  每个 Block 包含 3 个子层：Self-Attn → Cross-Attn → MLP
+  每层有自己的 AdaLN 调制（从 t_emb + lora 算出 shift/scale/gate）
+
+  ═══════════════════════════════════════════════════════════
+  Block[b] (b = 0..27)
+  ═══════════════════════════════════════════════════════════
+
+  输入: x [B×S, 2048], t_emb [B,1,2048], lora [B,1,6144], ctx [B,512,1024]
+
+  ┌─ AdaLN 调制（3 组，每组 36 dispatch）─────────────────
+  │  adaln_modulation_self_attn:
+  │    SiLU(t_emb) → linear_1 [2048,256] → linear_2 [256,6144]
+  │    + lora → chunk(3) → shift_self/scale_self/gate_self [B,1,2048]
+  │    复制到 [B×S, 2048]（每个 spatial token 相同值）
+  │  adaln_modulation_cross_attn: (同上结构, 独立权重)
+  │  adaln_modulation_mlp:        (同上结构, 独立权重)
+  │  scale = scale + 1.0
+  └─────────────────────────────────────────────────────────
+
+  ┌─ Self-Attention ───────────────────────────────────────
+  │  1. LayerNorm(x, affine=False, eps=1e-6) → [MS, 2048]
+  │  2. AdaLN modulate: y = LN(x) * scale_self + shift_self
+  │  3. Q = y @ q_proj^T           [2048,2048] → [MS, 2048]
+  │     K = y @ k_proj^T           [2048,2048]
+  │     V = y @ v_proj^T           [2048,2048]
+  │  4. reshape → [MS×16, 128] (16 heads, head_dim=128)
+  │  5. RMSNorm(Q, weight=q_norm [128], eps=1e-6) per-head
+  │     RMSNorm(K, weight=k_norm [128], eps=1e-6) per-head
+  │     V 不做 norm（v_norm = Identity）
+  │  6. RoPE(Q) 和 RoPE(K) — 旋转位置编码
+  │     每个 spatial position (16×16 grid) 有独立的旋转频率
+  │     head 之间共享同位置的频率
+  │  7. QK^T × scale (scale = 1/√128)
+  │     Self-attn: Q[MS×16,128] × K[MS×16,128]^T → scores [MS×16, MS]
+  │     Per-batch: 每个 batch 内 256 个 token 互相关注, batch 间隔离
+  │  8. Softmax over key dimension (MS=512, per-batch=256)
+  │  9. AV: softmax_scores [MS×16, MS] @ V [MS×16, 128] → [MS×16, 128]
+  │  10. reshape → [MS, 2048]
+  │  11. O_proj: attn_out @ output_proj^T [2048,2048] → [MS,2048]
+  │  12. Gate residual: x = x + gate_self * O_proj_out
+  │  (每 token 有独立的 gate 值, 从 AdaLN 广播来)
+  └─────────────────────────────────────────────────────────
+
+  ┌─ Cross-Attention ──────────────────────────────────────
+  │  1. LayerNorm(x, affine=False, eps=1e-6)
+  │  2. AdaLN modulate: y = LN(x) * scale_cross + shift_cross
+  │  3. Q = y @ cross_q_proj^T        [2048,2048] → [MS, 2048]
+  │     K = ctx @ cross_k_proj^T       [1024,2048] → [MS_kv, 2048]
+  │     V = ctx @ cross_v_proj^T       [1024,2048] → [MS_kv, 2048]
+  │     (ctx 是 LLMAdapter 输出 [B,512,1024], reshape 为 [B×512,1024])
+  │  4. reshape Q→[MS×16,128], K/V→[M×512×16,128]
+  │  5. RMSNorm(Q, weight=cross_q_norm [128]) per-head
+  │     RMSNorm(K, weight=cross_k_norm [128]) per-head
+  │     V 不做 norm
+  │  6. QK^T × scale: Q[MS×16,128] × K[M×Nctx×16,128]^T → scores [MS×16, M×Nctx]
+  │     Per-batch: 每个 batch 的 Q 只关注同 batch 的 K/V(Nctx=512)
+  │  7. Softmax over key dimension (M×Nctx=1024, per-batch=512)
+  │  8. AV → [MS×16, 128] → reshape [MS, 2048]
+  │  9. O_proj: @ cross_output_proj^T [2048,2048]
+  │  10. Gate residual: x = x + gate_cross * O_proj_out
+  └─────────────────────────────────────────────────────────
+
+  ┌─ MLP (GPT2FeedForward) ────────────────────────────────
+  │  1. LayerNorm(x, affine=False, eps=1e-6)
+  │  2. AdaLN modulate: y = LN(x) * scale_mlp + shift_mlp
+  │  3. fc1: y @ layer1^T [8192,2048] → [MS, 8192]
+  │  4. GELU (tanh 近似: 0.5*x*(1+tanh(√(2/π)*(x+0.044715*x³))))
+  │  5. fc2: @ layer2^T [2048,8192] → [MS, 2048]
+  │  6. Gate residual: x = x + gate_mlp * fc2_out
+  └─────────────────────────────────────────────────────────
+
+  输出: x [MS, 2048] → 传给下一个 Block, 或 final_layer
+
+五、final_layer (输出层)
+  AdaLN 调制 + Linear(D, patch_out) + unpatchify
+  输出 noise prediction [1, 16, H, W]
+  (CFG: noise_cfg = noise_uncond + 5.0 * (noise_cond - noise_uncond))
+
+六、调度器 (Euler / Flow Matching)
+  sigma schedule: time_snr_shift(3.0, linspace(1.0, 0.0, steps+1)[:-1])
+  每步: x = x + (sigma_next - sigma) * noise_pred
+
+七、关键尺寸一览
+  模型总参数: ~2.1B (685 tensors, BF16 ~3.9GB)
+  D = 2048 (hidden dim)
+  MLP_HIDDEN = 8192
+  N_HEADS = 16, HEAD_DIM = 128
+  Nctx = 512 (context tokens, LLMAdapter 输出)
+  S = 256 (spatial tokens = 16×16 patches)
+  MS = M×S = 512 (CFG batch=2)
+  每 block: 约 63 dispatch (per-step recording 模式)
+  28 blocks × 63 dispatch ≈ 1764 dispatch/step
+
+八、AdaLN-LoRA 说明
+  LoRA rank = 256
+  t_emb [B,2048] → SiLU → linear [2048,256] → linear [256,6144]
+  → chunk(3) → shift[B,2048] / scale[B,2048] / gate[B,2048]
+  + external lora[B,6144] (从 t_embedder 输出)
+  广播到 [B×S, 2048]
+  scale 额外 +1.0 (所以 scale 初始值 ≈ 1)
