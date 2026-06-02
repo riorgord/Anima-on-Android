@@ -145,15 +145,18 @@ n_vk = 0; n_shell = 0
 for key in all_keys:
     if key == "__metadata__": continue
     clean_key = strip_prefix(key)
-    if vk_ops.is_block_gemm_key(clean_key):
+    shape = st.header[key]['shape']
+    if vk_ops.is_linear_weight(clean_key, shape=shape):
+        # 2D Linear weight → Vulkan GEMM
         data = st.get_tensor(key)
         dc = st.dtype_code(key)
-        shape = list(data.shape)
-        shape_arr = (ctypes.c_int * len(shape))(*shape)
-        ret = vk_ops._lib.vk_weight_add(clean_key.encode(), data.ctypes.data, dc, shape_arr, len(shape))
+        shape_list = list(shape)
+        shape_arr = (ctypes.c_int * len(shape_list))(*shape_list)
+        ret = vk_ops._lib.vk_weight_add(clean_key.encode(), data.ctypes.data, dc, shape_arr, len(shape_list))
         if ret < 0: print(f"  WARNING: vk_weight_add({clean_key}) failed: {ret}")
         del data; n_vk += 1
     else:
+        # Non-Linear weights: norms, biases, embeddings → PyTorch shell
         data = st.get_tensor(key)
         raw_dtype = st.header[key]['dtype']
         if raw_dtype == 'BF16':
@@ -204,8 +207,9 @@ print_mem("shell_loaded")
 # ═══════════════════════════════════════════════════════════════
 # Step 4: Patch — block GEMM → Vulkan, norms/GELU → anima_rt
 # ═══════════════════════════════════════════════════════════════
-vk_ops.patch_block_layers(dit)      # block Linear → VulkanGemmLinear
 _patch_model_anima_rt(dit)          # LayerNorm/RMSNorm/GELU/SiLU → AnimaRT
+# Note: patch_shell_linear already converted ALL DummyLinear → VulkanGemmLinear
+#       (block GEMM + shell Linear). No separate patch_block_layers needed.
 print("Patched model: GEMM=Vulkan, norms/GELU/SiLU=libanima_rt.so")
 
 # Patch attention → anima_rt SDPA math backend

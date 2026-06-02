@@ -37,8 +37,7 @@ try:
 except Exception:
     _VK_AVAILABLE = False
 
-# Threshold: Vulkan when output dim >= 2048 AND M >= 16
-_VK_N_THRESHOLD = 2048
+# All Linear weights go to Vulkan (no threshold — correctness first)
 
 _VK_COUNT = 0
 _CPU_COUNT = 0
@@ -70,8 +69,7 @@ class VulkanGemmLinear(nn.Module):
         M = int(np.prod(batch)) if batch else 1
         out_f = self.out_features
 
-        if _VK_AVAILABLE and out_f >= _VK_N_THRESHOLD and M >= 16:
-            # BF16 weight + FP32 compute: input FP32, output FP32
+        if _VK_AVAILABLE:
             x_f32 = x.reshape(M, in_f).cpu().contiguous().float().numpy().copy()
             out_f32 = np.zeros(M * out_f, dtype=np.float32)
 
@@ -243,42 +241,31 @@ class ShellHybridOps:
 # Block layer patching
 # ═══════════════════════════════════════════════════════════════
 def patch_shell_linear(model):
-    """Replace shell (non-block GEMM) DummyLinear → nn.Linear, so load_state_dict works."""
-    linear_names = set()
-    # Collect all block GEMM weight names (these stay as DummyLinear/VulkanGemmLinear)
-    block_keys = set()
-    for bi in range(len(model.blocks)):
-        p = f"blocks.{bi}."
-        for s in ["_proj.weight", "mlp.layer1.weight", "mlp.layer2.weight"]:
-            block_keys.update([f"{p}self_attn.q_proj.weight", f"{p}self_attn.k_proj.weight",
-                               f"{p}self_attn.v_proj.weight", f"{p}self_attn.output_proj.weight",
-                               f"{p}cross_attn.q_proj.weight", f"{p}cross_attn.k_proj.weight",
-                               f"{p}cross_attn.v_proj.weight", f"{p}cross_attn.output_proj.weight",
-                               f"{p}mlp.layer1.weight", f"{p}mlp.layer2.weight"])
-
+    """Replace ALL DummyLinear → VulkanGemmLinear (block + shell).
+    All Linear weights are now in Vulkan — no nn.Linear needed."""
     def walk_and_patch(module, name_prefix=""):
         patched = 0
         for child_name, child in list(module.named_children()):
             full_prefix = f"{name_prefix}.{child_name}" if name_prefix else child_name
             if isinstance(child, DummyLinear):
-                # This is a DummyLinear — check if it's a block GEMM layer
                 wname = f"{full_prefix}.weight"
-                if wname not in block_keys:
-                    # Shell layer → replace with nn.Linear (preserving dtype)
-                    dtype = getattr(child, '_dtype', torch.float16)
-                    new_lin = nn.Linear(child.in_features, child.out_features,
-                                        bias=child.bias is not None,
-                                        dtype=dtype)
-                    if child.bias is not None:
-                        new_lin.bias.data.copy_(child.bias.data)
-                    setattr(module, child_name, new_lin)
-                    patched += 1
+                has_bias = child.bias is not None
+                new_lin = VulkanGemmLinear(
+                    weight_name=wname,
+                    in_features=child.in_features,
+                    out_features=child.out_features,
+                    bias=has_bias,
+                )
+                if has_bias:
+                    new_lin.bias.data.copy_(child.bias.data)
+                setattr(module, child_name, new_lin)
+                patched += 1
             else:
                 patched += walk_and_patch(child, full_prefix)
         return patched
 
     n = walk_and_patch(model)
-    if n > 0: print(f"Patched {n} shell DummyLinear → nn.Linear")
+    if n > 0: print(f"Patched {n} DummyLinear → VulkanGemmLinear")
     return n
 
 
@@ -320,11 +307,20 @@ def patch_block_layers(model):
 # ═══════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════
-def is_block_gemm_key(key):
-    """Does this safetensors key correspond to a block GEMM weight?"""
-    parts = key.split(".")
-    if len(parts) < 4: return False
-    if parts[0] != "blocks" or not parts[1].isdigit(): return False
-    name = ".".join(parts)
-    return any(p in name for p in [
-        "_proj.weight", "mlp.layer1.weight", "mlp.layer2.weight"])
+def is_linear_weight(key, shape=None):
+    """Does this safetensors key+shape correspond to a Linear (GEMM) weight?
+    Any 2D .weight tensor → Linear, excluding embedding/norm weights.
+    shape is from safetensors header (list of ints), used when available."""
+    if not key.endswith('.weight'):
+        return False
+    # Exclude position/text embedding lookup tables (not GEMM)
+    if 'pos_embed' in key.lower() or 'embed_tokens' in key.lower():
+        return False
+    # Exclude norm weights (1D but safe to check by name)
+    if 'norm' in key.lower():
+        return False
+    # If shape is known: 2D → Linear weight matrix [out_features, in_features]
+    if shape is not None:
+        if len(shape) != 2:
+            return False
+    return True
