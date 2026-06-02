@@ -136,7 +136,7 @@ output/       生成图片输出
 - 验证: NumpyDiT vs PT max_err=3e-6 (FP32 ULP 级别)
 - ComfyUI KSampler 式接口: `PipelineConfig` → `run_ksampler()`
 
-**基准图变更**: 去 torch 后随机数发生器从 torch MT19937 变为 numpy PCG64，同一 seed 产生不同 latent → 出图不同。**PC 参考图 (73,840 bytes) 暂时失效**，新基准为 NumpyDiT 手机出图 **90,155 bytes**。后续可用 PC 预生成 latent.npy 恢复可复现性。
+**基准图变更**: 去 torch 后随机数发生器从 torch MT19937 变为 numpy PCG64，同一 seed 产生不同 latent → 出图不同。**旧 PC 参考图 (73,840 bytes) 暂时失效**，新基准为 NumpyDiT **手机端出图 90,155 bytes**。后续可用 PC 预生成 latent.npy 推手机恢复可复现性。
 
 **v2 fp32 管线**：`vulkan/dit_engine_v2.cpp` (~1180行) + `vulkan/head_tail_ops.h` (C++ CPU head/tail)。safetensors 直读 BF16 权重，全 fp32 计算，4 段/block TDR-safe dispatch，3-pass attention shader。**唯一代码修复**：`head_tail_ops.h` sin/cos 顺序（PyTorch `[sin|cos]`，之前错写成 `[cos|sin]`）。全部 12 个 shader 通过 PyTorch 对齐验证。
 
