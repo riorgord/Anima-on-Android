@@ -79,8 +79,13 @@ class NumpyDiT:
                        for i in range(self.num_blocks)]
 
     def forward(self, x_np, sigma, ctx_np):
-        """x_np: [B,C,T,H,W] BF16 as uint16, sigma: float, ctx: [B,N,1024] BF16
-        Returns: [B,C,Tout,Hout,Wout] FP32"""
+        """x_np: [B,C,T,H,W], sigma: scalar or [B], ctx: [B,N,1024].
+        Returns: [B,C,Tout,Hout,Wout] FP32.
+        Resets Vulkan descriptor pool internally — call freely without vk management."""
+
+        # Reset Vulkan descriptor pool (needed each step)
+        import ctypes, vk_ops
+        vk_ops._lib.vk_reset_pool()
         B, C, T_in, Hi, Wi = x_np.shape
         orig = [B, C, T_in, Hi, Wi]
 

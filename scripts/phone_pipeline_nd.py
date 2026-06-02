@@ -5,9 +5,9 @@ from PIL import Image
 sys.path.insert(0, "/sdcard/anima_on_android/src")
 sys.path.insert(0, "/sdcard/anima_on_android/scripts")
 import torch  # ONLY for VAE decode at the end
-import vk_ops, anima_rt_ops, numpy_dit
+import vk_ops, anima_rt_ops, numpy_dit, sampling
 
-STEP=3; CFG=5.0; SEED=6666; H=32
+H=32
 
 # ════════ Load engines ════════
 print("Init Vulkan...")
@@ -84,38 +84,15 @@ if ctx_cond is None:
     ctx_cond = torch.load("/sdcard/anima_on_android/models/context_cond.pt", weights_only=True).float().cpu().numpy()
     ctx_uncond = torch.load("/sdcard/anima_on_android/models/context_uncond.pt", weights_only=True).float().cpu().numpy()
 
-# Scheduler (numpy, fork from flow_match)
-lin = np.linspace(1.0, 0.0, STEP+1)[:-1]
-sigmas_orig = (3.0*lin/(1.0+2.0*lin))
-sigmas = np.append(sigmas_orig, 0.0).astype(np.float32)
-
-# Latent init (no T dim, same as PT pipeline)
-rng = np.random.default_rng(SEED)
-x = rng.standard_normal((1, 16, H, H), dtype=np.float32).astype(np.float32)
+# KSampler — ComfyUI equivalent: cfg → scheduler + sampler → latent
+cfg = sampling.PipelineConfig(H=H, steps=3, cfg=5.0, seed=6666,
+                               sampler="euler", scheduler="z_image")
 t_start = time.time()
+x = sampling.run_ksampler(nd, cfg, ctx_cond, ctx_uncond)
+print(f"Denoised in {time.time()-t_start:.0f}s  latent shape={x.shape}")
 
-for i in range(STEP):
-    sigma = float(sigmas[i]); sigma_next = float(sigmas[i+1])
-
-    # Add T dim for DiT forward: [1, 16, 32, 32] → [1, 16, 1, 32, 32]
-    # CFG batch: → [2, 16, 1, 32, 32]
-    x_b = np.tile(np.expand_dims(x, 2), (2, 1, 1, 1, 1))
-    ctx_b = np.concatenate([ctx_uncond, ctx_cond], axis=0)
-    sigma_b = np.array([sigma, sigma], dtype=np.float32)
-
-    vk_ops._lib.vk_reset_pool()
-    t0 = time.time()
-    v_b = nd.forward(x_b, sigma_b, ctx_b)
-    dt = time.time()-t0
-
-    v_cond = v_b[1:2]; v_uncond = v_b[0:1]
-    v_cfg = v_uncond + CFG*(v_cond - v_uncond)
-    x = x + v_cfg[:, :, 0, :, :]*(sigma_next - sigma)
-
-    print(f"  step {i+1}/{STEP}: dit={dt:.0f}s"
-          f" v=[{v_cond.min():.2f},{v_cond.max():.2f}]"
-          f" x=[{x.min():.4f},{x.max():.4f}]"
-          f" (total {time.time()-t_start:.0f}s)")
+# ════════ VAE decode (torch — only import here) ════════
+import wan_vae
 
 vk_ops._lib.vk_engine_destroy()
 del nd; gc.collect()
@@ -140,4 +117,4 @@ Image.fromarray(img).save(out)
 total_t = time.time()-t_start
 fsize = os.stat(out).st_size if os.path.exists(out) else -1
 print(f"Saved: {out} ({fsize} bytes)")
-print(f"TOTAL: {STEP} steps, {total_t:.0f}s ({total_t/STEP:.0f}s/step), {H*8}x{H*8}")
+print(f"TOTAL: {cfg.steps} steps, {total_t:.0f}s ({total_t/cfg.steps:.0f}s/step), {cfg.H*8}x{cfg.H*8}")

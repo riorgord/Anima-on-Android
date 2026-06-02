@@ -163,3 +163,47 @@ SCHEDULERS: dict[str, type] = {
 SAMPLERS: dict[str, type] = {
     "euler": EulerSampler,
 }
+
+
+# ═══════════════════════════════════════════════════════════════
+# run_ksampler — ComfyUI KSampler's "Generate" button equivalent
+# ═══════════════════════════════════════════════════════════════
+#
+# This function mirrors ComfyUI's KSampler node wiring:
+#   KSampler(model, seed, steps, cfg, sampler_name, scheduler,
+#            positive, negative, latent_image, denoise) → latent
+#
+# Frontend usage:
+#   from sampling import PipelineConfig, run_ksampler
+#   cfg = PipelineConfig(H=32, steps=3, cfg=5.0, seed=6666,
+#                        sampler="euler", scheduler="z_image")
+#   latent = run_ksampler(model, cfg, ctx_cond, ctx_uncond)
+#   # → VAE.decode(latent) → PNG
+
+def run_ksampler(model, config: PipelineConfig,
+                 ctx_cond: np.ndarray, ctx_uncond: np.ndarray) -> np.ndarray:
+    """Run the full denoising loop — ComfyUI KSampler equivalent.
+    Args:
+        model:     NumpyDiT instance (model.forward(x_np, sigma, ctx_np) → v_np)
+        config:    PipelineConfig (seed, steps, cfg, sampler, scheduler, denoise, H, W)
+        ctx_cond:  float32 numpy [1, 512, 1024] positive prompt conditioning
+        ctx_uncond: float32 numpy [1, 512, 1024] negative prompt conditioning
+    Returns:
+        latent: float32 numpy [1, 16, H, W] denoised latent (ready for VAE)
+    """
+    # 1. Scheduler → sigma sequence
+    scheduler_cls = SCHEDULERS[config.scheduler]
+    scheduler = scheduler_cls()
+    sigmas = scheduler.get_sigmas(config.steps, config.denoise)
+
+    # 2. Noise (ComfyUI "latent_image" — empty latent with noise)
+    rng = np.random.default_rng(config.seed)
+    noise = rng.standard_normal((1, 16, config.H, config.W), dtype=np.float32)
+
+    # 3. Sampler → denoising loop
+    sampler_cls = SAMPLERS[config.sampler]
+    sampler = sampler_cls()
+    latent = sampler.sample(model, noise, sigmas, ctx_cond, ctx_uncond,
+                            config.cfg, config.seed)
+
+    return latent.astype(np.float32)
