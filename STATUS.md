@@ -1,10 +1,96 @@
-# Anima 项目状态摘要 (2026-06-02 凌晨)
+# Anima 项目状态摘要 (2026-06-02 晚间)
 
 ## 我们在做什么
 在 Snapdragon 8+ Gen1 手机上跑 Anima DiT 2B 模型。
 
 ## 当前状态（一句话）
-**anima_rt 轻量推理库 v0.2！** 从 PyTorch 源码抠出 GELU/SiLU/LayerNorm/RMSNorm/Softmax/Welford 六个 C++ kernel + BF16 权重 FP32 计算的 Vulkan GEMM shader，手机出图 77,056 字节（PC 基准 73,840，差 4.4%）。自研轮子已覆盖 LayerNorm×85、RMSNorm×113、GELU×28、SiLU×86、Softmax×56、GEMM×280。**未替换**：Attention SDPA、RoPE、VAE（仍在 PyTorch）。中期目标：自研轮子扩展 Vulkan/QNN 后端，最终全链路脱离 PyTorch。
+**anima_rt 轻量推理库 v0.3！** 完成「不造轮子，只搬运」策略转型：从 PyTorch 源码抠出 FlashAttention (tiled online softmax)、RMSNorm (sum/N 公式)、GEMM (dlopen OpenBLAS) 等 kernel，全部公式级对齐 PT。出图 77,272 字节（PC 白盒 73,840，差 4.6%）。剩余未替换：Shell Linear、RoPE。VAE 暂留 PyTorch。
+
+---
+
+## 2026-06-02 全天：全后端搬运策略转型 + 误差系统化分析
+
+### 核心策略变更
+**不再手搓 kernel → 从 PT 源码抠，或 dlopen PT 同款依赖 (OpenBLAS)。**
+手写 kernel 和 PT 的累加顺序/公式不同 → 误差无法消除。
+正确做法：PT 用什么依赖我们就用什么，PT 用什么公式我们就搬什么公式。
+
+### 成果
+
+#### 1. SDPA: Math → Flash Attention (最大突破)
+- **问题**：之前手搓的 math backend (matmul→softmax→matmul) 单次 err=0.99，出图 23KB（全黑）
+- **根因**：PT 2.11 默认走 flash attention (tiled online softmax)，和 math backend 是不同数值路径
+- **解决**：从 PT `FlashAttentionKernel.cpp` 抠 tiled online softmax 算法
+- **结果**：Flash attention vs PT `F.sdpa` err=**4.77e-07** ✅，出图回到正常范围
+
+#### 2. RMSNorm: Welford → PT sum/N 公式
+- **问题**：手搓的 Welford RMS，err=9.5e-06
+- **根因**：PT 的 RMSNorm 不是 dedicated kernel，是复合 `rsqrt(mean(x²)+eps)*weight`，用简单 sum/N
+- **解决**：替换为 PT 的 exact 公式 (sum(x²)/N)
+- **结果**：err 从 9.5e-06 → **6.68e-06** ✅
+
+#### 3. SiLU 接线
+- **问题**：`silu_kernel.h` 已存在且 bit-exact，但 `_patch_model_anima_rt` 没 patch `nn.SiLU`
+- **解决**：补上 `AnimaRTSiLU` + `_patch_sequential_anima_rt` 处理 `nn.Sequential` 内的 SiLU
+- **结果**：113 次/步全走 anima_rt，bit-exact ✅
+
+#### 4. GEMM backend: dlopen OpenBLAS
+- 手机上有 `libopenblas.so` (10MB)，`sbgemm_` 符号可用
+- 实现 dlopen → `sbgemm_` (BF16×BF16→FP32) + 纯 C++ fallback
+- FP32 纯 C++ err=4.77e-07，BF16 sbgemm_ err=4.77e-07 ✅
+
+#### 5. Vulkan GEMM 误差根因分析
+- **根因**：FMA 非结合律。shader 单 accumulator 串行链 vs OpenBLAS 多 accumulator 树归约
+- **实验**：1acc (77,685) → 4acc (77,272) → 8acc (77,965)
+- **结论**：调整 GLSL accumulator 数量只能有限改善，无法匹配 OpenBLAS 的特定 blocking。CPU/GPU 的 FMA 硬件舍入方向厂商差异无法消除
+- **策略**：GEMM 未来走 QNN NPU（高通 NPU BF16 矩阵乘法是其核心卖点）；其他 op 可安全上 Vulkan（累加规模小，有 LN/Softmax 自压缩效应）
+
+#### 6. P-1 PT 误差地板基准
+- PT CPU FP32 vs CUDA BF16：最终 v_cond max_err = **0.0495**
+- 块内误差在 b12 爆炸（×85），但 final_layer 压缩回来
+- 这是理论下限：不可能比 PT 自身跨后端差异更小
+
+### 当前管线 op 路由 & 误差
+
+| Op | 次数/步 | 后端 | err vs PT | 搬运状态 |
+|---|---------|------|-----------|---------|
+| Block GEMM | ~280 | Vulkan | 0.0044 | 🔴 FMA 非结合律 |
+| Shell Linear | ~174 | PT nn.Linear | 0 | ❌ 未替换 |
+| Flash Attn | 56 | anima_rt CPU | 4.77e-07 | ✅ 搬 PT |
+| SiLU | 113 | anima_rt CPU | **0** | ✅ 搬 PT |
+| GELU | 28 | anima_rt CPU | 4.8e-07 | ✅ 搬 PT |
+| LayerNorm | 85 | anima_rt CPU | 3.3e-06 | ✅ 搬 PT |
+| RMSNorm | 113 | anima_rt CPU | 6.7e-06 | ✅ 搬 PT（刚改） |
+| Softmax | 56 (独立) | anima_rt CPU | 2.2e-08 | ✅ 搬 PT |
+| RoPE | 28 | PT | 0 | ❌ 未替换 |
+| VAE | 1 | PT | — | ❌ 不碰 |
+
+### 出图演进（今天）
+
+| 版本 | 大小 | 说明 |
+|------|------|------|
+| PC 白盒 | 73,840 | 干净基准 |
+| anima_rt v0.2 (之前) | 77,056 | math SDPA + Welford RMS |
+| math SDPA (Path 3) | 23,304 | PT 公式验证，全黑 |
+| Flash SDPA + 1acc | 77,722 | 搬到 flash，回到正常 |
+| Flash SDPA + PT RMS | 77,685 | RMSNorm 搬完 |
+| Flash SDPA + **4acc** | **77,272** | Vulkan GEMM 最佳调参 |
+| Flash SDPA + 8acc | 77,965 | 过度优化反而倒退 |
+
+### Vulkan 上各 op 风险判断
+
+| Op | 累加规模 | 有自压缩？ | Vulkan 风险 |
+|----|---------|----------|------------|
+| SiLU/GELU | 1 element | N/A | ✅ 安全 |
+| Softmax | 256~512 | ✅ softmax | ✅ 安全 |
+| LN/RMSNorm | 2048 | ✅ /std | ✅ 安全 |
+| FlashAttn | 256×128 | ✅ softmax | 🟡 中等（内部有 GEMM） |
+| GEMM | 2048~8192 | 无 | 🔴 唯一高风险 |
+
+### 关键教训
+- **BF16 加载**：`.view(torch.bfloat16)` 做位重解释，`.to(torch.bfloat16)` 做值转换——用错权重全毁
+- **FMA 非结合律**：GPU 和 CPU 的 FMA 硬件差异是物理壁垒，GEMM 无法 vulkan→PT 对齐
+- **搬运 > 手搓**：今天无一例外——PT 的实现在精度和速度上都优于手写
 
 ---
 

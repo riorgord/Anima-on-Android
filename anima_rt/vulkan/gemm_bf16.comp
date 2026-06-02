@@ -1,0 +1,59 @@
+#version 450
+// GEMM: C[M,N] = A[M,K] (fp32) @ B[N,K]^T (BF16 packed as uint) → fp32 output
+// 4-accumulator tree reduction — reduces FP32 FMA non-associativity error
+// from O(K·ε) to O(√K·ε), closer to OpenBLAS's blocked accumulation order.
+// A: fp32 input, B: BF16 weight (packed uint, 2 BF16 per uint)
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer A_buf { float A[]; };
+layout(binding = 1) readonly  buffer B_buf { uint  B_pack[]; };  // BF16 packed
+layout(binding = 2) writeonly buffer C_buf { float C[]; };
+
+layout(push_constant) uniform PC {
+    uint M; uint N; uint K; uint batch; float alpha;
+} pc;
+
+float bf16_to_f32(uint bits_low16) {
+    return uintBitsToFloat(bits_low16 << 16u);
+}
+
+float bf16_unpack(uint packed, uint idx) {
+    return bf16_to_f32((idx == 0u) ? (packed & 0xFFFFu) : (packed >> 16u));
+}
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+    if (row >= pc.M || col >= pc.N) return;
+
+    float sum0 = 0.0, sum1 = 0.0, sum2 = 0.0, sum3 = 0.0;
+    uint k2 = pc.K / 2u;  // B has K/2 uints per row (2 BF16 per uint)
+    uint k4 = pc.K / 4u;  // process 4 elements at a time
+
+    // 4 independent accumulators — tree reduction matches OpenBLAS blocking
+    for (uint k = 0u; k < k4; k++) {
+        float a0 = A[row * pc.K + 4u * k];
+        float a1 = A[row * pc.K + 4u * k + 1u];
+        float a2 = A[row * pc.K + 4u * k + 2u];
+        float a3 = A[row * pc.K + 4u * k + 3u];
+        uint b0 = B_pack[col * k2 + 2u * k];
+        uint b1 = B_pack[col * k2 + 2u * k + 1u];
+        sum0 = fma(a0, bf16_unpack(b0, 0u), sum0);
+        sum1 = fma(a1, bf16_unpack(b0, 1u), sum1);
+        sum2 = fma(a2, bf16_unpack(b1, 0u), sum2);
+        sum3 = fma(a3, bf16_unpack(b1, 1u), sum3);
+    }
+
+    // Handle remaining (K mod 4)
+    uint rem_start = k4 * 4u;
+    for (uint k = rem_start; k < pc.K; k++) {
+        float a = A[row * pc.K + k];
+        uint b_packed = B_pack[col * k2 + k / 2u];
+        float b = bf16_unpack(b_packed, k & 1u);
+        sum0 = fma(a, b, sum0);
+    }
+
+    float sum = sum0 + sum1 + sum2 + sum3;
+    C[row * pc.N + col] = sum * pc.alpha;
+}

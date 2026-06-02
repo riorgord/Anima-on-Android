@@ -1,6 +1,6 @@
 #version 450
 // GEMM: C[M,N] = A[M,K] (fp32) @ B[N,K]^T (BF16 packed as uint) → fp32 output
-// 4-element unrolled — matches old gemm_fp16 throughput
+// 8-accumulator tree reduction — reduces FP32 FMA non-associativity error.
 // A: fp32 input, B: BF16 weight (packed uint, 2 BF16 per uint)
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -26,32 +26,37 @@ void main() {
     uint col = gl_GlobalInvocationID.x;
     if (row >= pc.M || col >= pc.N) return;
 
-    float sum = 0.0;
-    uint k2 = pc.K / 2u;  // B has K/2 uints per row (2 BF16 per uint)
-    uint k4 = pc.K / 4u;  // process 4 elements at a time
+    float sum[8] = {0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0};
+    uint k2 = pc.K / 2u;
+    uint k8 = pc.K / 8u;  // 8 elements per iteration → 4 B uints
 
-    // Unrolled: 4 A floats + 2 B uints = 4 FMAs per iteration
-    for (uint k = 0u; k < k4; k++) {
-        float a0 = A[row * pc.K + 4u * k];
-        float a1 = A[row * pc.K + 4u * k + 1u];
-        float a2 = A[row * pc.K + 4u * k + 2u];
-        float a3 = A[row * pc.K + 4u * k + 3u];
-        uint b0 = B_pack[col * k2 + 2u * k];
-        uint b1 = B_pack[col * k2 + 2u * k + 1u];
-        sum = fma(a0, bf16_unpack(b0, 0u), sum);
-        sum = fma(a1, bf16_unpack(b0, 1u), sum);
-        sum = fma(a2, bf16_unpack(b1, 0u), sum);
-        sum = fma(a3, bf16_unpack(b1, 1u), sum);
+    for (uint k = 0u; k < k8; k++) {
+        float a[8];
+        for (uint i = 0u; i < 8u; i++) {
+            a[i] = A[row * pc.K + 8u * k + i];
+        }
+        uint b0 = B_pack[col * k2 + 4u * k];
+        uint b1 = B_pack[col * k2 + 4u * k + 1u];
+        uint b2 = B_pack[col * k2 + 4u * k + 2u];
+        uint b3 = B_pack[col * k2 + 4u * k + 3u];
+        sum[0] = fma(a[0], bf16_unpack(b0, 0u), sum[0]);
+        sum[1] = fma(a[1], bf16_unpack(b0, 1u), sum[1]);
+        sum[2] = fma(a[2], bf16_unpack(b1, 0u), sum[2]);
+        sum[3] = fma(a[3], bf16_unpack(b1, 1u), sum[3]);
+        sum[4] = fma(a[4], bf16_unpack(b2, 0u), sum[4]);
+        sum[5] = fma(a[5], bf16_unpack(b2, 1u), sum[5]);
+        sum[6] = fma(a[6], bf16_unpack(b3, 0u), sum[6]);
+        sum[7] = fma(a[7], bf16_unpack(b3, 1u), sum[7]);
     }
 
-    // Handle remaining (K mod 4)
-    uint rem_start = k4 * 4u;
+    uint rem_start = k8 * 8u;
     for (uint k = rem_start; k < pc.K; k++) {
         float a = A[row * pc.K + k];
         uint b_packed = B_pack[col * k2 + k / 2u];
         float b = bf16_unpack(b_packed, k & 1u);
-        sum = fma(a, b, sum);
+        sum[0] = fma(a, b, sum[0]);
     }
 
-    C[row * pc.N + col] = sum * pc.alpha;
+    float total = sum[0]+sum[1]+sum[2]+sum[3]+sum[4]+sum[5]+sum[6]+sum[7];
+    C[row * pc.N + col] = total * pc.alpha;
 }
