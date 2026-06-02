@@ -223,6 +223,28 @@ def _patched_sdpa(q, k, v, heads, skip_reshape=False, transformer_options=None):
 _p2._scaled_dot_product_attention = _patched_sdpa
 print("Patched attention: SDPA=libanima_rt.so")
 
+# Phase 2: RoPE → numpy (direct translation of PT predict2.py:31-38, zero custom logic)
+import predict2 as _p2
+def _patched_rope(t, freqs):
+    """Line-by-line numpy translation of PT's apply_rotary_pos_emb.
+    No custom kernel — exact same math as PT Python code."""
+    t_np = t.float().cpu().contiguous().numpy()
+    f_np = freqs.float().cpu().contiguous().numpy()
+    half_D = t_np.shape[-1] // 2
+    t_shape = t_np.shape
+    # PT: t_ = t.reshape(*t.shape[:-1], 2, -1).movedim(-2, -1).unsqueeze(-2).float()
+    t_ = t_np.reshape(*t_shape[:-1], 2, half_D)
+    t_ = np.moveaxis(t_, -2, -1)
+    t_ = np.expand_dims(t_, -2)
+    # PT: t_out = freqs[..., 0] * t_[..., 0] + freqs[..., 1] * t_[..., 1]
+    t_out = f_np[..., 0] * t_[..., 0] + f_np[..., 1] * t_[..., 1]
+    # PT: t_out = t_out.movedim(-1, -2).reshape(*t.shape).type_as(t)
+    t_out = np.moveaxis(t_out, -1, -2)
+    t_out = t_out.reshape(*t_shape)
+    return torch.from_numpy(t_out).to(device=t.device, dtype=t.dtype)
+_p2.apply_rotary_pos_emb = _patched_rope
+print("Patched RoPE: numpy (line-by-line PT translation)")
+
 ## Phase 2 RoPE patch TEMPORARILY DISABLED for debugging
 # _orig_rope = _p2.apply_rotary_pos_emb
 # def _patched_rope(t, freqs):
